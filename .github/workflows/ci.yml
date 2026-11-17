@@ -1,0 +1,80 @@
+name: P0 checks and development packages
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: p0-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: python -m unittest discover -s tools -p 'test_*.py' -v
+  packages:
+    needs: core
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows
+            rust-target: x86_64-pc-windows-msvc
+            artifact: build/p0/wencrypt-windows-x64.zip
+          - os: macos-15
+            target: macos
+            rust-target: aarch64-apple-darwin
+            artifact: build/p0/wencrypt-macos-arm64.zip
+          - os: ubuntu-latest
+            target: android
+            rust-target: aarch64-linux-android
+            artifact: build/p0/wencrypt-android-arm64-debug.apk
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-java@v4
+        if: matrix.target == 'android'
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install Android SDK and NDK
+        if: matrix.target == 'android'
+        run: sdkmanager 'platforms;android-36' 'ndk;28.2.13676358'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.50.0'
+          channel: stable
+          cache: true
+      - run: flutter pub get --enforce-lockfile
+        working-directory: apps/wencrypt_flutter
+      - run: flutter analyze --no-pub
+        working-directory: apps/wencrypt_flutter
+      - run: flutter test --no-pub
+        working-directory: apps/wencrypt_flutter
+      - name: Build development package
+        run: python tools/package_p0.py ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wencrypt-p0-${{ matrix.target }}-${{ github.sha }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 14

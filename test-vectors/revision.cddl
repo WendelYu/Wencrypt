@@ -1,0 +1,22 @@
+; WENC v1 draft: RFC 8949 length-first deterministic encoding.
+; UUIDs are 16 byte strings, NOT strings with hyphens. v4 bits required semantically.
+revision = {
+  "schema_version": 1,
+  "revision_id": uuid,
+  "entry_id": uuid,
+  "parents": [0*1024 uuid],
+  "device_id": uuid,
+  "updated_at": int,
+  "is_deleted": bool,
+  "entry": entry / null,
+  "action": "create" / "update" / "delete" / "resolve" / "restore" / "import"
+}
+uuid = bstr .size 16
+entry = {
+  "title": tstr, "username": tstr, "password": tstr,
+  "urls": [* tstr], "notes": tstr, "tags": [* tstr],
+  "custom_fields": [* {"id": uuid, "label": tstr, "value": tstr, "sensitive": bool}]
+}
+; Semantic rules outside CDDL: duplicate keys forbidden; max depth 16; strings
+; <= 65536 UTF-8 bytes; parents/tags sorted and unique; deleted iff entry=null;
+; create/import roots only; DAG validation; unknown fields/schema rejected.

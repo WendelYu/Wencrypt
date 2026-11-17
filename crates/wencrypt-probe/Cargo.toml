@@ -1,0 +1,9 @@
+[package]
+name = "wencrypt-probe"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+wencrypt-core = { path = "../wencrypt-core" }
+serde_json.workspace = true
