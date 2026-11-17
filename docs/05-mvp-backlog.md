@@ -1,7 +1,7 @@
 # MVP 开发任务与验收
 
 > 2026-11-17 更新：首期后端已改为坚果云 WebDAV。此前 OneDrive 首期说明由 [后端变更与构建说明](07-jianguoyun-and-github.md) 覆盖；OneDrive 验证暂停。
-状态：全部待开发。任务编号供后续拆 issue/PR 使用，本轮不创建远端仓库或 issue。
+状态：P0已完成部分实机验证；Alpha已实现离线账号、事务存储、加密备份及手动同步。逐项安全验收尚未全部通过，以 reports/p0-status.md 与 docs/08-alpha-guide.md 为准。
 
 ## 1. 里程碑与依赖
 

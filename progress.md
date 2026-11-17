@@ -22,3 +22,12 @@
 用户再次验证：authenticate_root通过，create_directory/MKCOL返回400 text/xml。怀疑原43字符顶层名称触发坚果云sandbox名称限制（Agentero项目官方适配文档记录此限制，非坚果云具体长度保证）。缩短为20字符随机名称，碰撞时仍失败不覆盖；新增限8KiB的XML错误白名单分类，不输出服务端原文。16项测试通过，远端修复待重试确认。前次Content-Length假设未解决此次实测错误。
 
 用户确认真实坚果云基础 WebDAV 探针通过。已接入三端设备探针与 Rust P0 FFI，并让打包脚本将 Rust 动态库放入三个产物。核对免费版月额度和请求频率，补充预算策略及 Rust 账本原型。用户提供了空 GitHub 仓库，初始化了本地 Git。本机 GitHub CLI 凭据失效，等待重新登录。
+
+Mac v2 实现已编译。沙箱内 SecureEnclave.isAvailable=false，需授权沙箱外硬件测试。首次创建遇到 Foundation atomic 与 withoutOverwriting 不兼容，改为排他创建，保留损坏文件拒绝解包和显式重置策略。
+
+2026-11-17 Secure Enclave v2：替换旧Keychain永久条目创建，使用本地硬件块+ECDH/HKDF/AES-GCM。修正rawRepresentation的64字节公钥长度检查。创建成功，新进程禁止交互返回LA -1004且locked。两项自动测试覆盖缺失/损坏/超长数据与幂等重置通过；已请求用户按指纹，进程等待认证。Flutter源码引用同一DeviceProbe，无需改桥接。
+
+用户确认已按指纹，独立重开进程返回0，authenticated_unwrap_passed / authenticationBound=true / unlocked=true。已再次发起认证并要求用户点击取消，待读取结果。
+用户点击取消后读取结果：LocalAuthentication -2，退出码1，not_passed，unlocked=false。两轮独立进程实测完成，没有认证结果复用。待Flutter沙箱包验收和正式密码库接入。
+
+三端 Alpha：Rust SQLite/WENC 会话、CBOR修订、事务保存、历史、因果冲突、备份/恢复和密文导入实现。重启/错误密码/明文扫描、双端离线冲突与合并测试通过。Flutter主流程与手动坚果云同步已接入。单机预算100MiB上传/300MiB下载、80请求/30分钟，最多三台安装可低于已知免费额度；其他软件流量仍需用户账户侧监控。远端目录上限598修订，未实现后台同步和正式生物识别DEK绑定。

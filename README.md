@@ -1,3 +1,5 @@
+> 0.1 Alpha 已开始实施。可用流程、免费坚果云预算与未完成验收见 [Alpha 使用说明](docs/08-alpha-guide.md)。
+
 # Wencrypt
 
 > 2026-11-17 更新：首期后端已改为坚果云 WebDAV。此前 OneDrive 首期说明由 [后端变更与构建说明](docs/07-jianguoyun-and-github.md) 覆盖；OneDrive 验证暂停。

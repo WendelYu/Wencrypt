@@ -46,7 +46,9 @@ def android():
         raise SystemExit(f"Use Linux or macOS with Android NDK {NDK} to package Android")
     # NDK's API-specific wrapper supplies --target and the Android sysroot.
     linker = bin_dir / "aarch64-linux-android29-clang"
-    env = dict(os.environ, CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=str(linker))
+    env = dict(os.environ, CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=str(linker),
+               CC_aarch64_linux_android=str(linker),
+               AR_aarch64_linux_android=str(bin_dir / "llvm-ar"))
     library = rust_build("aarch64-linux-android", env) / "libwencrypt_core.so"
     jni = APP / "android/rust-jni/arm64-v8a"
     jni.mkdir(parents=True, exist_ok=True)

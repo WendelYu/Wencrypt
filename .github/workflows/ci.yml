@@ -74,6 +74,11 @@ jobs:
         working-directory: apps/wencrypt_flutter
       - run: flutter test --no-pub
         working-directory: apps/wencrypt_flutter
+      - name: Check macOS probe failure paths
+        if: matrix.target == 'macos'
+        run: |
+          swiftc platform_probes/macos/DeviceProbe.swift platform_probes/macos/main.swift -o "$RUNNER_TEMP/wencrypt-device-probe"
+          WENCRYPT_MACOS_PROBE="$RUNNER_TEMP/wencrypt-device-probe" python3 -m unittest discover -s tools -p test_macos_probe.py -v
       - name: Build development package
         run: python tools/package_p0.py ${{ matrix.target }}
       - uses: actions/upload-artifact@v4

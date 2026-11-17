@@ -34,3 +34,42 @@
 6. OneDrive 在桌面网络和 Android 移动网络重复测试；断网期间本地测试仍可运行，恢复后再次读取已上传测试文件。
 
 Android 需要启用开发者选项/USB 调试并在手机上确认本机授权；Windows 需要 Flutter、Rust MSVC、Visual Studio Desktop development with C++。这些机器不可由当前 Mac 的测试替代。
+
+## macOS Touch ID 的本地开发签名
+
+公开 Actions 包使用临时签名。在本机，应用能探测到 Touch ID 和 Secure Enclave，但用 Data Protection Keychain 保存测试密钥时返回 `-34018`。Keychain 默认访问组由签名里的应用标识决定。
+
+1. 从 App Store 安装完整 Xcode，首次启动完成初始化。在 Xcode → Settings → Accounts 登录 Apple 账号并选择可用于本机开发的团队。
+2. 打开 `apps/wencrypt_flutter/macos/Runner.xcworkspace`。选中 Runner target，进入 Signing & Capabilities，启用 Automatically manage signing，选择团队，保留 bundle ID `org.wencrypt.wencrypt`。使用 Xcode 生成 macOS 开发证书和适用于这台 Mac 的开发描述文件。先尝试已有团队或 Personal Team，能否获取匹配的描述文件以 Xcode 的结果为准。
+3. 运行 `security find-identity -v -p codesigning`，找出描述文件包含的 Apple Development 签名身份。用已校验的 CI 测试包、描述文件和签名身份制作新副本。
+
+   ```sh
+   python3 tools/sign_macos_keychain_probe.py .tools/ci-macos-5231869/wencrypt.app \
+     --profile /path/to/development.provisionprofile \
+     --identity CERTIFICATE_SHA1 \
+     --output .tools/macos-touch-id/Wencrypt-Development.app
+   ```
+
+4. 运行新副本并点击「生成测试密钥」，期待 `wrapped_test_marker`。退出后重新打开，点击「认证并解包测试数据」，先取消确认失败，再重试并按指纹，期待 `authenticated_unwrap_passed`。
+
+脚本保留应用沙箱并使用描述文件授权的应用标识和团队标识。Wencrypt 只访问自身的默认 Keychain 组。描述文件和私钥留在本机。如果 Xcode 报 bundle ID 或描述文件冲突，记录报错并核对团队、设备和签名范围再继续。
+
+[Apple Keychain 实现](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains) · [Apple 描述文件说明](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles)
+
+## Mac 无开发者会员的 Secure Enclave v2 路线
+
+当前 macOS 探针使用 CryptoKit SecureEnclave P-256 ECDH、HKDF-SHA256 和 AES-256-GCM。硬件私钥设置 `privateKeyUsage + biometryCurrentSet`，每次解包使用新的 LAContext，不复用认证，也不回退系统密码或软件私钥。只存储本机硬件封装块、公钥、随机 salt 和测试数据密文。该格式独立于云端 WENC v1，不上传网盘。
+
+Flutter 的三个按钮仍为生成、认证解包、清除测试密钥。数据默认存入应用 Application Support 的 `org.wencrypt/device-probe-v2.json`。旧 v1 Keychain 探针不会迁移或自动删除。v2 清除按钮只清除 v2 文件，不能视为旧文件备份的密码学撤销。
+
+本机没有完整 Xcode 时可用 Command Line Tools 验证与 Flutter 共用的原生源文件：
+
+```sh
+swiftc platform_probes/macos/DeviceProbe.swift platform_probes/macos/main.swift -o /tmp/wencrypt-device-probe
+WENCRYPT_PROBE_FILE="$PWD/.tools/macos-touch-id/persistent-v2.json" /tmp/wencrypt-device-probe createProbe
+WENCRYPT_PROBE_FILE="$PWD/.tools/macos-touch-id/persistent-v2.json" /tmp/wencrypt-device-probe unlockProbe
+```
+
+每次命令是独立进程。第一轮按指纹，应为 `authenticated_unwrap_passed`；第二轮取消，必须 `not_passed` 且 `unlocked=false`。`unlockProbeNonInteractive` 必须拒绝解包。损坏文件、缺文件及超长文件测试可通过 `WENCRYPT_MACOS_PROBE=/tmp/wencrypt-device-probe python3 -m unittest discover -s tools -p test_macos_probe.py` 运行。
+
+这仍是公开测试数据探针，`strictUnlockEnabled=false`。尚未接入真实 DEK、锁屏生命周期和主密码重绑定。独立进程验证不能替代 Flutter 沙箱包退出重开验证；完整 Flutter 包可通过 GitHub Actions 构建，不需要本机安装 Xcode。应用发行签名与公证另行处理。

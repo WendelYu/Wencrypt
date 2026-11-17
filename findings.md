@@ -38,3 +38,6 @@
 - MVP 保留同条目并发版本，字段级自动合并延期，避免因误判共同基线产生静默密码覆盖。
 
 坚果云MKCOL排查：认证根属性请求成功，43字符随机顶层目录创建失败。https://docs.agentero.app/backend/sync/ 记录顶层sandbox name is too long限制；坚果云官方 https://help.jianguoyun.com/?p=1904 仅说明通用255字符路径限制，并未给出顶层sandbox特例。因此缩短目录名是有依据的兼容修复，尚非实测确诊。
+
+用户提供 Android 截图：WENC v1 179ms，hardwareBacked=true，authenticated_unwrap_passed，reset成功。正式strictUnlockEnabled仍false。
+Apple CryptoKit 官方 Storing CryptoKit Keys in the Keychain 文档确认 dataRepresentation 为仅原Secure Enclave可恢复的加密块，不是明文私钥。新实现采用本地私有文件存储硬件块和AEAD密文，不依赖永久Keychain条目的签名权限。
