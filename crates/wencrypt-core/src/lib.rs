@@ -33,3 +33,6 @@ pub extern "C" fn wencrypt_probe_unlock_ms() -> i64 {
         _ => -1,
     }
 }
+
+mod ffi;
+pub mod vault;

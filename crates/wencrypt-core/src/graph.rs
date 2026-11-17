@@ -24,51 +24,69 @@ pub fn evaluate(input: &[Revision]) -> Result<View, &'static str> {
             return Err("duplicate parent");
         }
     }
-    fn visit(
-        id: &str,
-        all: &BTreeMap<String, &Revision>,
-        visiting: &mut BTreeSet<String>,
-        valid: &mut BTreeSet<String>,
-        pending: &mut BTreeSet<String>,
-    ) -> Result<bool, &'static str> {
-        if valid.contains(id) {
-            return Ok(true);
-        }
-        if pending.contains(id) {
-            return Ok(false);
-        }
-        let Some(r) = all.get(id) else {
-            return Ok(false);
-        };
-        if !visiting.insert(id.to_string()) {
-            return Err("cycle");
-        }
-        let mut complete = true;
+    if all.len() > 10000 {
+        return Err("revision limit");
+    }
+    let mut valid = BTreeSet::new();
+    let mut remaining: BTreeSet<String> = all.keys().cloned().collect();
+    for r in all.values() {
         for p in &r.parents {
             if let Some(parent) = all.get(p) {
                 if parent.entry != r.entry {
                     return Err("cross-entry parent");
                 }
             }
-            complete &= visit(p, all, visiting, valid, pending)?;
         }
-        visiting.remove(id);
-        if complete {
-            valid.insert(id.to_string());
-        } else {
-            pending.insert(id.to_string());
+    }
+    // Kahn traversal avoids stack overflow on attacker-controlled parent chains.
+    let mut degree = BTreeMap::new();
+    let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut ready = std::collections::VecDeque::new();
+    for (id, r) in &all {
+        degree.insert(id.clone(), r.parents.len());
+        if r.parents.is_empty() {
+            ready.push_back(id.clone());
         }
-        Ok(complete)
+        for p in &r.parents {
+            children.entry(p.clone()).or_default().push(id.clone());
+        }
     }
-    // Prototype resource bound also limits recursive traversal depth.
-    if all.len() > 128 {
-        return Err("P0 model limit");
+    while let Some(id) = ready.pop_front() {
+        valid.insert(id.clone());
+        remaining.remove(&id);
+        for child in children.get(&id).into_iter().flatten() {
+            let n = degree.get_mut(child).unwrap();
+            *n -= 1;
+            if *n == 0 {
+                ready.push_back(child.clone());
+            }
+        }
     }
-    let mut valid = BTreeSet::new();
-    let mut pending = BTreeSet::new();
-    for id in all.keys() {
-        visit(id, &all, &mut BTreeSet::new(), &mut valid, &mut pending)?;
+    // Distinguish missing ancestry from cycles, even cycles with missing parents.
+    let mut cycle_degree = BTreeMap::new();
+    let mut ready = std::collections::VecDeque::new();
+    for (id, r) in &all {
+        let n = r.parents.iter().filter(|p| all.contains_key(*p)).count();
+        cycle_degree.insert(id.clone(), n);
+        if n == 0 {
+            ready.push_back(id.clone());
+        }
     }
+    let mut visited = 0;
+    while let Some(id) = ready.pop_front() {
+        visited += 1;
+        for child in children.get(&id).into_iter().flatten() {
+            let n = cycle_degree.get_mut(child).unwrap();
+            *n -= 1;
+            if *n == 0 {
+                ready.push_back(child.clone());
+            }
+        }
+    }
+    if visited != all.len() {
+        return Err("cycle");
+    }
+    let pending = remaining;
     let mut heads = valid.clone();
     for id in &valid {
         for p in &all[id].parents {
