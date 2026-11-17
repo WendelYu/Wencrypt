@@ -56,6 +56,7 @@ struct Session {
 #[derive(Default)]
 pub struct Vault {
     session: Option<Session>,
+    epoch: u64,
 }
 fn random<const N: usize>() -> Result<[u8; N]> {
     let mut b = [0; N];
@@ -203,10 +204,21 @@ fn field<'a>(v: &'a Value, name: &str) -> Result<&'a str> {
 }
 impl Vault {
     pub const fn new() -> Self {
-        Self { session: None }
+        Self {
+            session: None,
+            epoch: 0,
+        }
     }
     pub fn command(&mut self, v: &Value) -> Result<Value> {
         let op = field(v, "op")?;
+        if let Some(epoch) = v.get("epoch").and_then(Value::as_u64) {
+            if op == "lock" && epoch >= self.epoch {
+                self.epoch = epoch;
+            }
+            if epoch != self.epoch {
+                return Err("session_expired");
+            }
+        }
         if op == "lock" {
             self.session = None;
             return Ok(json!({"locked":true}));
@@ -486,6 +498,27 @@ mod tests {
     fn call(v: &mut Vault, token: &str, mut request: Value) -> Value {
         request["session"] = json!(token);
         v.command(&request).unwrap()
+    }
+    #[test]
+    fn queued_unlock_cannot_reopen_after_lock() {
+        let mut v = Vault::new();
+        v.command(&json!({"op":"lock","epoch":2})).unwrap();
+        assert_eq!(
+            v.command(&json!({"op":"unlock","epoch":1,"path":"unused","password":"unused"}))
+                .unwrap_err(),
+            "session_expired"
+        );
+        assert!(v.session.is_none());
+    }
+    #[test]
+    fn rejected_create_leaves_no_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.db");
+        let mut v = Vault::new();
+        assert!(v
+            .command(&json!({"op":"create","path":path,"password":"short"}))
+            .is_err());
+        assert!(!path.exists());
     }
     #[test]
     fn offline_restart_conflict_backup_and_disk_secrecy() {

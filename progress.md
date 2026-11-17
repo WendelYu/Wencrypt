@@ -31,3 +31,5 @@ Mac v2 实现已编译。沙箱内 SecureEnclave.isAvailable=false，需授权�
 用户点击取消后读取结果：LocalAuthentication -2，退出码1，not_passed，unlocked=false。两轮独立进程实测完成，没有认证结果复用。待Flutter沙箱包验收和正式密码库接入。
 
 三端 Alpha：Rust SQLite/WENC 会话、CBOR修订、事务保存、历史、因果冲突、备份/恢复和密文导入实现。重启/错误密码/明文扫描、双端离线冲突与合并测试通过。Flutter主流程与手动坚果云同步已接入。单机预算100MiB上传/300MiB下载、80请求/30分钟，最多三台安装可低于已知免费额度；其他软件流量仍需用户账户侧监控。远端目录上限598修订，未实现后台同步和正式生物识别DEK绑定。
+
+62cfd30已推送，Actions 44040800579产出Windows/macOS/Android三端Alpha。新增会话epoch拒绝过期解锁，Rust4项vault测试通过，Flutter分析无问题。正在下载Mac首轮包实测，再推送epoch补丁生成最终包。

@@ -51,8 +51,16 @@ String _request(String request) {
   }
 }
 
+int _epoch = 0;
+// Synchronous invalidation serializes with the Rust mutex before the app backgrounds.
+// Queued requests carry an older epoch and cannot reopen a locked vault.
+void lockCore() {
+  _epoch++;
+  _request(jsonEncode({'op': 'lock', 'epoch': _epoch}));
+}
+
 Future<Map<String, dynamic>> core(Map<String, dynamic> request) async {
-  final input = jsonEncode(request);
+  final input = jsonEncode({...request, 'epoch': _epoch});
   final result = jsonDecode(
     await Isolate.run(() => _request(input)),
   ) as Map<String, dynamic>;

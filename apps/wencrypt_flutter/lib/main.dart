@@ -94,7 +94,11 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       Navigator.of(context).popUntil((r) => r.isFirst);
       setState(() => message = '密码库已锁定');
     }
-    core({'op': 'lock'}).catchError((Object _) => <String, dynamic>{});
+    try {
+      lockCore();
+    } catch (_) {
+      /* A missing core cannot hold an active vault. */
+    }
   }
 
   Future<void> action(Future<void> Function() task) async {
@@ -114,6 +118,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
 
   String friendly(Object e) {
     final text = e.toString();
+    if (text.contains('backup_limit')) return '超出 Alpha 的 2 MiB 备份上限，导出已停止。';
     if (text.contains('free_budget')) return '已达到本机免费流量或请求预算，请稍后再试。';
     if (text.contains('remote_missing')) return '云端副本缺失，已停止同步；本地数据仍保留。';
     if (text.contains('directory_limit')) return '达到 Alpha 云目录上限，请先导出加密备份。';
@@ -365,6 +370,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     await action(() async {
       final data = await request('export', {'password': password});
       final bytes = utf8.encode(jsonEncode(data));
+      if (bytes.length > 2 * 1024 * 1024) {
+        throw StateError('backup_limit');
+      }
       if (Platform.isAndroid) {
         await const MethodChannel('org.wencrypt.files')
             .invokeMethod('saveBackup', {'bytes': Uint8List.fromList(bytes)});

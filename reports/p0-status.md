@@ -23,3 +23,7 @@ GitHub Actions 产物文件名为 wencrypt-windows-x64.zip、wencrypt-macos-arm6
 
 - macOS v2 正向实测通过：创建进程退出后，另起进程读取磁盘硬件封装块，用户 Touch ID 认证后返回 authenticated_unwrap_passed、authenticationBound=true、hardwareBacked=true、unlocked=true。此证据属于原生独立进程，Flutter 沙箱包重开尚待验证。取消认证测试已发起。
 - macOS v2 取消实测通过：在正向成功之后再起新进程，用户点击取消，返回 LocalAuthentication -2、not_passed、unlocked=false，退出码1。没有复用上一轮认证成功状态。原生独立进程退出重开和取消路径均已验证；正式DEK集成、Flutter沙箱应用重开、锁屏/重启/生物特征变更测试仍待完成。
+
+## Alpha 0.1 首轮构建
+
+提交62cfd30的GitHub Actions三端已产生产物。Rust离线/重启/冲突/备份测试、Flutter锁定页与预算测试通过。随后新增锁定epoch校验，防止排队解锁在锁定后重新建立会话；回归测试通过，最终包需对应后续提交。真实坚果云Alpha同步和三端真实库操作仍需实机验证。
