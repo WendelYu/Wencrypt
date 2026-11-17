@@ -27,3 +27,12 @@ GitHub Actions 产物文件名为 wencrypt-windows-x64.zip、wencrypt-macos-arm6
 ## Alpha 0.1 首轮构建
 
 提交62cfd30的GitHub Actions三端已产生产物。Rust离线/重启/冲突/备份测试、Flutter锁定页与预算测试通过。随后新增锁定epoch校验，防止排队解锁在锁定后重新建立会话；回归测试通过，最终包需对应后续提交。真实坚果云Alpha同步和三端真实库操作仍需实机验证。
+
+## Alpha 最终产物
+
+- 提交 `dbb994233955f266329031e0713b9ff66bb58de1`，Actions https://github.com/WendelYu/Wencrypt/actions/runs/44093230639 的核心检查和三端包全部通过。
+- 三个artifact归档下载后SHA-256均匹配GitHub元数据。最终Mac包严格codesign验证通过。
+- Mac首轮Alpha应用实测创建、保存、编辑、退出重开主密码解锁成功。中文真实输入法、最终包完整安全矩阵未计为通过。
+- 交付目录 `build/alpha-dbb9942/`（忽略，不提交二进制），包含三端包、Mac解压应用和SHA256SUMS.txt。
+- 本机实测创建了仅含公开fixture的Alpha库，主密码 `Wencrypt Alpha public test 2026!`。这不是用户真实主密码，也不能用于真实密码库。
+- 当前仍是测试数据Alpha；正式生物识别DEK集成、自动同步、跨设备网盘验收及独立安全评审未完成，详见 docs/08-alpha-guide.md。
