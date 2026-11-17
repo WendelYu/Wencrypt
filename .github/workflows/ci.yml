@@ -7,7 +7,7 @@ permissions:
   contents: read
 concurrency:
   group: p0-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   core:
     runs-on: ubuntu-latest
@@ -58,6 +58,8 @@ jobs:
           java-version: '17'
       - uses: android-actions/setup-android@v3
         if: matrix.target == 'android'
+        with:
+          packages: platform-tools
       - name: Install Android SDK and NDK
         if: matrix.target == 'android'
         run: sdkmanager 'platforms;android-36' 'ndk;28.2.13676358'
