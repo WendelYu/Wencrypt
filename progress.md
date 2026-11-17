@@ -33,3 +33,5 @@ Mac v2 实现已编译。沙箱内 SecureEnclave.isAvailable=false，需授权�
 三端 Alpha：Rust SQLite/WENC 会话、CBOR修订、事务保存、历史、因果冲突、备份/恢复和密文导入实现。重启/错误密码/明文扫描、双端离线冲突与合并测试通过。Flutter主流程与手动坚果云同步已接入。单机预算100MiB上传/300MiB下载、80请求/30分钟，最多三台安装可低于已知免费额度；其他软件流量仍需用户账户侧监控。远端目录上限598修订，未实现后台同步和正式生物识别DEK绑定。
 
 62cfd30已推送，Actions 44040800579产出Windows/macOS/Android三端Alpha。新增会话epoch拒绝过期解锁，Rust4项vault测试通过，Flutter分析无问题。正在下载Mac首轮包实测，再推送epoch补丁生成最终包。
+
+最终dbb9942的Actions 44093230639四个job全部success。Mac首轮62cfd30产物摘要与GitHub一致、codesign严格验证通过；CUA实测创建公开测试库、保存编辑账号、退出重开后主密码解锁且账号保留。测试主密码为公开fixture `Wencrypt Alpha public test 2026!`，仅本机测试数据。中文粘贴存在自动化AX文本与Flutter提交时机不一致，未计为通过，保留真实输入法验收。
