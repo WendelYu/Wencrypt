@@ -13,6 +13,9 @@ build/
 !.env.example
 *.keystore
 *.jks
+*.provisionprofile
+*.mobileprovision
+*.p12
 .DS_Store
 reports/private/
 __pycache__/
