@@ -84,7 +84,8 @@ class _WencryptProbeAppState extends State<WencryptProbeApp> {
               child: Text(label),
             ),
           const SizedBox(height: 16),
-          SelectableText(busy ? '正在验证…' : result),
+          // This output is read-only. Avoid an editable text client on macOS.
+          Semantics(liveRegion: true, child: Text(busy ? '正在验证…' : result)),
         ],
       ),
     ),
