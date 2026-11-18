@@ -711,11 +711,15 @@ mod tests {
         call(
             &mut v,
             &t,
-            json!({"op":"sync_settings_set","settings":{"username":"test@example.com","password":secret,"auto":true}}),
+            json!({"op":"sync_settings_set","settings":{"username":"test@example.com","password":secret,"auto":false}}),
         );
         assert_eq!(
             call(&mut v, &t, json!({"op":"sync_settings_get"}))["settings"]["password"],
             secret
+        );
+        assert_eq!(
+            call(&mut v, &t, json!({"op":"sync_settings_get"}))["settings"]["auto"],
+            false
         );
         let objects = call(&mut v, &t, json!({"op":"sync_objects"}));
         assert!(objects["objects"].as_array().unwrap().is_empty());

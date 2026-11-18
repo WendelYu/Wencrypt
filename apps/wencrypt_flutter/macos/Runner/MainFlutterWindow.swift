@@ -70,6 +70,16 @@ class MainFlutterWindow: NSWindow {
             result(error == nil ? nil : FlutterError(code: "browser_open_failed", message: nil, details: nil))
           }
         }
+      } else if call.method == "watchDirs" {
+        var dirs: [String] = []
+        if let pw = getpwuid(getuid()), let homeDir = pw.pointee.pw_dir {
+          let realHome = String(cString: homeDir)
+          let downloads = (realHome as NSString).appendingPathComponent("Downloads")
+          if FileManager.default.fileExists(atPath: downloads) {
+            dirs.append(downloads)
+          }
+        }
+        result(dirs)
       } else { result(FlutterMethodNotImplemented) }
     }
 

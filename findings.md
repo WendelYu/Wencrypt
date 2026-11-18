@@ -45,3 +45,5 @@ Apple CryptoKit 官方 Storing CryptoKit Keys in the Keychain 文档确认 dataR
 当前坚果云Alpha失败用户仅看到“操作未完成”，尚无阶段信息。现实现首次GET只允1KiB错误响应，且MKCOL成功/PUT失败后再次MKCOL会遇405而无法恢复；PROPFIND未检查DAV命名空间和propstat状态。需修正并以真实阶段诊断确认根因，不能把推断当实测结果。
 
 2026-11-18：用户截图确认 Chrome 内部 URL 未能由 macOS 打开，坚果云的引导文件 GET 实际返回 409。409 的具体服务端原因未知，兼容路径在认证成功后通过建目录结果或目录内容判断能否初始化。Mac 用 AppKit 启动应用并让用户在浏览器地址栏打开设置。
+
+2026-11-18：微软明确支持受支持浏览器迁移，桌面 Edge 官方密码导出为用户确认的 CSV。微软支持的扩展 API 列表未提供批量读取 Edge 已保存密码的授权接口。Windows 应用绑定加密和 macOS 钥匙串保护限制直接读取。Apple 的凭据交换由支持的来源 App 发起，查到的 Edge 桌面文档只确认 CSV 路径。见 https://support.microsoft.com/en-us/edge/export-passwords-in-microsoft-edge 和 https://learn.microsoft.com/en-us/microsoft-edge/extensions/developer-guide/api-support 。
