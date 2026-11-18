@@ -110,6 +110,75 @@ class _FakeVault {
 String _hash(int value) => value.toRadixString(16).padLeft(64, '0');
 
 void main() {
+  test('password rotation requires a version tag and refuses to overwrite a competing change', () async {
+    final dir = await Directory.systemTemp.createTemp('wencrypt-rewrap-test');
+    addTearDown(() => dir.delete(recursive: true));
+    final calls = <String>[];
+    String? version;
+    var conflicting = false;
+    var remote = <int>[1, 2];
+    NutstoreSync client() => NutstoreSync(
+      dir,
+      (op, [args = const {}]) async {
+        if (op == 'sync_bootstrap_relation') {
+          expect(args['bootstrap'], '0102');
+          return {'same_vault': true, 'previous': true};
+        }
+        return {
+          'vault': '0123456789abcdef0123456789abcdef',
+          'bootstrap': '0304',
+          'objects': <String, int>{},
+        };
+      },
+      pace: Duration.zero,
+      wire: (method, uri, body, depth, limit) async {
+        calls.add(method);
+        if (method == 'GET') return DavReply(200, remote, etag: version);
+        if (method == 'PUT') {
+          expect(body, [3, 4]);
+          if (conflicting) {
+            remote = [5, 6];
+            return DavReply(412, []);
+          }
+          remote = body;
+          return DavReply(204, []);
+        }
+        return DavReply(
+          207,
+          utf8.encode(listing(uri.path, ['bootstrap.wenc'])),
+        );
+      },
+    );
+    await expectLater(
+      client().sync('fixture', 'fixture'),
+      throwsA(
+        isA<DavFailure>().having(
+          (e) => e.reason,
+          'reason',
+          'strong_etag_required',
+        ),
+      ),
+    );
+    expect(calls, isNot(contains('PUT')));
+    version = '"old-strong-etag"';
+    conflicting = true;
+    await expectLater(
+      client().sync('fixture', 'fixture'),
+      throwsA(
+        isA<DavFailure>().having(
+          (e) => e.reason,
+          'reason',
+          'cloud_password_changed',
+        ),
+      ),
+    );
+    expect(remote, [5, 6]);
+    remote = [1, 2];
+    conflicting = false;
+    expect((await client().sync('fixture', 'fixture')).complete, isTrue);
+    expect(remote, [3, 4]);
+  });
+
   test(
     'DAV accepts collection without final slash and rejects partial responses',
     () {

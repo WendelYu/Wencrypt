@@ -1,8 +1,80 @@
 import Cocoa
 import FlutterMacOS
 
+private final class WatchDirectoryBookmarks {
+  private let key = "WencryptBrowserWatchBookmarks"
+  private var active: [String: URL] = [:]
+
+  private var data: [Data] {
+    get { UserDefaults.standard.array(forKey: key) as? [Data] ?? [] }
+    set { UserDefaults.standard.set(newValue, forKey: key) }
+  }
+
+  private func resolve(_ bookmark: Data) throws -> (URL, Bool) {
+    var stale = false
+    let url = try URL(
+      resolvingBookmarkData: bookmark,
+      options: [.withSecurityScope, .withoutUI],
+      relativeTo: nil,
+      bookmarkDataIsStale: &stale
+    )
+    return (url, stale)
+  }
+
+  func restore() -> [String] {
+    stop()
+    data = data.map { bookmark in
+      guard let (url, stale) = try? resolve(bookmark) else { return bookmark }
+      let path = url.standardizedFileURL.path
+      guard active[path] == nil, url.startAccessingSecurityScopedResource() else {
+        return bookmark
+      }
+      active[path] = url
+      if stale, let refreshed = try? url.bookmarkData(options: [.withSecurityScope]) {
+        return refreshed
+      }
+      return bookmark
+    }
+    return active.keys.sorted()
+  }
+
+  func add(_ url: URL) throws -> String {
+    let bookmark = try url.bookmarkData(options: [.withSecurityScope])
+    let (resolved, _) = try resolve(bookmark)
+    let path = resolved.standardizedFileURL.path
+    if active[path] == nil {
+      guard resolved.startAccessingSecurityScopedResource() else {
+        throw CocoaError(.fileReadNoPermission)
+      }
+      active[path] = resolved
+    }
+    let existing = data.filter { saved in
+      guard let (savedURL, _) = try? resolve(saved) else { return true }
+      return savedURL.standardizedFileURL.path != path
+    }
+    data = existing + [bookmark]
+    return path
+  }
+
+  func forget(_ path: String) {
+    active.removeValue(forKey: path)?.stopAccessingSecurityScopedResource()
+    data = data.filter { bookmark in
+      guard let (url, _) = try? resolve(bookmark) else { return true }
+      return url.standardizedFileURL.path != path
+    }
+  }
+
+  func stop() {
+    for url in active.values { url.stopAccessingSecurityScopedResource() }
+    active.removeAll()
+  }
+
+  deinit { stop() }
+}
+
 class MainFlutterWindow: NSWindow {
   private let probe = DeviceProbe()
+  private let watchBookmarks = WatchDirectoryBookmarks()
   private let vaultDevice = DeviceVault()
   private let probeQueue = DispatchQueue(label: "org.wencrypt.p0.device")
 
@@ -13,6 +85,7 @@ class MainFlutterWindow: NSWindow {
     self.setFrame(windowFrame, display: true)
 
     RegisterGeneratedPlugins(registry: flutterViewController)
+    (NSApp.delegate as? AppDelegate)?.configureInviteChannel(flutterViewController.engine.binaryMessenger)
 
     let channel = FlutterMethodChannel(
       name: "org.wencrypt.p0/device",
@@ -68,7 +141,8 @@ class MainFlutterWindow: NSWindow {
       "Firefox": ("org.mozilla.firefox", "about:logins")
     ]
     let browserChannel = FlutterMethodChannel(name:"org.wencrypt.browser-import", binaryMessenger:flutterViewController.engine.binaryMessenger)
-    browserChannel.setMethodCallHandler { call, result in
+    browserChannel.setMethodCallHandler { [weak self] call, result in
+      guard let self else { result(FlutterMethodNotImplemented); return }
       if call.method == "installed" {
         result(browsers.keys.sorted().filter {
           guard let (id, _) = browsers[$0] else { return false }
@@ -116,6 +190,25 @@ class MainFlutterWindow: NSWindow {
             }
           }
         }
+      } else if call.method == "savedWatchDirs" {
+        result(self.watchBookmarks.restore())
+      } else if call.method == "chooseWatchDir" {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "记住目录"
+        panel.beginSheetModal(for: self) { response in
+          guard response == .OK, let url = panel.url else { result(nil); return }
+          do { result(try self.watchBookmarks.add(url)) }
+          catch { result(FlutterError(code: "watch_dir_permission", message: nil, details: nil)) }
+        }
+      } else if call.method == "forgetWatchDir", let path = call.arguments as? String {
+        self.watchBookmarks.forget(path)
+        result(nil)
+      } else if call.method == "stopWatchAccess" {
+        self.watchBookmarks.stop()
+        result(nil)
       } else if call.method == "watchDirs" {
         var dirs: [String] = []
         if let pw = getpwuid(getuid()), let homeDir = pw.pointee.pw_dir {

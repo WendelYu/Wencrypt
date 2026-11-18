@@ -5,6 +5,8 @@ import 'dart:isolate';
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 
+import 'design/wencrypt_theme.dart';
+
 const deviceProbe = MethodChannel('org.wencrypt.p0/device');
 
 void main() => runApp(const WencryptProbeApp());
@@ -64,6 +66,8 @@ class _WencryptProbeAppState extends State<WencryptProbeApp> {
 
   @override
   Widget build(BuildContext context) => MaterialApp(
+    theme: wencryptTheme(Brightness.light),
+    darkTheme: wencryptTheme(Brightness.dark),
     home: Scaffold(
       appBar: AppBar(title: const Text('Wencrypt P0')),
       body: ListView(

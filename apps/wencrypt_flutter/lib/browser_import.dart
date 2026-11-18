@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
@@ -6,6 +7,9 @@ import 'package:csv/csv.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
+
+import 'design/wencrypt_theme.dart';
+import 'design/wencrypt_widgets.dart';
 
 class BrowserExport {
   BrowserExport(this.source, this.rows, this.skipped);
@@ -159,6 +163,64 @@ Future<List<Directory>> defaultWatchDirectories() async {
   return accessible;
 }
 
+class WatchDirectoryPreferences {
+  WatchDirectoryPreferences(this.file);
+
+  final File file;
+
+  Future<List<String>> load() async {
+    if (!await file.exists()) return [];
+    final saved = jsonDecode(await file.readAsString()) as List;
+    return saved.whereType<String>().toSet().toList();
+  }
+
+  Future<void> setDirectory(String path, {required bool remember}) async {
+    final folders = (await load()).toSet();
+    if (remember) {
+      folders.add(path);
+    } else {
+      folders.remove(path);
+    }
+    final temp = File('${file.path}.tmp');
+    await temp.writeAsString(jsonEncode(folders.toList()), flush: true);
+    await temp.rename(file.path);
+  }
+}
+
+class SavedBrowserWatchFolders {
+  SavedBrowserWatchFolders(Directory appData)
+    : _preferences = WatchDirectoryPreferences(
+        File('${appData.path}/browser-watch-dirs.json'),
+      );
+
+  final WatchDirectoryPreferences _preferences;
+
+  Future<List<String>> load() async => Platform.isMacOS
+      ? await _browserChannel.invokeListMethod<String>('savedWatchDirs') ?? []
+      : _preferences.load();
+
+  Future<String?> choose() async {
+    if (Platform.isMacOS) {
+      return _browserChannel.invokeMethod<String>('chooseWatchDir');
+    }
+    final selected = await getDirectoryPath(confirmButtonText: '记住目录');
+    if (selected != null) {
+      await _preferences.setDirectory(selected, remember: true);
+    }
+    return selected;
+  }
+
+  Future<void> forget(String path) => Platform.isMacOS
+      ? _browserChannel.invokeMethod<void>('forgetWatchDir', path)
+      : _preferences.setDirectory(path, remember: false);
+
+  Future<void> close() async {
+    if (Platform.isMacOS) {
+      await _browserChannel.invokeMethod<void>('stopWatchAccess');
+    }
+  }
+}
+
 enum BrowserLaunch { settings, browserOnly, failed }
 
 Future<BrowserLaunch> launchBrowserForExport(String browser, String app) async {
@@ -210,8 +272,12 @@ class BrowserCsvWatcher {
   Future<void> addDirectory(Directory directory) async {
     final target = _normPath(directory.path);
     if (_directories.any((d) => _normPath(d.path) == target)) return;
-    _directories.add(directory);
     await _snapshotDirectory(directory);
+    if (!_disposed) _directories.add(directory);
+  }
+
+  void removeDirectory(String path) {
+    _directories.removeWhere((dir) => _normPath(dir.path) == _normPath(path));
   }
 
   Future<void> _snapshotExisting() async {
@@ -288,6 +354,7 @@ class BrowserCsvWatcher {
               final parsed = BrowserExport.parse(content);
               _seenSignatures[key] = afterSig;
               if (parsed.rows.isNotEmpty) {
+                if (!_directories.contains(dir)) break;
                 if (!_controller.isClosed) {
                   _controller.add(CapturedBrowserCsv(entity, parsed));
                 }
@@ -362,8 +429,15 @@ Future<BrowserWatchResult?> watchBrowserExportDialog(
   required String browser,
   required String app,
   required List<Directory> initialDirs,
+  required List<String> rememberedDirs,
+  required SavedBrowserWatchFolders savedFolders,
 }) async {
-  final watcher = BrowserCsvWatcher(initialDirs);
+  final remembered = rememberedDirs.toSet();
+  final merged = {for (final dir in initialDirs) dir.path: dir};
+  for (final path in remembered) {
+    merged.putIfAbsent(path, () => Directory(path));
+  }
+  final watcher = BrowserCsvWatcher(merged.values.toList());
   await watcher.start();
   if (!context.mounted) {
     watcher.dispose();
@@ -373,6 +447,7 @@ Future<BrowserWatchResult?> watchBrowserExportDialog(
   StreamSubscription<CapturedBrowserCsv>? sub;
   var popped = false;
   var launching = true;
+  var changingDirectories = false;
   BrowserLaunch? launch;
 
   try {
@@ -407,33 +482,42 @@ Future<BrowserWatchResult?> watchBrowserExportDialog(
             final address = browserSettingsUrl(browser);
             final dirs = watcher.directories;
 
-            return AlertDialog(
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(20),
+            return WDialog(
+              width: 520,
+              icon: Icons.file_download_outlined,
+              title: '等待 $browser 导出密码…',
+              subtitle: 'Wencrypt 会监听下载目录，导出 CSV 后自动识别并预览。',
+              headerTrailing: const SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
               ),
-              title: Row(
-                children: [
-                  const SizedBox(
-                    width: 22,
-                    height: 22,
-                    child: CircularProgressIndicator(strokeWidth: 2.5),
+              bodyPadding: const EdgeInsets.fromLTRB(20, 8, 20, 16),
+              footer: WDialogFooter(
+                actions: [
+                  TextButton(
+                    onPressed: () {
+                      if (!popped) {
+                        popped = true;
+                        Navigator.pop(ctx);
+                      }
+                    },
+                    child: const Text('取消等待'),
                   ),
-                  const SizedBox(width: 12),
-                  Expanded(child: Text('等待 $browser 导出密码…')),
                 ],
               ),
-              content: SizedBox(
-                width: 460,
+              child: SizedBox(
+                width: double.infinity,
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Container(
-                      padding: const EdgeInsets.all(14),
+                      padding: const EdgeInsets.all(12),
                       decoration: BoxDecoration(
-                        color: Theme.of(ctx).colorScheme.surfaceContainerHighest
-                            .withValues(alpha: 0.5),
-                        borderRadius: BorderRadius.circular(12),
+                        color: WColors.of(ctx).surfaceMuted,
+                        borderRadius: BorderRadius.circular(WRadius.sm),
+                        border: Border.all(color: WColors.of(ctx).border),
                       ),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
@@ -501,7 +585,7 @@ Future<BrowserWatchResult?> watchBrowserExportDialog(
                     Text(
                       dirs.isEmpty
                           ? '未检测到可访问的默认下载目录，请授权监听目录或手动选择 CSV：'
-                          : '正在实时监听以下目录中的新 CSV 文件：',
+                          : '正在监听以下目录中的新 CSV 文件',
                       style: Theme.of(ctx).textTheme.labelMedium,
                     ),
                     const SizedBox(height: 6),
@@ -511,7 +595,41 @@ Future<BrowserWatchResult?> watchBrowserExportDialog(
                         runSpacing: 6,
                         children: [
                           for (final d in dirs)
-                            Chip(
+                            InputChip(
+                              onDeleted:
+                                  remembered.contains(d.path) &&
+                                      !changingDirectories
+                                  ? () async {
+                                      setLocal(
+                                        () => changingDirectories = true,
+                                      );
+                                      try {
+                                        await savedFolders.forget(d.path);
+                                        remembered.remove(d.path);
+                                        if (!initialDirs.any(
+                                          (dir) => dir.path == d.path,
+                                        )) {
+                                          watcher.removeDirectory(d.path);
+                                        }
+                                      } catch (_) {
+                                        if (ctx.mounted) {
+                                          ScaffoldMessenger.of(ctx)
+                                              .showSnackBar(
+                                                const SnackBar(
+                                                  content: Text('无法移除已保存的目录'),
+                                                ),
+                                              );
+                                        }
+                                      } finally {
+                                        if (ctx.mounted && !popped) {
+                                          setLocal(
+                                            () => changingDirectories = false,
+                                          );
+                                        }
+                                      }
+                                    }
+                                  : null,
+                              deleteButtonTooltipMessage: '忘记此监听目录',
                               avatar: const Icon(
                                 Icons.folder_outlined,
                                 size: 16,
@@ -529,15 +647,34 @@ Future<BrowserWatchResult?> watchBrowserExportDialog(
                       spacing: 8,
                       children: [
                         OutlinedButton.icon(
-                          onPressed: () async {
-                            final chosen = await getDirectoryPath(
-                              confirmButtonText: '监听此目录',
-                            );
-                            if (chosen != null) {
-                              await watcher.addDirectory(Directory(chosen));
-                              if (ctx.mounted) setLocal(() {});
-                            }
-                          },
+                          onPressed: changingDirectories
+                              ? null
+                              : () async {
+                                  setLocal(() => changingDirectories = true);
+                                  try {
+                                    final chosen = await savedFolders.choose();
+                                    if (chosen != null) {
+                                      remembered.add(chosen);
+                                      await watcher.addDirectory(
+                                        Directory(chosen),
+                                      );
+                                    }
+                                  } catch (_) {
+                                    if (ctx.mounted) {
+                                      ScaffoldMessenger.of(ctx).showSnackBar(
+                                        const SnackBar(
+                                          content: Text('无法记住此目录，请确认访问权限'),
+                                        ),
+                                      );
+                                    }
+                                  } finally {
+                                    if (ctx.mounted && !popped) {
+                                      setLocal(
+                                        () => changingDirectories = false,
+                                      );
+                                    }
+                                  }
+                                },
                           icon: const Icon(
                             Icons.create_new_folder_outlined,
                             size: 18,
@@ -578,17 +715,6 @@ Future<BrowserWatchResult?> watchBrowserExportDialog(
                   ],
                 ),
               ),
-              actions: [
-                TextButton(
-                  onPressed: () {
-                    if (!popped) {
-                      popped = true;
-                      Navigator.pop(ctx);
-                    }
-                  },
-                  child: const Text('取消等待'),
-                ),
-              ],
             );
           },
         );
@@ -633,12 +759,33 @@ Future<List<Map<String, String>>?> selectPasswords(
   return showDialog<List<Map<String, String>>>(
     context: context,
     builder: (ctx) => StatefulBuilder(
-      builder: (ctx, update) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: Text('选择要导入的账号（${selected.length}/${batch.rows.length}）'),
-        content: SizedBox(
-          width: 520,
-          height: 410,
+      builder: (ctx, update) => WDialog(
+        width: 560,
+        icon: Icons.playlist_add_check_rounded,
+        title: '选择要导入的账号（${selected.length}/${batch.rows.length}）',
+        subtitle: '相同凭据会自动合并，取消勾选可跳过。',
+        scrollable: false,
+        bodyPadding: const EdgeInsets.fromLTRB(20, 8, 20, 12),
+        footer: WDialogFooter(
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: selected.isEmpty
+                  ? null
+                  : () => Navigator.pop(ctx, [
+                      for (final i in selected.toList()..sort())
+                        {...batch.rows[i], if (group.isNotEmpty) 'tags': group},
+                    ]),
+              child: const Text('导入所选账号'),
+            ),
+          ],
+        ),
+        child: SizedBox(
+          width: double.infinity,
+          height: 400,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -738,21 +885,6 @@ Future<List<Map<String, String>>?> selectPasswords(
             ],
           ),
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: selected.isEmpty
-                ? null
-                : () => Navigator.pop(ctx, [
-                    for (final i in selected.toList()..sort())
-                      {...batch.rows[i], if (group.isNotEmpty) 'tags': group},
-                  ]),
-            child: const Text('导入所选账号'),
-          ),
-        ],
       ),
     ),
   );

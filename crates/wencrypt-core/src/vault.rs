@@ -179,6 +179,127 @@ fn sealed_sync_settings(dek: &[u8; 32], id: &[u8; 16], settings: &Value) -> Resu
     crypto(envelope::encrypt_object(dek, id, Kind::Backup, &plain))
 }
 
+const SYNC_HISTORY_KEY: &str = "local-sync-history-v1";
+const SYNC_HISTORY_PAGE: usize = 50;
+
+#[derive(Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum SyncOutcome {
+    Running,
+    Success,
+    Partial,
+    Failed,
+    Interrupted,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyncIssue {
+    stage: String,
+    reason: String,
+    http_status: Option<u16>,
+}
+
+impl SyncIssue {
+    fn valid(&self) -> bool {
+        [&self.stage, &self.reason].into_iter().all(|item| {
+            !item.is_empty()
+                && item.len() <= 64
+                && item
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+        }) && self
+            .http_status
+            .is_none_or(|code| (100..=599).contains(&code))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct SyncHistoryEntry {
+    id: String,
+    folder: String,
+    started_at: u64,
+    finished_at: Option<u64>,
+    automatic: bool,
+    uploaded: u32,
+    downloaded: u32,
+    outcome: SyncOutcome,
+    issue: Option<SyncIssue>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SealedSyncHistoryEntry {
+    purpose: String,
+    record: SyncHistoryEntry,
+}
+
+fn sync_history_table(db: &Connection) -> Result<()> {
+    sql(db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS local_sync_history (
+            sequence INTEGER PRIMARY KEY,
+            id TEXT NOT NULL UNIQUE,
+            body BLOB NOT NULL
+        );",
+    ))
+}
+
+fn open_sync_history(s: &Session, expected_id: &str, body: &[u8]) -> Result<SyncHistoryEntry> {
+    let plain = crypto(envelope::decrypt_object(&s.dek, &s.id, Kind::Backup, body))?;
+    let entry: SealedSyncHistoryEntry =
+        serde_json::from_slice(&plain).map_err(|_| "invalid_sync_history")?;
+    if entry.purpose != SYNC_HISTORY_KEY || entry.record.id != expected_id {
+        return Err("invalid_sync_history");
+    }
+    Ok(entry.record)
+}
+
+fn seal_sync_history(s: &Session, record: &SyncHistoryEntry) -> Result<Vec<u8>> {
+    let plain = Zeroizing::new(
+        serde_json::to_vec(&json!({"purpose":SYNC_HISTORY_KEY,"record":record}))
+            .map_err(|_| "encode_failed")?,
+    );
+    crypto(envelope::encrypt_object(
+        &s.dek,
+        &s.id,
+        Kind::Backup,
+        &plain,
+    ))
+}
+
+const BOOTSTRAP_PREDECESSORS: &str = "local-bootstrap-predecessors-v1";
+
+fn bootstrap_predecessors(
+    db: &Connection,
+    dek: &[u8; 32],
+    id: &[u8; 16],
+) -> Result<BTreeSet<String>> {
+    let body: Option<Vec<u8>> = sql(db
+        .query_row(
+            "SELECT value FROM metadata WHERE key=?1",
+            params![BOOTSTRAP_PREDECESSORS],
+            |row| row.get(0),
+        )
+        .optional())?;
+    let Some(body) = body else {
+        return Ok(BTreeSet::new());
+    };
+    let plain = crypto(envelope::decrypt_object(dek, id, Kind::Backup, &body))?;
+    let value: Value = serde_json::from_slice(&plain).map_err(|_| "invalid_bootstrap")?;
+    if value["purpose"] != BOOTSTRAP_PREDECESSORS {
+        return Err("invalid_bootstrap");
+    }
+    serde_json::from_value(value["hashes"].clone()).map_err(|_| "invalid_bootstrap")
+}
+
+fn replace_bootstrap(db: &Connection, value: &[u8]) -> Result<()> {
+    sql(db.execute(
+        "UPDATE metadata SET value=?1 WHERE key='bootstrap'",
+        params![value],
+    ))?;
+    sql(db.execute("DELETE FROM metadata WHERE key='device-key-proof'", []))?;
+    Ok(())
+}
+
 fn view(revisions: &BTreeMap<String, Revision>) -> Result<graph::View> {
     graph::evaluate(
         &revisions
@@ -553,6 +674,12 @@ impl Vault {
                 let b = hex::decode(field(v, "bootstrap")?).map_err(|_| "invalid_bootstrap")?;
                 let key = crypto(envelope::unlock_bootstrap(password, &b))?;
                 let id = crypto(envelope::parse(&b))?.0.vault_id;
+                if v["expected_vault"]
+                    .as_str()
+                    .is_some_and(|expected| expected != hex::encode(id))
+                {
+                    return Err("invitation_vault_mismatch");
+                }
                 let settings = v
                     .get("settings")
                     .map(|settings| sealed_sync_settings(&key, &id, settings))
@@ -609,6 +736,180 @@ impl Vault {
                     expires: std::time::Instant::now() + std::time::Duration::from_secs(60),
                 });
                 Ok(json!({"ticket":ticket,"binding":hex::encode(Sha256::digest(&b))}))
+            }
+            "change_master_password" | "adopt_cloud_password" => {
+                let new_password = field(v, "new_password")?;
+                let adopting = op == "adopt_cloud_password";
+                if !adopting && (new_password.chars().count() < 12 || new_password.len() > 1024) {
+                    return Err("password_length");
+                }
+                let tx = sql(s
+                    .db
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
+                let current = bootstrap(&tx)?;
+                let replacement = if adopting {
+                    let remote =
+                        hex::decode(field(v, "bootstrap")?).map_err(|_| "invalid_bootstrap")?;
+                    let parsed = crypto(envelope::parse(&remote))?.0;
+                    let key = crypto(envelope::unlock_bootstrap(new_password, &remote))?;
+                    if parsed.vault_id != s.id || *key != *s.dek {
+                        return Err("vault_identity_mismatch");
+                    }
+                    if current == remote {
+                        return Ok(json!({"changed":false}));
+                    }
+                    sql(tx.execute(
+                        "DELETE FROM metadata WHERE key=?1",
+                        params![BOOTSTRAP_PREDECESSORS],
+                    ))?;
+                    remote
+                } else {
+                    let old_password = field(v, "old_password")?;
+                    let key = crypto(envelope::unlock_bootstrap(old_password, &current))?;
+                    if *key != *s.dek {
+                        return Err("authentication_failed");
+                    }
+                    if old_password == new_password {
+                        return Err("password_unchanged");
+                    }
+                    let next = crypto(envelope::create_bootstrap(new_password, &s.id, &s.dek))?;
+                    let mut hashes = bootstrap_predecessors(&tx, &s.dek, &s.id)?;
+                    hashes.insert(object_hash(&current));
+                    let plain = Zeroizing::new(
+                        serde_json::to_vec(
+                            &json!({"purpose":BOOTSTRAP_PREDECESSORS,"hashes":hashes}),
+                        )
+                        .map_err(|_| "encode_failed")?,
+                    );
+                    let body = crypto(envelope::encrypt_object(
+                        &s.dek,
+                        &s.id,
+                        Kind::Backup,
+                        &plain,
+                    ))?;
+                    sql(tx.execute(
+                        "INSERT OR REPLACE INTO metadata VALUES (?1,?2)",
+                        params![BOOTSTRAP_PREDECESSORS, body],
+                    ))?;
+                    next
+                };
+                replace_bootstrap(&tx, &replacement)?;
+                sql(tx.commit())?;
+                self.grant = None;
+                s.backup_grant = None;
+                Ok(json!({"changed":true}))
+            }
+            "sync_bootstrap_relation" => {
+                let body = hex::decode(field(v, "bootstrap")?).map_err(|_| "invalid_bootstrap")?;
+                let same_vault =
+                    envelope::parse(&body).is_ok_and(|(header, _, _)| header.vault_id == s.id);
+                let previous = same_vault
+                    && bootstrap_predecessors(&s.db, &s.dek, &s.id)?.contains(&object_hash(&body));
+                Ok(json!({"same_vault":same_vault,"previous":previous}))
+            }
+            "sync_history_list" => {
+                sync_history_table(&s.db)?;
+                let mut stmt = sql(s.db.prepare(
+                    "SELECT sequence,id,body FROM local_sync_history
+                     WHERE ?1 IS NULL OR sequence < ?1 ORDER BY sequence DESC LIMIT ?2",
+                ))?;
+                let before = v["before"].as_i64();
+                let rows = sql(
+                    stmt.query_map(params![before, SYNC_HISTORY_PAGE + 1], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                        ))
+                    }),
+                )?;
+                let mut records = Vec::new();
+                let mut cursor = None;
+                let mut last = 0;
+                for row in rows {
+                    let (sequence, id, body) = sql(row)?;
+                    if records.len() == SYNC_HISTORY_PAGE {
+                        cursor = Some(last);
+                        break;
+                    }
+                    records.push(
+                        json!({"sequence":sequence,"record":open_sync_history(s, &id, &body)?}),
+                    );
+                    last = sequence;
+                }
+                Ok(json!({"records":records,"cursor":cursor}))
+            }
+            "sync_history_start" => {
+                let folder = field(v, "folder")?;
+                if folder.trim().is_empty() || folder.len() > 128 {
+                    return Err("invalid_sync_history");
+                }
+                sync_history_table(&s.db)?;
+                let record = SyncHistoryEntry {
+                    id: identifier()?,
+                    folder: folder.to_owned(),
+                    started_at: now()?,
+                    finished_at: None,
+                    automatic: v["automatic"].as_bool().unwrap_or(false),
+                    uploaded: 0,
+                    downloaded: 0,
+                    outcome: SyncOutcome::Running,
+                    issue: None,
+                };
+                let sealed = seal_sync_history(s, &record)?;
+                sql(s.db.execute(
+                    "INSERT INTO local_sync_history (id,body) VALUES (?1,?2)",
+                    params![record.id, sealed],
+                ))?;
+                Ok(json!({"id":record.id}))
+            }
+            "sync_history_update" => {
+                let id = field(v, "id")?;
+                let count = |key: &str| {
+                    v[key]
+                        .as_u64()
+                        .and_then(|count| u32::try_from(count).ok())
+                        .ok_or("invalid_sync_history")
+                };
+                let uploaded = count("uploaded")?;
+                let downloaded = count("downloaded")?;
+                let outcome: SyncOutcome = serde_json::from_value(v["outcome"].clone())
+                    .map_err(|_| "invalid_sync_history")?;
+                let issue: Option<SyncIssue> = serde_json::from_value(v["issue"].clone())
+                    .map_err(|_| "invalid_sync_history")?;
+                if issue.as_ref().is_some_and(|issue| !issue.valid()) {
+                    return Err("invalid_sync_history");
+                }
+                let tx = sql(rusqlite::Transaction::new_unchecked(
+                    &s.db,
+                    rusqlite::TransactionBehavior::Immediate,
+                ))?;
+                let body: Vec<u8> = sql(tx.query_row(
+                    "SELECT body FROM local_sync_history WHERE id=?1",
+                    params![id],
+                    |row| row.get(0),
+                ))?;
+                let mut record = open_sync_history(s, id, &body)?;
+                if record.outcome != SyncOutcome::Running
+                    || uploaded < record.uploaded
+                    || downloaded < record.downloaded
+                {
+                    return Err("invalid_sync_history");
+                }
+                record.uploaded = uploaded;
+                record.downloaded = downloaded;
+                if outcome != SyncOutcome::Running {
+                    record.finished_at = Some(now()?);
+                }
+                record.outcome = outcome;
+                record.issue = issue;
+                let sealed = seal_sync_history(s, &record)?;
+                sql(tx.execute(
+                    "UPDATE local_sync_history SET body=?2 WHERE id=?1",
+                    params![id, sealed],
+                ))?;
+                sql(tx.commit())?;
+                Ok(json!({"saved":true}))
             }
             "sync_settings_set" => {
                 let settings = v.get("settings").ok_or("invalid_settings")?;
@@ -1012,6 +1313,163 @@ mod tests {
         request["session"] = json!(token);
         v.command(&request).unwrap()
     }
+    #[test]
+    fn sync_history_records_progress_and_failure_with_encrypted_pagination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.db");
+        let mut vault = Vault::new();
+        let opened = vault
+            .command(&json!({
+                "op":"create","path":path,"password":"public history test password"
+            }))
+            .unwrap();
+        let token = opened["session"].as_str().unwrap();
+        let folder = "local-folder-fixture";
+        for _ in 0..51 {
+            call(
+                &mut vault,
+                token,
+                json!({"op":"sync_history_start","folder":folder,"automatic":true}),
+            );
+        }
+        let newest = call(
+            &mut vault,
+            token,
+            json!({"op":"sync_history_start","folder":folder}),
+        );
+        call(
+            &mut vault,
+            token,
+            json!({
+                "op":"sync_history_update","id":newest["id"],"uploaded":2,"downloaded":1,"outcome":"running"
+            }),
+        );
+        call(
+            &mut vault,
+            token,
+            json!({
+                "op":"sync_history_update","id":newest["id"],"uploaded":2,"downloaded":1,
+                "outcome":"failed","issue":{"stage":"upload_pack","reason":"http_error","http_status":503}
+            }),
+        );
+        let page = call(&mut vault, token, json!({"op":"sync_history_list"}));
+        assert_eq!(page["records"].as_array().unwrap().len(), 50);
+        let record = &page["records"][0]["record"];
+        assert_eq!(record["folder"], folder);
+        assert_eq!(record["uploaded"], 2);
+        assert_eq!(record["downloaded"], 1);
+        assert_eq!(record["issue"]["http_status"], 503);
+        assert!(record["finished_at"].is_number());
+        let before = call(
+            &mut vault,
+            token,
+            json!({"op":"sync_history_list","before":page["cursor"]}),
+        );
+        assert_eq!(before["records"].as_array().unwrap().len(), 2);
+        assert!(before["cursor"].is_null());
+
+        let database = &vault.session.as_ref().unwrap().db;
+        let body: Vec<u8> = database
+            .query_row(
+                "SELECT body FROM local_sync_history WHERE id=?1",
+                params![newest["id"].as_str().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!body
+            .windows(folder.len())
+            .any(|bytes| bytes == folder.as_bytes()));
+        assert!(
+            call(&mut vault, token, json!({"op":"sync_objects"}))["objects"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rotates_password_without_changing_vault_and_peers_must_authenticate() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home.db");
+        let other = dir.path().join("other.db");
+        let wrong_invite = dir.path().join("wrong-invite.db");
+        let original = "first public fixture passphrase";
+        let updated = "second public fixture passphrase";
+        let mut vault = Vault::new();
+        let opened = vault
+            .command(&json!({"op":"create","path":home,"password":original}))
+            .unwrap();
+        let token = opened["session"].as_str().unwrap();
+        call(
+            &mut vault,
+            token,
+            json!({"op":"save","data":entry("retained")}),
+        );
+        let before = call(&mut vault, token, json!({"op":"sync_inventory"}));
+        let mut peer = Vault::new();
+        assert_eq!(
+            peer.command(&json!({
+                "op":"join","path":wrong_invite,"password":original,"bootstrap":before["bootstrap"],
+                "expected_vault":"00000000000000000000000000000000"
+            })),
+            Err("invitation_vault_mismatch")
+        );
+        assert!(!wrong_invite.exists());
+        let peer_opened = peer
+            .command(&json!({
+                "op":"join","path":other,"password":original,"bootstrap":before["bootstrap"],
+                "expected_vault":before["vault"]
+            }))
+            .unwrap();
+        let peer_token = peer_opened["session"].as_str().unwrap();
+        assert!(vault.command(&json!({
+            "op":"change_master_password","session":token,"old_password":"incorrect","new_password":updated
+        })).is_err());
+        call(
+            &mut vault,
+            token,
+            json!({
+                "op":"change_master_password","old_password":original,"new_password":updated
+            }),
+        );
+        let after = call(&mut vault, token, json!({"op":"sync_inventory"}));
+        assert_eq!(after["vault"], before["vault"]);
+        assert_eq!(after["objects"], before["objects"]);
+        assert_ne!(after["bootstrap"], before["bootstrap"]);
+        let relation = call(
+            &mut vault,
+            token,
+            json!({
+                "op":"sync_bootstrap_relation","bootstrap":before["bootstrap"]
+            }),
+        );
+        assert_eq!(relation, json!({"same_vault":true,"previous":true}));
+        let relation = call(
+            &mut peer,
+            peer_token,
+            json!({
+                "op":"sync_bootstrap_relation","bootstrap":after["bootstrap"]
+            }),
+        );
+        assert_eq!(relation, json!({"same_vault":true,"previous":false}));
+        assert!(peer.command(&json!({
+            "op":"adopt_cloud_password","session":peer_token,"new_password":original,"bootstrap":after["bootstrap"]
+        })).is_err());
+        call(
+            &mut peer,
+            peer_token,
+            json!({
+                "op":"adopt_cloud_password","new_password":updated,"bootstrap":after["bootstrap"]
+            }),
+        );
+        assert!(peer
+            .command(&json!({"op":"unlock","path":other,"password":original}))
+            .is_err());
+        assert!(peer
+            .command(&json!({"op":"unlock","path":other,"password":updated}))
+            .is_ok());
+    }
+
     #[test]
     fn three_vaults_converge_beyond_the_legacy_directory_limit() {
         let dir = tempfile::tempdir().unwrap();

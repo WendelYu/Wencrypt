@@ -131,6 +131,15 @@ jobs:
         run: |
           assets=(wencrypt-macos-arm64.dmg wencrypt-windows-x64.zip wencrypt-android-arm64-debug.apk)
           sha256sum "${assets[@]}" > SHA256SUMS.txt
+          notes="$RUNNER_TEMP/wencrypt-release-notes.md"
+          version_notes="../.github/releases/$TAG.md"
+          if [ -f "$version_notes" ]; then
+            cat "$version_notes" > "$notes"
+            printf '\n\n' >> "$notes"
+            cat ../.github/release-notes.md >> "$notes"
+          else
+            cp ../.github/release-notes.md "$notes"
+          fi
           if gh release view "$TAG" --json isDraft --jq '.isDraft' | grep -qx true; then
             previous=$(gh release view "$TAG" --json targetCommitish --jq '.targetCommitish')
             if [ "$previous" != "$GITHUB_SHA" ]; then
@@ -142,5 +151,5 @@ jobs:
           else
             gh release create "$TAG" "${assets[@]}" SHA256SUMS.txt \
               --target "$GITHUB_SHA" --title "Wencrypt $TAG" \
-              --notes-file ../.github/release-notes.md --generate-notes
+              --notes-file "$notes" --generate-notes
           fi

@@ -1,6 +1,7 @@
 package org.wencrypt.wencrypt
 
 import android.content.ContentValues
+import android.content.Intent
 import android.os.Environment
 import android.provider.MediaStore
 import io.flutter.embedding.android.FlutterFragmentActivity
@@ -10,8 +11,25 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : FlutterFragmentActivity() {
     private var backupResult: MethodChannel.Result? = null
     private var backupBytes: ByteArray? = null
+    private var inviteChannel: MethodChannel? = null
+    private var pendingInvite: String? = null
+
+    private fun receiveInvite(intent: Intent?) {
+        val uri = intent?.data ?: return
+        if (uri.scheme != "wencrypt" || uri.host != "join") return
+        pendingInvite = uri.toString()
+        inviteChannel?.invokeMethod("available", null)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        receiveInvite(intent)
+    }
+
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         super.onCreate(savedInstanceState)
+        receiveInvite(intent)
         window.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
     }
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
@@ -57,6 +75,17 @@ class MainActivity : FlutterFragmentActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        inviteChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "org.wencrypt.invite").apply {
+            setMethodCallHandler { call, result ->
+                if (call.method == "takePending") {
+                    val invitation = pendingInvite
+                    pendingInvite = null
+                    result.success(invitation)
+                } else {
+                    result.notImplemented()
+                }
+            }
+        }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "org.wencrypt.device/vault")
             .setMethodCallHandler { call, result ->
                 @Suppress("UNCHECKED_CAST")

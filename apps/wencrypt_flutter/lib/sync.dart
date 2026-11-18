@@ -99,7 +99,9 @@ class DavFailure implements Exception {
 }
 
 class DavReply {
-  DavReply(this.status, List<int> body) : body = Uint8List.fromList(body);
+  DavReply(this.status, List<int> body, {this.etag})
+    : body = Uint8List.fromList(body);
+  final String? etag;
   final int status;
   final Uint8List body;
 }
@@ -229,6 +231,7 @@ class NutstoreSync {
     String depth,
     int limit, {
     required bool createOnly,
+    String? ifMatch,
   }) async {
     final req = await client
         .openUrl(method, uri)
@@ -237,6 +240,7 @@ class NutstoreSync {
     req.headers.set(HttpHeaders.authorizationHeader, auth);
     req.headers.set(HttpHeaders.userAgentHeader, 'Wencrypt/0.2');
     if (createOnly) req.headers.set(HttpHeaders.ifNoneMatchHeader, '*');
+    if (ifMatch != null) req.headers.set(HttpHeaders.ifMatchHeader, ifMatch);
     if (method != 'GET' && method != 'HEAD') req.contentLength = body.length;
     if (method == 'PUT') req.headers.contentType = ContentType.binary;
     if (method == 'PROPFIND') {
@@ -259,7 +263,11 @@ class NutstoreSync {
       }
       bytes.add(chunk);
     }
-    return DavReply(res.statusCode, bytes.takeBytes());
+    return DavReply(
+      res.statusCode,
+      bytes.takeBytes(),
+      etag: res.headers.value(HttpHeaders.etagHeader),
+    );
   }
 
   Future<DavReply> send(
@@ -271,6 +279,7 @@ class NutstoreSync {
     int limit = 1024 * 1024,
     Set<int> accepted = const {200},
     bool createOnly = false,
+    String? ifMatch,
   }) async {
     try {
       if (uri.scheme != 'https' ||
@@ -289,7 +298,15 @@ class NutstoreSync {
       last = DateTime.now();
       final response =
           await (wire?.call(method, uri, body, depth, limit) ??
-              _http(method, uri, body, depth, limit, createOnly: createOnly));
+              _http(
+                method,
+                uri,
+                body,
+                depth,
+                limit,
+                createOnly: createOnly,
+                ifMatch: ifMatch,
+              ));
       if (response.body.length > limit) {
         throw DavFailure(stage, 'response_limit', response.status);
       }
@@ -455,12 +472,13 @@ class NutstoreSync {
     String password, {
     String? remoteFolder,
     bool existingOnly = false,
-    void Function(String message)? onProgress,
+    Future<void> Function(SyncReport report)? onProgress,
   }) async {
     _configure(username, password);
     var downloaded = 0;
     var uploaded = 0;
-    void progress() => onProgress?.call('已上传 $uploaded 条，已下载 $downloaded 条');
+    Future<void> progress() async =>
+        onProgress?.call(SyncReport(uploaded, downloaded));
     try {
       final snapshot = await request('sync_inventory');
       final vault = snapshot['vault'] as String;
@@ -534,7 +552,39 @@ class NutstoreSync {
         }
       }
       if (hex(remote.body) != hex(bootstrap)) {
-        throw const DavFailure('verify_bootstrap', 'vault_identity_mismatch');
+        final relation = await request('sync_bootstrap_relation', {
+          'bootstrap': hex(remote.body),
+        });
+        if (relation['previous'] != true) {
+          throw DavFailure(
+            'verify_bootstrap',
+            relation['same_vault'] == true
+                ? 'cloud_password_changed'
+                : 'vault_identity_mismatch',
+          );
+        }
+        final etag = remote.etag;
+        if (etag == null || !RegExp(r'^"[!#-~]+"$').hasMatch(etag)) {
+          throw const DavFailure('update_bootstrap', 'strong_etag_required');
+        }
+        await send(
+          'update_bootstrap',
+          'PUT',
+          folder.resolve('bootstrap.wenc'),
+          body: bootstrap,
+          ifMatch: etag,
+          limit: 8192,
+          accepted: {200, 201, 204, 412},
+        );
+        final verified = await send(
+          'verify_bootstrap',
+          'GET',
+          folder.resolve('bootstrap.wenc'),
+          limit: 8192,
+        );
+        if (hex(verified.body) != hex(bootstrap)) {
+          throw const DavFailure('update_bootstrap', 'cloud_password_changed');
+        }
       }
       await remembered.writeAsString('bound', flush: true);
       final names = await _list(folder, DavContents.vault);
@@ -590,7 +640,7 @@ class NutstoreSync {
             if (known.add(hash)) downloaded++;
           }
           packed.addAll(hashes);
-          progress();
+          await progress();
         }
       }
 
@@ -609,7 +659,7 @@ class NutstoreSync {
         known.add(hash);
         readLegacy = true;
         downloaded++;
-        progress();
+        await progress();
       }
       final remaining = readLegacy
           ? Map<String, int>.from(
@@ -647,7 +697,7 @@ class NutstoreSync {
           }
         }
         uploaded += group.length;
-        progress();
+        await progress();
       }
       return SyncReport(uploaded, downloaded);
     } catch (e) {
