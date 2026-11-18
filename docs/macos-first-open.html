@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>安装与首次打开 Wencrypt</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { max-width: 42rem; padding: 2rem; margin: auto; font: 1rem/1.65 -apple-system, sans-serif; }
+  li { margin-block: .4rem; }
+  a { color: LinkText; }
+</style>
+<h1>安装与首次打开 Wencrypt</h1>
+<p><strong>此 macOS 版本尚未经过 Apple 公证。</strong></p>
+<ol>
+  <li>把磁盘映像中的 Wencrypt 拖到 Applications（应用程序），再从「应用程序」打开。</li>
+  <li>如果 macOS 提示无法验证开发者或无法检查 App，请确认安装包来自本仓库的 GitHub Release，然后关闭提示。</li>
+  <li>前往<a href="x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension">系统设置 → 隐私与安全性</a>，在「安全性」下点「仍要打开」，按提示确认。</li>
+</ol>
+<h2>提示「已损坏」或仍然无法打开</h2>
+<p>请从 GitHub Release 重新下载 Apple 芯片版 DMG，核对 SHA256SUMS.txt 后重新安装。如果校验不符、仍提示已损坏，或 macOS 提示该 App 将损坏电脑，请停止打开并在仓库提交问题，附上 macOS 版本和完整提示。</p>
+<p><a href="https://github.com/WendelYu/Wencrypt/releases/latest">下载与校验文件</a> · <a href="https://support.apple.com/zh-cn/102445">Apple 官方首次打开说明</a></p>
+</html>

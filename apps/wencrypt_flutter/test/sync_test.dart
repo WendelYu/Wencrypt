@@ -6,6 +6,109 @@ import 'package:wencrypt/sync.dart';
 
 String listing(String folder, List<String> names, {bool slash = true}) =>
     '<d:multistatus xmlns:d="DAV:">${[slash ? folder : folder.substring(0, folder.length - 1), ...names.map((n) => '$folder$n')].map((h) => '<d:response><d:href>$h</d:href><d:propstat><d:prop><d:resourcetype/></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>').join()}</d:multistatus>';
+
+class _MemoryDav {
+  final directories = <String>{'/dav/', '/dav/shared/'};
+  final files = <String, List<int>>{
+    '/dav/shared/bootstrap.wenc': [1, 2, 3],
+  };
+  final calls = <(String, String)>[];
+
+  Future<DavReply> wire(
+    String method,
+    Uri uri,
+    List<int> body,
+    String depth,
+    int limit,
+  ) async {
+    final path = uri.path;
+    calls.add((method, path));
+    switch (method) {
+      case 'GET':
+        final bytes = files[path];
+        return bytes == null ? DavReply(404, []) : DavReply(200, bytes);
+      case 'PUT':
+        if (files.containsKey(path)) return DavReply(412, []);
+        files[path] = body.toList();
+        return DavReply(201, []);
+      case 'MKCOL':
+        return DavReply(directories.add(path) ? 201 : 405, []);
+      case 'PROPFIND':
+        if (!directories.contains(path)) return DavReply(404, []);
+        final children = [...directories, ...files.keys]
+            .where((item) => item.startsWith(path) && item != path)
+            .map((item) => item.substring(path.length))
+            .where(
+              (item) => !item.replaceFirst(RegExp(r'/$'), '').contains('/'),
+            )
+            .toList();
+        return DavReply(
+          207,
+          utf8.encode(listing(path, depth == '0' ? [] : children)),
+        );
+      default:
+        throw StateError('Unexpected WebDAV verb');
+    }
+  }
+}
+
+class _FakeVault {
+  _FakeVault({this.objectSize = 128});
+
+  final int objectSize;
+  final objects = <String>{};
+  final receipts = <String, List<String>>{};
+
+  Future<Map<String, dynamic>> request(
+    String op, [
+    Map<String, dynamic> fields = const {},
+  ]) async {
+    switch (op) {
+      case 'sync_inventory':
+        return {
+          'vault': '0123456789abcdef0123456789abcdef',
+          'bootstrap': '010203',
+          'objects': {for (final hash in objects) hash: objectSize},
+        };
+      case 'sync_receipts':
+        return {
+          'packs': {
+            for (final pack in (fields['packs'] as List).cast<String>())
+              if (receipts.containsKey(pack)) pack: receipts[pack],
+          },
+        };
+      case 'sync_build_pack':
+        final hashes = (fields['hashes'] as List).cast<String>().toList();
+        final suffix = hashes.first;
+        final hash = '${suffix.substring(62)}${suffix.substring(2)}';
+        receipts[hash] = hashes;
+        return {'hash': hash, 'body': _hex(utf8.encode(jsonEncode(hashes)))};
+      case 'sync_ingest_pack':
+        final hash = fields['hash'] as String;
+        final body = fields['body'] as String;
+        final hashes = (jsonDecode(
+          utf8.decode([
+            for (var i = 0; i < body.length; i += 2)
+              int.parse(body.substring(i, i + 2), radix: 16),
+          ]),
+        ) as List).cast<String>();
+        receipts[hash] = hashes;
+        objects.addAll(hashes);
+        return {'hashes': hashes};
+      case 'ingest':
+        objects.add(fields['hash'] as String);
+        return {};
+      default:
+        throw StateError('Unexpected vault operation');
+    }
+  }
+
+  String _hex(List<int> bytes) =>
+      bytes.map((byte) => byte.toRadixString(16).padLeft(2, '0')).join();
+}
+
+String _hash(int value) => value.toRadixString(16).padLeft(64, '0');
+
 void main() {
   test(
     'DAV accepts collection without final slash and rejects partial responses',
@@ -46,7 +149,7 @@ void main() {
         (String op, [Map<String, dynamic> extra = const {}]) async => {
           'vault': '0123456789abcdef0123456789abcdef',
           'bootstrap': '010203',
-          'objects': <dynamic>[],
+          'objects': <String, int>{},
         },
         pace: Duration.zero,
         wire: (method, uri, body, depth, limit) async {
@@ -72,10 +175,7 @@ void main() {
           throw StateError('unexpected');
         },
       );
-      expect(
-        await sync.sync('test@example.com', 'test-only'),
-        contains('上传 0'),
-      );
+      expect((await sync.sync('test@example.com', 'test-only')).uploaded, 0);
       expect(calls, [
         'PROPFIND',
         'GET',
@@ -103,7 +203,7 @@ void main() {
           (String op, [Map<String, dynamic> extra = const {}]) async => {
             'vault': '0123456789abcdef0123456789abcdef',
             'bootstrap': '0102',
-            'objects': [],
+            'objects': <String, int>{},
           },
           pace: Duration.zero,
           wire: (_, uri, body, depth, limit) async =>
@@ -129,12 +229,137 @@ void main() {
     },
   );
 
+  test(
+    'migrates legacy objects and synchronizes 1,291 revisions to three devices',
+    () async {
+      final dir = await Directory.systemTemp.createTemp('wencrypt-packs-test');
+      addTearDown(() => dir.delete(recursive: true));
+      final dav = _MemoryDav();
+      final legacy = '/dav/shared/${_hash(1290)}.wenc';
+      dav.files[legacy] = [42];
+      final source = _FakeVault()..objects.addAll(List.generate(1290, _hash));
+      final second = _FakeVault();
+      final third = _FakeVault();
+      Future<SyncReport> sync(_FakeVault vault, String name) async {
+        final device = await Directory('${dir.path}/$name').create();
+        return NutstoreSync(
+          device,
+          vault.request,
+          pace: Duration.zero,
+          wire: dav.wire,
+        ).sync(
+          'test@example.com',
+          'fixture-app-password',
+          remoteFolder: 'shared',
+        );
+      }
+
+      final initial = await sync(source, 'source');
+      expect(initial.uploaded, 1291);
+      expect(initial.downloaded, 1);
+      expect(initial.complete, isTrue);
+      expect(dav.files[legacy], [42]);
+      expect(dav.files.keys.where((path) => path.endsWith('.pack')).length, 11);
+      final intervalStart = dav.calls.length;
+      expect((await sync(second, 'second')).downloaded, 1291);
+      expect((await sync(third, 'third')).downloaded, 1291);
+      expect(second.objects, source.objects);
+      expect(third.objects, source.objects);
+      expect(dav.calls.skip(intervalStart), isNot(contains(('GET', legacy))));
+
+      final idlePass = await sync(second, 'second');
+      expect(idlePass.downloaded, 0);
+      expect(idlePass.uploaded, 0);
+
+      second.objects.add(_hash(1291));
+      expect((await sync(second, 'second')).uploaded, 1);
+      expect((await sync(source, 'source')).downloaded, 1);
+      expect((await sync(third, 'third')).downloaded, 1);
+      expect(third.objects.length, 1292);
+    },
+  );
+
+  test(
+    'continues a quota-limited upload without rewriting committed packs',
+    () async {
+      final dir = await Directory.systemTemp.createTemp('wencrypt-packs-test');
+      addTearDown(() => dir.delete(recursive: true));
+      final dav = _MemoryDav();
+      final source = _FakeVault(objectSize: 260 * 1024)
+        ..objects.addAll(List.generate(95, _hash));
+      Future<SyncReport> sync() =>
+          NutstoreSync(
+            dir,
+            source.request,
+            pace: Duration.zero,
+            wire: dav.wire,
+          ).sync(
+            'test@example.com',
+            'fixture-app-password',
+            remoteFolder: 'shared',
+          );
+      final first = await sync();
+      expect(first.complete, isFalse);
+      expect(first.uploaded, greaterThan(0));
+      expect(first.uploaded, lessThan(95));
+      var uploaded = first.uploaded;
+      final ledger = File('${dir.path}/sync-budget.json');
+      for (var window = 0; window < 4 && uploaded < 95; window++) {
+        final state = jsonDecode(await ledger.readAsString()) as Map;
+        state['requests'] = [];
+        await ledger.writeAsString(jsonEncode(state));
+        uploaded += (await sync()).uploaded;
+      }
+      expect(uploaded, 95);
+      expect(dav.calls.where((c) => c.$1 == 'PUT').length, 95);
+    },
+  );
+
+  test('joining a missing cloud vault performs no writes', () async {
+    final dir = await Directory.systemTemp.createTemp('wencrypt-join-test');
+    addTearDown(() => dir.delete(recursive: true));
+    final dav = _MemoryDav();
+    final vault = _FakeVault();
+    NutstoreSync client() =>
+        NutstoreSync(dir, vault.request, pace: Duration.zero, wire: dav.wire);
+    expect(
+      await client().readExistingBootstrap(
+        'test@example.com',
+        'fixture',
+        'shared',
+      ),
+      '010203',
+    );
+    await expectLater(
+      client().readExistingBootstrap('test@example.com', 'fixture', 'missing'),
+      throwsA(
+        isA<DavFailure>().having((e) => e.reason, 'reason', 'remote_missing'),
+      ),
+    );
+    await expectLater(
+      client().sync(
+        'test@example.com',
+        'fixture',
+        remoteFolder: 'missing',
+        existingOnly: true,
+      ),
+      throwsA(
+        isA<DavFailure>().having((e) => e.reason, 'reason', 'remote_missing'),
+      ),
+    );
+    expect(dav.calls.map((call) => call.$1).toSet(), {'GET', 'PROPFIND'});
+  });
+
   group('Nutstore bootstrap GET returns 409', () {
     const vault = '0123456789abcdef0123456789abcdef';
     Future<Map<String, dynamic>> snapshot(
       String op, [
       Map<String, dynamic> args = const {},
-    ]) async => {'vault': vault, 'bootstrap': '010203', 'objects': []};
+    ]) async => {
+      'vault': vault,
+      'bootstrap': '010203',
+      'objects': <String, int>{},
+    };
 
     test('creates the missing directory and verifies the bootstrap', () async {
       final dir = await Directory.systemTemp.createTemp('wencrypt-sync-test');
@@ -171,10 +396,7 @@ void main() {
           }
         },
       );
-      expect(
-        await sync.sync('test@example.com', 'test-only'),
-        contains('上传 0'),
-      );
+      expect((await sync.sync('test@example.com', 'test-only')).uploaded, 0);
       expect(calls, ['PROPFIND', 'GET', 'MKCOL', 'PUT', 'GET', 'PROPFIND']);
       expect(await File('${dir.path}/sync-$vault.bound').exists(), isTrue);
     });

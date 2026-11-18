@@ -6,12 +6,26 @@ import 'package:wencrypt/main.dart';
 import 'package:wencrypt/sync.dart';
 
 void main() {
-  testWidgets('alpha starts locked and has no entry editor', (tester) async {
+  testWidgets('first launch separates creation and joining', (tester) async {
     await tester.pumpWidget(const WencryptApp());
     await tester.pumpAndSettle();
-    expect(find.text('创建你的密码库'), findsOneWidget);
+    expect(find.text('欢迎使用 Wencrypt'), findsOneWidget);
     expect(find.text('新增账号'), findsNothing);
+    expect(find.text('主密码（至少 12 个字符）'), findsNothing);
+
+    await tester.tap(find.text('创建新库'));
+    await tester.pumpAndSettle();
     expect(find.text('主密码（至少 12 个字符）'), findsOneWidget);
+    expect(find.text('再次输入主密码'), findsOneWidget);
+    expect(find.text('从加密备份恢复'), findsNothing);
+
+    await tester.tap(find.text('返回'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('加入已有库'));
+    await tester.pumpAndSettle();
+    expect(find.text('从坚果云加入'), findsOneWidget);
+    expect(find.text('从加密备份恢复'), findsOneWidget);
+    expect(find.text('主密码（至少 12 个字符）'), findsNothing);
   });
   test('budget survives restarts and refuses excess requests', () async {
     final dir = await Directory.systemTemp.createTemp('wencrypt-budget-test');

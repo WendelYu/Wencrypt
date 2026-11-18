@@ -30,9 +30,9 @@ WEN-002 改为坚果云应用密码认证、MKCOL/PUT/GET/PROPFIND、限流和�
 
 `.github/workflows/ci.yml` 在 push、PR 和手动触发时运行 Rust 测试、Clippy、格式检查和 Python 探针测试，再构建三端开发产物，上传 Actions artifacts，保留14天。
 
-Windows：未签名 Release 文件夹（需完整下载解压，不只是 exe）。macOS：临时签名的 .app ZIP，未公证。Android：调试签名 ARM64 APK；不同CI运行的调试密钥可能不同，不能用于稳定升级。
+Windows 提供 x64 ZIP。macOS 提供 Apple 芯片版 DMG，包含拖拽安装和首次打开帮助，Actions 另保留 ZIP。macOS 应用使用临时签名，尚未经 Apple 公证。Android 提供 ARM64 调试签名 APK，不同 CI 运行的调试密钥可能不同，更新前请先导出并验证加密备份。
 
-这不是正式发布流水线，不自动发布 GitHub Release，不上传任何云盘凭据。正式签名需要另建受保护的 release environment、用户提供签名证书和密钥，并审核后启用。可在仓库 Actions 页面查看真实构建结果。
+把 `apps/wencrypt_flutter/pubspec.yaml` 的 `version` 提升到新的 `主版本.次版本.修订号+构建号` 并推送到 `main`。三端测试和打包成功后，CI 根据版本创建对应的 GitHub Release，上传安装包和 SHA-256 清单。已发布的版本会跳过，仅提升构建号会继续使用同一个版本号。可在仓库 Actions 页面查看构建结果。
 
 开源前仍需明确项目LICENSE、固定第三方Action提交SHA和依赖许可证检查。SDK、缓存、构建产物和凭据排除在版本控制外；示例向量中的密码/密钥是明确标注的公开测试数据。
 

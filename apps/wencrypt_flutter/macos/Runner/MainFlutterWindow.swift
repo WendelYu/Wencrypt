@@ -48,26 +48,57 @@ class MainFlutterWindow: NSWindow {
       deviceChannel.invokeMethod("systemLocked",arguments:nil)
     }
     let browsers = [
-      "Chrome": "com.google.Chrome",
-      "Edge": "com.microsoft.edgemac",
-      "Firefox": "org.mozilla.firefox"
+      "Chrome": ("com.google.Chrome", "chrome://password-manager/settings"),
+      "Edge": ("com.microsoft.edgemac", "edge://settings/passwords"),
+      "Firefox": ("org.mozilla.firefox", "about:logins")
     ]
     let browserChannel = FlutterMethodChannel(name:"org.wencrypt.browser-import", binaryMessenger:flutterViewController.engine.binaryMessenger)
     browserChannel.setMethodCallHandler { call, result in
       if call.method == "installed" {
         result(browsers.keys.sorted().filter {
-          guard let id = browsers[$0] else { return false }
+          guard let (id, _) = browsers[$0] else { return false }
           return NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) != nil
         })
-      } else if call.method == "open", let name = call.arguments as? String, let id = browsers[name] {
+      } else if call.method == "open", let name = call.arguments as? String,
+                let (id, address) = browsers[name], let url = URL(string: address) {
         guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) else {
           result(FlutterError(code: "browser_open_failed", message: nil, details: nil))
           return
         }
-        // Internal browser URLs are only handled inside the browser, not by Launch Services.
-        NSWorkspace.shared.openApplication(at: app, configuration: NSWorkspace.OpenConfiguration()) { _, error in
+        let workspace = NSWorkspace.shared
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.promptsUserIfNeeded = false
+        workspace.open([url], withApplicationAt: app, configuration: configuration) { _, error in
           DispatchQueue.main.async {
-            result(error == nil ? nil : FlutterError(code: "browser_open_failed", message: nil, details: nil))
+            if error == nil {
+              result(true)
+              return
+            }
+            workspace.openApplication(at: app, configuration: configuration) { _, fallbackError in
+              DispatchQueue.main.async {
+                guard fallbackError == nil else {
+                  result(FlutterError(code: "browser_open_failed", message: nil, details: nil))
+                  return
+                }
+                guard name == "Chrome" || name == "Edge" else {
+                  result(false)
+                  return
+                }
+                // These browsers expose a native tab API. macOS asks for consent
+                // before the first Apple Event to each browser.
+                let script = NSAppleScript(source: """
+                  with timeout of 30 seconds
+                    tell application id "\(id)"
+                      if (count of windows) is 0 then make new window
+                      tell front window to make new tab with properties {URL:"\(address)"}
+                      activate
+                    end tell
+                  end timeout
+                  """)
+                var scriptError: NSDictionary?
+                result(script?.executeAndReturnError(&scriptError) != nil && scriptError == nil)
+              }
+            }
           }
         }
       } else if call.method == "watchDirs" {

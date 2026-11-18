@@ -84,7 +84,7 @@ class BrowserWatchResult {
 const _browserChannel = MethodChannel('org.wencrypt.browser-import');
 const _settings = {
   'Chrome': 'chrome://password-manager/settings',
-  'Edge': 'edge://wallet/passwords',
+  'Edge': 'edge://settings/passwords',
   'Firefox': 'about:logins',
 };
 
@@ -159,47 +159,25 @@ Future<List<Directory>> defaultWatchDirectories() async {
   return accessible;
 }
 
-Future<void> launchBrowserForExport(String browser, String app) async {
-  final address = browserSettingsUrl(browser);
-  await Clipboard.setData(ClipboardData(text: address));
-  if (Platform.isMacOS) {
-    await _browserChannel.invokeMethod<void>('open', browser);
-  } else if (Platform.isWindows) {
-    await Process.start(app, [address], mode: ProcessStartMode.detached);
-  }
-}
+enum BrowserLaunch { settings, browserOnly, failed }
 
-Future<bool> openExportSettings(
-  BuildContext context,
-  String browser,
-  String app,
-) async {
-  if (Platform.isMacOS) {
-    final address = browserSettingsUrl(browser);
-    final proceed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text('从 $browser 导出密码'),
-        content: Text(
-          '打开浏览器后，将复制的地址粘贴到地址栏。'
-          '在密码管理页面导出 CSV，再回到 Wencrypt 自动导入。\n\n$address',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: Text('复制地址并打开 $browser'),
-          ),
-        ],
-      ),
-    );
-    if (proceed != true) return false;
+Future<BrowserLaunch> launchBrowserForExport(String browser, String app) async {
+  final address = browserSettingsUrl(browser);
+  try {
+    if (Platform.isMacOS) {
+      final opened = await _browserChannel.invokeMethod<bool>('open', browser);
+      if (opened == true) return BrowserLaunch.settings;
+      await Clipboard.setData(ClipboardData(text: address));
+      return BrowserLaunch.browserOnly;
+    }
+    if (Platform.isWindows) {
+      await Process.start(app, [address], mode: ProcessStartMode.detached);
+      return BrowserLaunch.settings;
+    }
+  } catch (_) {
+    return BrowserLaunch.failed;
   }
-  await launchBrowserForExport(browser, app);
-  return true;
+  return BrowserLaunch.failed;
 }
 
 /// Watches one or more directories for newly written browser password CSV exports.
@@ -382,6 +360,7 @@ Future<void> shredFile(File file) async {
 Future<BrowserWatchResult?> watchBrowserExportDialog(
   BuildContext context, {
   required String browser,
+  required String app,
   required List<Directory> initialDirs,
 }) async {
   final watcher = BrowserCsvWatcher(initialDirs);
@@ -393,6 +372,8 @@ Future<BrowserWatchResult?> watchBrowserExportDialog(
 
   StreamSubscription<CapturedBrowserCsv>? sub;
   var popped = false;
+  var launching = true;
+  BrowserLaunch? launch;
 
   try {
     return await showDialog<BrowserWatchResult>(
@@ -401,12 +382,27 @@ Future<BrowserWatchResult?> watchBrowserExportDialog(
       builder: (ctx) {
         return StatefulBuilder(
           builder: (ctx, setLocal) {
-            sub ??= watcher.onCaptured.listen((captured) {
-              if (!popped && ctx.mounted) {
-                popped = true;
-                Navigator.pop(ctx, BrowserWatchResult.captured(captured));
+            Future<void> openBrowser() async {
+              final result = await launchBrowserForExport(browser, app);
+              if (ctx.mounted && !popped) {
+                setLocal(() {
+                  launch = result;
+                  launching = false;
+                });
               }
-            });
+            }
+
+            if (sub == null) {
+              sub = watcher.onCaptured.listen((captured) {
+                if (!popped && ctx.mounted) {
+                  popped = true;
+                  Navigator.pop(ctx, BrowserWatchResult.captured(captured));
+                }
+              });
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (ctx.mounted && !popped) unawaited(openBrowser());
+              });
+            }
 
             final address = browserSettingsUrl(browser);
             final dirs = watcher.directories;
@@ -435,19 +431,25 @@ Future<BrowserWatchResult?> watchBrowserExportDialog(
                     Container(
                       padding: const EdgeInsets.all(14),
                       decoration: BoxDecoration(
-                        color: Theme.of(
-                          ctx,
-                        ).colorScheme.surfaceContainerHighest.withValues(alpha: 0.5),
+                        color: Theme.of(ctx).colorScheme.surfaceContainerHighest
+                            .withValues(alpha: 0.5),
                         borderRadius: BorderRadius.circular(12),
                       ),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            '已为你打开 $browser 并复制设置页地址：',
-                            style: Theme.of(ctx).textTheme.bodyMedium?.copyWith(
-                              fontWeight: FontWeight.w600,
-                            ),
+                            launching
+                                ? '正在打开 $browser…'
+                                : switch (launch) {
+                                    BrowserLaunch.settings =>
+                                      '已向 $browser 发送密码管理页地址',
+                                    BrowserLaunch.browserOnly =>
+                                      '已打开 $browser 并复制地址',
+                                    _ => '无法启动 $browser，可手动打开并粘贴地址',
+                                  },
+                            style: Theme.of(ctx).textTheme.bodyMedium
+                                ?.copyWith(fontWeight: FontWeight.w600),
                           ),
                           const SizedBox(height: 6),
                           Row(
@@ -480,11 +482,18 @@ Future<BrowserWatchResult?> watchBrowserExportDialog(
                           ),
                           const SizedBox(height: 8),
                           const Text(
-                            '1. 在浏览器地址栏粘贴并回车\n'
-                            '2. 点击「导出密码」保存 CSV 文件到下载目录\n'
-                            '3. Wencrypt 将自动捕获、导入并安全粉碎原文件',
+                            '如果未进入密码管理页，请在浏览器地址栏粘贴上方地址。\n'
+                            '点击「导出密码」，将 CSV 保存到正在监听的目录。',
                             style: TextStyle(height: 1.5),
                           ),
+                          if (launch == BrowserLaunch.failed && !launching)
+                            TextButton(
+                              onPressed: () {
+                                setLocal(() => launching = true);
+                                unawaited(openBrowser());
+                              },
+                              child: Text('重新打开 $browser'),
+                            ),
                         ],
                       ),
                     ),
@@ -503,7 +512,10 @@ Future<BrowserWatchResult?> watchBrowserExportDialog(
                         children: [
                           for (final d in dirs)
                             Chip(
-                              avatar: const Icon(Icons.folder_outlined, size: 16),
+                              avatar: const Icon(
+                                Icons.folder_outlined,
+                                size: 16,
+                              ),
                               label: Text(
                                 d.path,
                                 overflow: TextOverflow.ellipsis,
@@ -526,7 +538,10 @@ Future<BrowserWatchResult?> watchBrowserExportDialog(
                               if (ctx.mounted) setLocal(() {});
                             }
                           },
-                          icon: const Icon(Icons.create_new_folder_outlined, size: 18),
+                          icon: const Icon(
+                            Icons.create_new_folder_outlined,
+                            size: 18,
+                          ),
                           label: Text(dirs.isEmpty ? '选择监听目录' : '添加监听目录'),
                         ),
                         TextButton.icon(
@@ -592,22 +607,28 @@ Future<List<Map<String, String>>?> selectPasswords(
   bool? shredAfterImport,
   ValueChanged<bool>? onShredChanged,
   String? sourceFileName,
+  List<String> groups = const [],
+  String? initialGroup,
 }) {
-  (String, String, String) identity(Map data) => (
-    data['url'] as String,
-    data['username'] as String,
-    data['password'] as String,
-  );
+  (String, String, String, String) identity(Map data) {
+    final url = (data['url'] as String).trim();
+    return (
+      url,
+      data['username'] as String,
+      data['password'] as String,
+      url.isEmpty ? (data['title'] as String).trim() : '',
+    );
+  }
+
   final known = {
     for (final r in existing)
       if (r['deleted'] != true) identity(r['data'] as Map),
   };
   final duplicate = [for (final r in batch.rows) !known.add(identity(r))];
-  final selected = {
-    for (var i = 0; i < duplicate.length; i++)
-      if (!duplicate[i]) i,
-  };
+  final selected = {for (var i = 0; i < batch.rows.length; i++) i};
   var shred = shredAfterImport ?? false;
+  final customGroups = groups.where((name) => name != '导入').toList();
+  var group = customGroups.contains(initialGroup) ? initialGroup! : '';
 
   return showDialog<List<Map<String, String>>>(
     context: context,
@@ -633,6 +654,23 @@ Future<List<Map<String, String>>?> selectPasswords(
                   ),
                 ),
               Text('已识别 ${batch.source}，跳过 ${batch.skipped} 条无效记录。'),
+              if (customGroups.isNotEmpty)
+                DropdownButton<String>(
+                  isExpanded: true,
+                  value: group,
+                  items: [
+                    const DropdownMenuItem(value: '', child: Text('分组：导入')),
+                    for (final name in customGroups)
+                      DropdownMenuItem(
+                        value: name,
+                        child: Text(
+                          '分组：$name',
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                  ],
+                  onChanged: (value) => update(() => group = value ?? ''),
+                ),
               const SizedBox(height: 4),
               Wrap(
                 spacing: 8,
@@ -673,7 +711,7 @@ Future<List<Map<String, String>>?> selectPasswords(
                       ),
                       subtitle: Text(
                         [
-                          if (duplicate[i]) '相同账号和密码（已存在）',
+                          if (duplicate[i]) '相同凭据会合并',
                           row['username']!,
                           row['url']!,
                         ].where((s) => s.isNotEmpty).join(' · '),
@@ -694,8 +732,7 @@ Future<List<Map<String, String>>?> selectPasswords(
                     update(() => shred = next);
                     onShredChanged(next);
                   },
-                  title: const Text('导入后安全粉碎临时 CSV 文件（推荐）'),
-                  subtitle: const Text('使用随机数据覆写后彻底删除明文文件'),
+                  title: const Text('导入后覆盖并删除临时 CSV 文件'),
                 ),
               ],
             ],
@@ -710,7 +747,8 @@ Future<List<Map<String, String>>?> selectPasswords(
             onPressed: selected.isEmpty
                 ? null
                 : () => Navigator.pop(ctx, [
-                    for (final i in selected) batch.rows[i],
+                    for (final i in selected.toList()..sort())
+                      {...batch.rows[i], if (group.isNotEmpty) 'tags': group},
                   ]),
             child: const Text('导入所选账号'),
           ),

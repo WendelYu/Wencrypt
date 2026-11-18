@@ -112,7 +112,17 @@ typedef DavWire = Future<DavReply> Function(
   int limit,
 );
 
-Set<String> parseDavListing(List<int> bytes, Uri folder) {
+enum DavContents { vault, packBuckets, packs }
+
+final _revisionFile = RegExp(r'^[0-9a-f]{64}\.wenc$');
+final _packFile = RegExp(r'^[0-9a-f]{64}\.pack$');
+final _bucketName = RegExp(r'^[01][0-9a-f]$');
+
+Set<String> parseDavListing(
+  List<int> bytes,
+  Uri folder, {
+  DavContents contents = DavContents.vault,
+}) {
   final text = utf8.decode(bytes);
   if (text.toUpperCase().contains('<!DOCTYPE') ||
       text.toUpperCase().contains('<!ENTITY')) {
@@ -126,7 +136,7 @@ Set<String> parseDavListing(List<int> bytes, Uri folder) {
   final responses = root
       .findElements('response', namespaceUri: 'DAV:')
       .toList();
-  if (responses.length >= 600) {
+  if (responses.length >= 750) {
     throw const DavFailure('list', 'directory_limit');
   }
   final names = <String>{};
@@ -157,15 +167,31 @@ Set<String> parseDavListing(List<int> bytes, Uri folder) {
       self = true;
       continue;
     }
-    final name = uri.path.substring(folder.path.length);
-    if (name != 'bootstrap.wenc' &&
-        !RegExp(r'^[0-9a-f]{64}\.wenc$').hasMatch(name)) {
-      throw const DavFailure('list', 'unexpected_file');
-    }
+    final name = path.substring(folder.path.length);
+    final allowed = switch (contents) {
+      DavContents.vault =>
+        name == 'bootstrap.wenc' ||
+            name == 'packs-v1' ||
+            _revisionFile.hasMatch(name),
+      DavContents.packBuckets => _bucketName.hasMatch(name),
+      DavContents.packs => _packFile.hasMatch(name),
+    };
+    if (!allowed) throw const DavFailure('list', 'unexpected_file');
     if (!names.add(name)) throw const DavFailure('list', 'duplicate_href');
   }
   if (!self) throw const DavFailure('list', 'missing_collection');
   return names;
+}
+
+class SyncReport {
+  const SyncReport(this.uploaded, this.downloaded, {this.complete = true});
+
+  final int uploaded, downloaded;
+  final bool complete;
+
+  String get message =>
+      '本轮上传 $uploaded、下载 $downloaded。'
+      '${complete ? '' : '已达到同步额度，下轮继续。'}';
 }
 
 class NutstoreSync {
@@ -179,6 +205,8 @@ class NutstoreSync {
   final VaultRequest request;
   final DavWire? wire;
   final Duration pace;
+  static const _packSize = 512 * 1024;
+  static const _packCount = 128;
   final HttpClient client = HttpClient()
     ..connectionTimeout = const Duration(seconds: 20);
   String auth = '';
@@ -300,56 +328,153 @@ class NutstoreSync {
     }
   }
 
-  List<int> unhex(String s) => [
-    for (int i = 0; i < s.length; i += 2)
-      int.parse(s.substring(i, i + 2), radix: 16),
-  ];
-  String hex(List<int> b) =>
-      b.map((v) => v.toRadixString(16).padLeft(2, '0')).join();
-  String _normalizeFolder(String? remoteFolder, String vault) {
-    final raw = (remoteFolder ?? '').trim();
-    if (raw.isEmpty) return 'wc-${vault.substring(0, 16)}/';
-    final cleaned = raw.replaceAll('\\', '/').replaceAll(RegExp(r'^/+|/+$'), '');
-    if (cleaned.isEmpty ||
-        cleaned.contains('..') ||
-        cleaned.contains('/') ||
-        cleaned.length > 32) {
-      throw const DavFailure('configure', 'invalid_remote_folder');
+  List<int> unhex(String value) {
+    final bytes = Uint8List(value.length ~/ 2);
+    for (var i = 0; i < bytes.length; i++) {
+      bytes[i] = int.parse(value.substring(i * 2, i * 2 + 2), radix: 16);
     }
-    return '$cleaned/';
+    return bytes;
   }
 
-  Future<String> sync(
-    String username,
-    String password, {
-    String? remoteFolder,
-  }) async {
+  String hex(List<int> bytes) {
+    final buffer = StringBuffer();
+    for (final byte in bytes) {
+      buffer.write(byte.toRadixString(16).padLeft(2, '0'));
+    }
+    return buffer.toString();
+  }
+
+  String _folderName(String raw) {
+    final name = raw.trim().replaceAll(RegExp(r'^/+|/+$'), '');
+    if (name.isEmpty ||
+        name == '.' ||
+        name.contains('..') ||
+        name.contains('/') ||
+        name.contains('\\') ||
+        name.length > 32) {
+      throw const DavFailure('configure', 'invalid_remote_folder');
+    }
+    return name;
+  }
+
+  Uri _folderUri(String name) => root.replace(pathSegments: ['dav', name, '']);
+
+  String _packBucket(String pack) =>
+      (int.parse(pack.substring(0, 2), radix: 16) & 31)
+          .toRadixString(16)
+          .padLeft(2, '0');
+
+  void _configure(String username, String password) {
     if (username.trim().isEmpty || username.contains(':') || password.isEmpty) {
       throw const DavFailure('configure', 'missing_credentials');
     }
     auth = 'Basic ${base64Encode(utf8.encode('${username.trim()}:$password'))}';
     budget = SyncBudget(File('${directory.path}/sync-budget.json'));
+  }
+
+  Future<void> _authenticate() async {
+    await send(
+      'authenticate',
+      'PROPFIND',
+      root,
+      body: prop,
+      depth: '0',
+      limit: 64 * 1024,
+      accepted: {207},
+    );
+  }
+
+  Future<String> readExistingBootstrap(
+    String username,
+    String password,
+    String folderName,
+  ) async {
     try {
-      final snapshot = await request('sync_objects');
+      final folder = _folderUri(_folderName(folderName));
+      _configure(username, password);
+      await _authenticate();
+      final reply = await send(
+        'read_bootstrap',
+        'GET',
+        folder.resolve('bootstrap.wenc'),
+        limit: 8192,
+        accepted: {200, 404, 409},
+      );
+      if (reply.status != 200) {
+        throw DavFailure('read_bootstrap', 'remote_missing', reply.status);
+      }
+      return hex(reply.body);
+    } finally {
+      auth = '';
+      client.close(force: true);
+    }
+  }
+
+  Future<Set<String>> _list(Uri folder, DavContents contents) async {
+    final reply = await send(
+      'list',
+      'PROPFIND',
+      folder,
+      body: prop,
+      accepted: {207},
+    );
+    return parseDavListing(reply.body, folder, contents: contents);
+  }
+
+  Future<void> _makeFolder(Uri folder) async {
+    await send(
+      'create_pack_directory',
+      'MKCOL',
+      folder,
+      limit: 8192,
+      accepted: {201, 405},
+    );
+  }
+
+  Iterable<List<String>> _packGroups(Map<String, int> objects) sync* {
+    var size = 4;
+    var group = <String>[];
+    for (final object in objects.entries) {
+      final record = 4 + object.value;
+      if (record + 4 > _packSize) {
+        throw const DavFailure('upload', 'revision_size_limit');
+      }
+      if (group.length == _packCount || size + record > _packSize) {
+        yield group;
+        group = [];
+        size = 4;
+      }
+      group.add(object.key);
+      size += record;
+    }
+    if (group.isNotEmpty) yield group;
+  }
+
+  Future<SyncReport> sync(
+    String username,
+    String password, {
+    String? remoteFolder,
+    bool existingOnly = false,
+    void Function(String message)? onProgress,
+  }) async {
+    _configure(username, password);
+    var downloaded = 0;
+    var uploaded = 0;
+    void progress() => onProgress?.call('已上传 $uploaded 条，已下载 $downloaded 条');
+    try {
+      final snapshot = await request('sync_inventory');
       final vault = snapshot['vault'] as String;
-      final folderName = _normalizeFolder(remoteFolder, vault);
-      final isDefaultFolder = folderName == 'wc-${vault.substring(0, 16)}/';
-      final folder = root.resolve(folderName);
-      final boundKey = isDefaultFolder
+      final defaultName = 'wc-${vault.substring(0, 16)}';
+      final folderName = (remoteFolder ?? '').trim().isEmpty
+          ? defaultName
+          : _folderName(remoteFolder!);
+      final folder = _folderUri(folderName);
+      final boundKey = folderName == defaultName
           ? vault
-          : '$vault-${base64Url.encode(utf8.encode(folderName))}';
+          : '$vault-${base64Url.encode(utf8.encode('$folderName/'))}';
       final remembered = File('${directory.path}/sync-$boundKey.bound');
       final bootstrap = unhex(snapshot['bootstrap'] as String);
-      // Authentication is diagnosed separately from missing collections.
-      await send(
-        'authenticate',
-        'PROPFIND',
-        root,
-        body: prop,
-        depth: '0',
-        limit: 64 * 1024,
-        accepted: {207},
-      );
+      await _authenticate();
       var remote = await send(
         'read_bootstrap',
         'GET',
@@ -358,7 +483,7 @@ class NutstoreSync {
         accepted: {200, 404, 409},
       );
       if (remote.status != 200) {
-        if (await remembered.exists()) {
+        if (existingOnly || await remembered.exists()) {
           throw DavFailure('read_bootstrap', 'remote_missing', remote.status);
         }
         // Nutstore can return 409 for a file inside a missing collection.
@@ -412,52 +537,125 @@ class NutstoreSync {
         throw const DavFailure('verify_bootstrap', 'vault_identity_mismatch');
       }
       await remembered.writeAsString('bound', flush: true);
-      final listing = await send(
-        'list',
-        'PROPFIND',
-        folder,
-        body: prop,
-        accepted: {207},
-      );
-      final names = parseDavListing(listing.body, folder);
+      final names = await _list(folder, DavContents.vault);
       if (!names.contains('bootstrap.wenc')) {
         throw const DavFailure('list', 'bootstrap_missing');
       }
-      final remoteHashes = names
-          .where((n) => n != 'bootstrap.wenc')
-          .map((n) => n.substring(0, 64))
-          .toSet();
-      final objects = (snapshot['objects'] as List)
-          .cast<Map<String, dynamic>>();
-      final local = objects.map((o) => o['hash'] as String).toSet();
-      if (remoteHashes.union(local).length >= 598) {
-        throw const DavFailure('list', 'directory_limit');
+      final local = Map<String, int>.from(snapshot['objects'] as Map);
+      final known = local.keys.toSet();
+      final packed = <String>{};
+      final packsFolder = folder.resolve('packs-v1/');
+      final packsExist = names.contains('packs-v1');
+      final buckets = <String>{};
+      final remotePacks = <String, Uri>{};
+
+      if (packsExist) {
+        buckets.addAll(await _list(packsFolder, DavContents.packBuckets));
+        for (final bucket in buckets) {
+          final bucketUri = packsFolder.resolve('$bucket/');
+          for (final file in await _list(bucketUri, DavContents.packs)) {
+            final pack = file.substring(0, 64);
+            if (bucket != _packBucket(pack)) {
+              throw const DavFailure('list', 'pack_in_wrong_bucket');
+            }
+            remotePacks[pack] = bucketUri.resolve(file);
+          }
+        }
       }
-      int downloaded = 0, uploaded = 0;
-      for (final hash in remoteHashes.difference(local)) {
+
+      if (remotePacks.isNotEmpty) {
+        final receipts =
+            (await request('sync_receipts', {
+                  'packs': remotePacks.keys.toList(),
+                }))['packs']
+                as Map;
+        for (final pack in remotePacks.entries) {
+          final receipt = receipts[pack.key];
+          if (receipt is List && receipt.every(known.contains)) {
+            packed.addAll(receipt.cast<String>());
+            continue;
+          }
+          final response = await send(
+            'download_pack',
+            'GET',
+            pack.value,
+            limit: _packSize,
+          );
+          final result = await request('sync_ingest_pack', {
+            'hash': pack.key,
+            'body': hex(response.body),
+          });
+          final hashes = (result['hashes'] as List).cast<String>();
+          for (final hash in hashes) {
+            if (known.add(hash)) downloaded++;
+          }
+          packed.addAll(hashes);
+          progress();
+        }
+      }
+
+      // Existing flat objects remain readable. Publish them in packs too so
+      // another newly joined device can fetch the complete history efficiently.
+      var readLegacy = false;
+      for (final file in names.where(_revisionFile.hasMatch)) {
+        final hash = file.substring(0, 64);
+        if (known.contains(hash)) continue;
         final response = await send(
-          'download',
+          'download_legacy',
           'GET',
-          folder.resolve('$hash.wenc'),
+          folder.resolve(file),
         );
         await request('ingest', {'hash': hash, 'body': hex(response.body)});
+        known.add(hash);
+        readLegacy = true;
         downloaded++;
+        progress();
       }
-      for (final object in objects.where(
-        (o) => !remoteHashes.contains(o['hash']),
-      )) {
-        await send(
-          'upload',
+      final remaining = readLegacy
+          ? Map<String, int>.from(
+              (await request('sync_inventory'))['objects'] as Map,
+            )
+          : local;
+      remaining.removeWhere((hash, _) => packed.contains(hash));
+      if (remaining.isNotEmpty && !packsExist) await _makeFolder(packsFolder);
+      for (final group in _packGroups(remaining)) {
+        final result = await request('sync_build_pack', {'hashes': group});
+        final pack = result['hash'] as String;
+        final body = unhex(result['body'] as String);
+        final bucket = _packBucket(pack);
+        final bucketUri = packsFolder.resolve('$bucket/');
+        if (buckets.add(bucket)) await _makeFolder(bucketUri);
+        final uri = bucketUri.resolve('$pack.pack');
+        final reply = await send(
+          'upload_pack',
           'PUT',
-          folder.resolve('${object['hash']}.wenc'),
-          body: unhex(object['body'] as String),
+          uri,
+          body: body,
           limit: 8192,
-          accepted: {201, 204},
+          createOnly: true,
+          accepted: {201, 204, 412},
         );
-        uploaded++;
+        if (reply.status == 412) {
+          final existing = await send(
+            'verify_pack',
+            'GET',
+            uri,
+            limit: _packSize,
+          );
+          if (hex(existing.body) != result['body']) {
+            throw const DavFailure('verify_pack', 'pack_content_mismatch');
+          }
+        }
+        uploaded += group.length;
+        progress();
       }
-      return '本轮上传 $uploaded、下载 $downloaded；其他设备的新内容会在后续同步发现。';
+      return SyncReport(uploaded, downloaded);
     } catch (e) {
+      if (e is DavFailure &&
+          e.reason == 'free_budget_reached' &&
+          (downloaded > 0 || uploaded > 0)) {
+        return SyncReport(uploaded, downloaded, complete: false);
+      }
       final safe = e is DavFailure
           ? e
           : const DavFailure('merge_or_parse', 'validation_failed');

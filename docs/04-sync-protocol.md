@@ -9,14 +9,19 @@
 
 ## 2. 远端布局和后端接口
 
-AppFolder 下布局：
+坚果云 WebDAV 的现行布局如下。
 
 ```text
-vaults/<vault_id_hex>/bootstrap.wenc
-vaults/<vault_id_hex>/objects/<sha256>.wenc
+<同步目录>/bootstrap.wenc
+<同步目录>/<修订 SHA-256>.wenc
+<同步目录>/packs-v1/<分桶>/<密文包 SHA-256>.pack
 ```
 
-库 UUID 随机且不含用户命名；不上传明文索引/manifest。MVP 不分片目录，避免创建大量目录的请求成本；文件规模以 10,000 修订验证，后续必要时升级布局。
+同步沿用原引导文件和目录。旧版根目录中的单个修订仍能读取。新版第一次同步时把已有修订也发布进密文包，新设备可以按包拉取。所有旧文件继续保留，同一库的设备需先升级到支持该布局的版本。
+
+包以四字节 `WPK1` 开头，每个成员是四字节大端长度和完整的原始 WENC 修订。每包最多 128 条、512 KiB。包名是整个包的 SHA-256，分桶取摘要首字节的低 5 位，编码为 `00` 至 `1f`。包与成员均可按内容去重。接收端核对包摘要，逐项验证 WENC 和版本图，并在一个本机事务中保存修订与接收凭据。收到额度错误时，下轮对照已验证的接收凭据和服务器现有文件继续。枚举仍会拒绝达到服务端 750 项上限的目录，以防把截断列表当成完整结果。[坚果云 WebDAV 限制](https://help.jianguoyun.com/?p=2064)
+
+已有库在线加入时只读取已存在的引导文件，用原主密码在本机认证，随后按相同的库 ID 和密钥同步。首次加入只会安装到空本机路径。
 
 存储抽象：list_objects(cursor)、get_object(hash)、put_object(hash, bytes)、get_bootstrap、create_vault。接口返回分页游标/重试提示/认证失效/配额错误等类型化结果，不暴露业务明文。
 
@@ -27,7 +32,7 @@ vaults/<vault_id_hex>/objects/<sha256>.wenc
 - bootstrap 只在新随机目录创建；失败重试时核对原字节。禁止自动新建空库覆盖已存在库。
 - v1 正常同步不发 DELETE；云端文件删除不是账号条目删除。
 
-WebDAV 后续适配 GET/PUT/PROPFIND/MKCOL；不依赖 LOCK、MOVE 或服务器 ETag 实现合并。具体服务仍需限流、目录列举与上传可见性测试。OneDrive 本地同步目录后置，不能未经适配直接指向 SQLite 文件。
+坚果云使用 GET、PUT、PROPFIND 和 MKCOL。OneDrive 本地同步目录仍需单独适配。
 
 ## 3. 本地保存及同步流程
 

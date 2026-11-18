@@ -15,6 +15,9 @@ use zeroize::{Zeroize, Zeroizing};
 
 type Result<T> = std::result::Result<T, &'static str>;
 const LIMIT: usize = 10000;
+const PACK_LIMIT: usize = 512 * 1024;
+const PACK_OBJECTS: usize = 128;
+const PACK_MAGIC: &[u8] = b"WPK1";
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
@@ -98,7 +101,12 @@ fn connection(path: &str, create: bool) -> Result<Connection> {
     Ok(db)
 }
 // Install a fully committed database without replacing any existing vault.
-fn install(path: &str, bootstrap: &[u8], objects: &[Vec<u8>]) -> Result<()> {
+fn install(
+    path: &str,
+    bootstrap: &[u8],
+    objects: &[Vec<u8>],
+    sync_settings: Option<&[u8]>,
+) -> Result<()> {
     let temporary = format!("{}.{}.stage", path, identifier()?);
     let result = (|| {
         let mut db = connection(&temporary, true)?;
@@ -107,6 +115,12 @@ fn install(path: &str, bootstrap: &[u8], objects: &[Vec<u8>]) -> Result<()> {
             "INSERT INTO metadata VALUES ('bootstrap',?1)",
             params![bootstrap],
         ))?;
+        if let Some(bytes) = sync_settings {
+            sql(tx.execute(
+                "INSERT INTO metadata VALUES ('local-sync-settings',?1)",
+                params![bytes],
+            ))?;
+        }
         for body in objects {
             sql(tx.execute(
                 "INSERT INTO objects VALUES (?1,?2)",
@@ -132,6 +146,21 @@ fn bootstrap(db: &Connection) -> Result<Vec<u8>> {
         |r| r.get(0),
     ))
 }
+fn sealed_sync_settings(dek: &[u8; 32], id: &[u8; 16], settings: &Value) -> Result<Vec<u8>> {
+    let username = field(settings, "username")?;
+    let password = field(settings, "password")?;
+    if username.len() > 320 || password.len() > 1024 || username.contains(':') {
+        return Err("invalid_settings");
+    }
+    let plain = Zeroizing::new(
+        serde_json::to_vec(
+            &json!({"purpose":"wencrypt-local-sync-settings-v1","settings":settings}),
+        )
+        .map_err(|_| "encode_failed")?,
+    );
+    crypto(envelope::encrypt_object(dek, id, Kind::Backup, &plain))
+}
+
 fn view(revisions: &BTreeMap<String, Revision>) -> Result<graph::View> {
     graph::evaluate(
         &revisions
@@ -178,6 +207,140 @@ fn validate_entry(e: &Entry) -> Result<()> {
     }
     Ok(())
 }
+fn credential(e: &Entry) -> (&str, &str, &str, &str) {
+    let url = e.url.trim();
+    let title_without_url = if url.is_empty() { e.title.trim() } else { "" };
+    (url, &e.username, &e.password, title_without_url)
+}
+
+fn merge_import_metadata(current: &mut Entry, incoming: &Entry) -> bool {
+    let mut changed = false;
+    let note = incoming.notes.trim();
+    if !note.is_empty() {
+        let existing = current.notes.trim();
+        if existing.is_empty() {
+            current.notes = note.to_owned();
+            changed = true;
+        } else if current.notes.len() + note.len() + 2 <= 16384 {
+            let already_present = existing.char_indices().any(|(start, _)| {
+                (start == 0 || existing[..start].ends_with("\n\n"))
+                    && existing[start..]
+                        .strip_prefix(note)
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with("\n\n"))
+            });
+            if !already_present {
+                current.notes.push_str("\n\n");
+                current.notes.push_str(note);
+                changed = true;
+            }
+        }
+    }
+    let tags = |c| matches!(c, ',' | '，' | ';' | '；');
+    let mut existing = current
+        .tags
+        .split(tags)
+        .map(|tag| tag.trim().to_lowercase())
+        .collect::<BTreeSet<_>>();
+    for tag in incoming.tags.split(tags).map(str::trim) {
+        if tag.is_empty() || matches!(tag, "置顶") || tag.eq_ignore_ascii_case("pinned") {
+            continue;
+        }
+        let separator = if current.tags.is_empty() { "" } else { ", " };
+        if current.tags.len() + separator.len() + tag.len() <= 16384
+            && existing.insert(tag.to_lowercase())
+        {
+            current.tags.push_str(separator);
+            current.tags.push_str(tag);
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn write_revision(
+    db: &Connection,
+    dek: &[u8; 32],
+    vault: &[u8; 16],
+    revision: &Revision,
+) -> Result<()> {
+    let mut plain = Zeroizing::new(Vec::new());
+    ciborium::into_writer(revision, &mut *plain).map_err(|_| "encode_failed")?;
+    let bytes = crypto(envelope::encrypt_object(dek, vault, Kind::Revision, &plain))?;
+    sql(db.execute(
+        "INSERT INTO objects VALUES (?1,?2)",
+        params![hex::encode(Sha256::digest(&bytes)), bytes],
+    ))?;
+    Ok(())
+}
+
+fn object_hash(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn pack_objects(mut body: &[u8]) -> Result<Vec<&[u8]>> {
+    if body.len() > PACK_LIMIT {
+        return Err("invalid_sync_pack");
+    }
+    body = body.strip_prefix(PACK_MAGIC).ok_or("invalid_sync_pack")?;
+    let mut objects = Vec::new();
+    while !body.is_empty() {
+        let (length, tail) = body.split_at_checked(4).ok_or("invalid_sync_pack")?;
+        let len = u32::from_be_bytes(length.try_into().unwrap()) as usize;
+        let (object, rest) = tail.split_at_checked(len).ok_or("invalid_sync_pack")?;
+        if len == 0 || objects.len() == PACK_OBJECTS {
+            return Err("invalid_sync_pack");
+        }
+        objects.push(object);
+        body = rest;
+    }
+    if objects.is_empty() {
+        return Err("invalid_sync_pack");
+    }
+    Ok(objects)
+}
+
+fn record_pack(db: &Connection, pack: &str, hashes: &[String]) -> Result<()> {
+    let receipt = serde_json::to_vec(hashes).map_err(|_| "encode_failed")?;
+    sql(db.execute(
+        "INSERT OR IGNORE INTO metadata VALUES (?1,?2)",
+        params![format!("sync-pack:{pack}"), receipt],
+    ))?;
+    Ok(())
+}
+
+fn ingest_objects(
+    s: &mut Session,
+    objects: &[&[u8]],
+    hashes: &[String],
+    pack: Option<&str>,
+) -> Result<()> {
+    let tx = sql(s
+        .db
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
+    {
+        let mut insert = sql(tx.prepare("INSERT OR IGNORE INTO objects VALUES (?1,?2)"))?;
+        for (hash, body) in hashes.iter().zip(objects) {
+            sql(insert.execute(params![hash, body]))?;
+        }
+    }
+    // Authenticate all revisions and validate ancestry before committing the batch.
+    let current = load(&tx, &s.dek, &s.id)?;
+    view(&current)?;
+    if let Some(pack) = pack {
+        record_pack(&tx, pack, hashes)?;
+    }
+    sql(tx.commit())?;
+    s.revisions = current;
+    Ok(())
+}
+
+fn now() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "clock_failed")?
+        .as_secs())
+}
+
 fn load(db: &Connection, dek: &[u8; 32], id: &[u8; 16]) -> Result<BTreeMap<String, Revision>> {
     let (count, size): (usize, usize) = sql(db.query_row(
         "SELECT count(*),coalesce(sum(length(body)),0) FROM objects",
@@ -329,14 +492,14 @@ impl Vault {
             if !view(&revisions)?.pending.is_empty() {
                 return Err("incomplete_backup");
             }
-            install(path, &b, &bodies)?;
+            install(path, &b, &bodies, None)?;
             return Ok(json!({"restored":true}));
         }
-        if op == "create" || op == "unlock" {
+        if matches!(op, "create" | "unlock" | "join") {
             self.session = None;
             let path = field(v, "path")?;
             let password = field(v, "password")?;
-            if op == "create" && Path::new(path).exists() {
+            if op != "unlock" && Path::new(path).exists() {
                 return Err("vault_already_exists");
             }
             if op == "create" && (password.chars().count() < 12 || password.len() > 1024) {
@@ -346,12 +509,28 @@ impl Vault {
                 let id = random::<16>()?;
                 let dek = Zeroizing::new(random::<32>()?);
                 let b = crypto(envelope::create_bootstrap(password, &id, &dek))?;
-                install(path, &b, &[])?;
+                install(path, &b, &[], None)?;
             }
+            let joined_key = if op == "join" {
+                let b = hex::decode(field(v, "bootstrap")?).map_err(|_| "invalid_bootstrap")?;
+                let key = crypto(envelope::unlock_bootstrap(password, &b))?;
+                let id = crypto(envelope::parse(&b))?.0.vault_id;
+                let settings = v
+                    .get("settings")
+                    .map(|settings| sealed_sync_settings(&key, &id, settings))
+                    .transpose()?;
+                install(path, &b, &[], settings.as_deref())?;
+                Some(key)
+            } else {
+                None
+            };
             let db = connection(path, false)?;
             let b = bootstrap(&db)?;
             let id = crypto(envelope::parse(&b))?.0.vault_id;
-            let dek = crypto(envelope::unlock_bootstrap(password, &b))?;
+            let dek = match joined_key {
+                Some(key) => key,
+                None => crypto(envelope::unlock_bootstrap(password, &b))?,
+            };
             let revisions = load(&db, &dek, &id)?;
             let token = identifier()?;
             self.session = Some(Session {
@@ -394,23 +573,7 @@ impl Vault {
             }
             "sync_settings_set" => {
                 let settings = v.get("settings").ok_or("invalid_settings")?;
-                let username = field(settings, "username")?;
-                let password = field(settings, "password")?;
-                if username.len() > 320 || password.len() > 1024 || username.contains(':') {
-                    return Err("invalid_settings");
-                }
-                let plain = Zeroizing::new(
-                    serde_json::to_vec(
-                        &json!({"purpose":"wencrypt-local-sync-settings-v1","settings":settings}),
-                    )
-                    .map_err(|_| "encode_failed")?,
-                );
-                let bytes = crypto(envelope::encrypt_object(
-                    &s.dek,
-                    &s.id,
-                    Kind::Backup,
-                    &plain,
-                ))?;
+                let bytes = sealed_sync_settings(&s.dek, &s.id, settings)?;
                 sql(s.db.execute(
                     "INSERT OR REPLACE INTO metadata VALUES ('local-sync-settings',?1)",
                     params![bytes],
@@ -483,39 +646,117 @@ impl Vault {
                     .db
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
                 let mut revisions = load(&tx, &s.dek, &s.id)?;
-                if revisions.len() + entries.len() > LIMIT {
-                    return Err("vault_limit");
+                let state = view(&revisions)?;
+                let mut batch: BTreeMap<_, Vec<_>> = BTreeMap::new();
+                for entry in &entries {
+                    batch.entry(credential(entry)).or_default().push(entry);
                 }
-                for data in entries {
-                    let r = Revision {
+                let mut head_counts = BTreeMap::new();
+                let mut matches: BTreeMap<_, Vec<_>> = BTreeMap::new();
+                for id in &state.heads {
+                    let head = &revisions[id];
+                    *head_counts.entry(&head.entry).or_insert(0) += 1;
+                    if !head.deleted && batch.contains_key(&credential(&head.data)) {
+                        matches
+                            .entry(credential(&head.data))
+                            .or_default()
+                            .push(head);
+                    }
+                }
+
+                let mut added = 0;
+                let mut updated = 0;
+                let mut writes = Vec::new();
+                for (key, incoming) in batch {
+                    let (entry, parents, mut data) = match matches.get(&key).map(Vec::as_slice) {
+                        Some([head])
+                            if head_counts[&head.entry] == 1 && state.pending.is_empty() =>
+                        {
+                            (head.entry.clone(), vec![head.id.clone()], head.data.clone())
+                        }
+                        Some(_) => continue,
+                        None => (identifier()?, vec![], incoming[0].clone()),
+                    };
+                    let is_new = parents.is_empty();
+                    let mut changed = false;
+                    for next in incoming.iter().skip(usize::from(is_new)) {
+                        changed |= merge_import_metadata(&mut data, next);
+                    }
+                    if !is_new && !changed {
+                        continue;
+                    }
+                    added += usize::from(is_new);
+                    updated += usize::from(!is_new);
+                    writes.push(Revision {
                         schema: 1,
                         id: identifier()?,
-                        entry: identifier()?,
-                        parents: vec![],
+                        entry,
+                        parents,
                         deleted: false,
-                        updated_at: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_err(|_| "clock_failed")?
-                            .as_secs(),
+                        updated_at: now()?,
                         data,
-                    };
-                    let mut plain = Zeroizing::new(Vec::new());
-                    ciborium::into_writer(&r, &mut *plain).map_err(|_| "encode_failed")?;
-                    let bytes = crypto(envelope::encrypt_object(
-                        &s.dek,
-                        &s.id,
-                        Kind::Revision,
-                        &plain,
-                    ))?;
-                    sql(tx.execute(
-                        "INSERT INTO objects VALUES (?1,?2)",
-                        params![hex::encode(Sha256::digest(&bytes)), bytes],
-                    ))?;
-                    revisions.insert(r.id.clone(), r);
+                    });
+                }
+                if revisions.len() + writes.len() > LIMIT {
+                    return Err("vault_limit");
+                }
+                for revision in writes {
+                    write_revision(&tx, &s.dek, &s.id, &revision)?;
+                    revisions.insert(revision.id.clone(), revision);
                 }
                 sql(tx.commit())?;
                 s.revisions = revisions;
-                Ok(json!({"imported":true}))
+                Ok(
+                    json!({"imported":true,"added":added,"updated":updated,"duplicates":entries.len()-added}),
+                )
+            }
+            "set_deleted" => {
+                let ids: BTreeSet<String> =
+                    serde_json::from_value(v.get("heads").cloned().ok_or("invalid_entry_id")?)
+                        .map_err(|_| "invalid_entry_id")?;
+                let deleted = v
+                    .get("deleted")
+                    .and_then(Value::as_bool)
+                    .ok_or("invalid_entry")?;
+                let tx = sql(s
+                    .db
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
+                let mut revisions = load(&tx, &s.dek, &s.id)?;
+                let state = view(&revisions)?;
+                if !state.pending.is_empty() {
+                    return Err("missing_ancestry");
+                }
+                if ids.is_empty() || revisions.len() + ids.len() > LIMIT {
+                    return Err("vault_limit");
+                }
+                let mut head_counts = BTreeMap::new();
+                for id in &state.heads {
+                    *head_counts.entry(&revisions[id].entry).or_insert(0) += 1;
+                }
+                let mut writes = Vec::with_capacity(ids.len());
+                for id in &ids {
+                    let head = revisions
+                        .get(id)
+                        .filter(|r| {
+                            state.heads.contains(id)
+                                && head_counts[&r.entry] == 1
+                                && r.deleted != deleted
+                        })
+                        .ok_or("entry_changed_reload")?;
+                    let mut revision = head.clone();
+                    revision.id = identifier()?;
+                    revision.parents = vec![id.clone()];
+                    revision.deleted = deleted;
+                    revision.updated_at = now()?;
+                    write_revision(&tx, &s.dek, &s.id, &revision)?;
+                    writes.push(revision);
+                }
+                for revision in writes {
+                    revisions.insert(revision.id.clone(), revision);
+                }
+                sql(tx.commit())?;
+                s.revisions = revisions;
+                Ok(json!({"changed":ids.len()}))
             }
             "save" => {
                 let data: Entry =
@@ -559,24 +800,10 @@ impl Vault {
                     entry,
                     parents,
                     deleted: v.get("deleted").and_then(Value::as_bool).unwrap_or(false),
-                    updated_at: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_err(|_| "clock_failed")?
-                        .as_secs(),
+                    updated_at: now()?,
                     data,
                 };
-                let mut plain = Zeroizing::new(Vec::new());
-                ciborium::into_writer(&r, &mut *plain).map_err(|_| "encode_failed")?;
-                let bytes = crypto(envelope::encrypt_object(
-                    &s.dek,
-                    &s.id,
-                    Kind::Revision,
-                    &plain,
-                ))?;
-                sql(tx.execute(
-                    "INSERT INTO objects VALUES (?1,?2)",
-                    params![hex::encode(Sha256::digest(&bytes)), bytes],
-                ))?;
+                write_revision(&tx, &s.dek, &s.id, &r)?;
                 sql(tx.commit())?;
                 current.insert(r.id.clone(), r);
                 s.revisions = current;
@@ -592,23 +819,89 @@ impl Vault {
                 .collect::<Result<Vec<_>>>()?;
                 Ok(json!({"vault":hex::encode(s.id),"bootstrap":hex::encode(b),"objects":objects}))
             }
+            "sync_inventory" => {
+                let mut stmt = sql(s
+                    .db
+                    .prepare("SELECT hash,length(body) FROM objects ORDER BY hash"))?;
+                let objects = sql(
+                    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, usize>(1)?)))
+                )?
+                .map(sql)
+                .collect::<Result<BTreeMap<_, _>>>()?;
+                Ok(json!({
+                    "vault":hex::encode(s.id),
+                    "bootstrap":hex::encode(bootstrap(&s.db)?),
+                    "objects":objects
+                }))
+            }
+            "sync_receipts" => {
+                let names: Vec<String> =
+                    serde_json::from_value(v.get("packs").cloned().ok_or("invalid_sync_pack")?)
+                        .map_err(|_| "invalid_sync_pack")?;
+                let mut stmt = sql(s.db.prepare("SELECT value FROM metadata WHERE key=?1"))?;
+                let mut receipts = BTreeMap::new();
+                for name in names {
+                    let stored = sql(stmt
+                        .query_row(params![format!("sync-pack:{name}")], |r| {
+                            r.get::<_, Vec<u8>>(0)
+                        })
+                        .optional())?;
+                    if let Some(body) = stored {
+                        let hashes: Vec<String> =
+                            serde_json::from_slice(&body).map_err(|_| "invalid_sync_receipt")?;
+                        receipts.insert(name, hashes);
+                    }
+                }
+                Ok(json!({"packs":receipts}))
+            }
+            "sync_build_pack" => {
+                let hashes: Vec<String> =
+                    serde_json::from_value(v.get("hashes").cloned().ok_or("invalid_sync_pack")?)
+                        .map_err(|_| "invalid_sync_pack")?;
+                if hashes.is_empty()
+                    || hashes.len() > PACK_OBJECTS
+                    || hashes.iter().collect::<BTreeSet<_>>().len() != hashes.len()
+                {
+                    return Err("invalid_sync_pack");
+                }
+                let mut body = PACK_MAGIC.to_vec();
+                let mut stmt = sql(s.db.prepare("SELECT body FROM objects WHERE hash=?1"))?;
+                for hash in &hashes {
+                    let bytes: Vec<u8> = sql(stmt.query_row(params![hash], |r| r.get(0)))?;
+                    if body.len() + 4 + bytes.len() > PACK_LIMIT || object_hash(&bytes) != *hash {
+                        return Err("invalid_sync_pack");
+                    }
+                    body.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+                    body.extend_from_slice(&bytes);
+                }
+                let pack = object_hash(&body);
+                record_pack(&s.db, &pack, &hashes)?;
+                Ok(json!({"hash":pack,"body":hex::encode(body)}))
+            }
+            "sync_ingest_pack" => {
+                let body = hex::decode(field(v, "body")?).map_err(|_| "invalid_sync_pack")?;
+                let pack = field(v, "hash")?;
+                if object_hash(&body) != pack {
+                    return Err("object_hash_mismatch");
+                }
+                let objects = pack_objects(&body)?;
+                let hashes = objects
+                    .iter()
+                    .map(|bytes| object_hash(bytes))
+                    .collect::<Vec<_>>();
+                if hashes.iter().collect::<BTreeSet<_>>().len() != hashes.len() {
+                    return Err("invalid_sync_pack");
+                }
+                ingest_objects(s, &objects, &hashes, Some(pack))?;
+                Ok(json!({"hashes":hashes}))
+            }
             "ingest" => {
                 let bytes = hex::decode(field(v, "body")?).map_err(|_| "invalid_object")?;
-                let hash = hex::encode(Sha256::digest(&bytes));
+                let hash = object_hash(&bytes);
                 if hash != field(v, "hash")? {
                     return Err("object_hash_mismatch");
                 }
-                decode(&s.dek, &s.id, &bytes)?;
-                let tx = sql(s
-                    .db
-                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
-                sql(tx.execute(
-                    "INSERT OR IGNORE INTO objects VALUES (?1,?2)",
-                    params![hash, bytes],
-                ))?;
-                let current = load(&tx, &s.dek, &s.id)?;
-                sql(tx.commit())?;
-                s.revisions = current;
+                ingest_objects(s, &[&bytes], &[hash], None)?;
                 Ok(json!({"received":true}))
             }
             "export" => {
@@ -653,6 +946,248 @@ mod tests {
         request["session"] = json!(token);
         v.command(&request).unwrap()
     }
+    #[test]
+    fn three_vaults_converge_beyond_the_legacy_directory_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = "public migration fixture passphrase";
+        let mut source = Vault::new();
+        let opened = source
+            .command(&json!({"op":"create","path":dir.path().join("a.db"),"password":password}))
+            .unwrap();
+        let token = opened["session"].as_str().unwrap();
+        for range in [0..500, 500..647] {
+            let entries = range
+                .map(|i| entry(&format!("fixture-{i}")))
+                .collect::<Vec<_>>();
+            call(&mut source, token, json!({"op":"import","entries":entries}));
+        }
+        let listed = call(&mut source, token, json!({"op":"list"}));
+        let heads = listed["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .take(644)
+            .map(|revision| &revision["id"])
+            .collect::<Vec<_>>();
+        call(
+            &mut source,
+            token,
+            json!({"op":"set_deleted","heads":heads,"deleted":true}),
+        );
+        let inventory = call(&mut source, token, json!({"op":"sync_inventory"}));
+        let hashes = inventory["objects"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>();
+        assert_eq!(hashes.len(), 1291);
+        let packs = hashes
+            .chunks(128)
+            .map(|hashes| {
+                call(
+                    &mut source,
+                    token,
+                    json!({"op":"sync_build_pack","hashes":hashes}),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = call(&mut source, token, json!({"op":"list"}));
+
+        let path = dir.path().join("b.db");
+        let mut second = Vault::new();
+        let mut join = json!({
+            "op":"join","path":path,"password":"incorrect",
+            "bootstrap":inventory["bootstrap"],
+            "settings":{"username":"fixture@example.com","password":"fixture-app-password","joinPending":true}
+        });
+        assert!(second.command(&join).is_err());
+        assert!(!path.exists());
+        join["password"] = json!(password);
+        let second_opened = second.command(&join).unwrap();
+        let second_token = second_opened["session"].as_str().unwrap();
+        let settings = call(&mut second, second_token, json!({"op":"sync_settings_get"}));
+        assert_eq!(settings["settings"]["joinPending"], true);
+
+        // Even with a matching content address, an unauthenticated member must
+        // leave the whole pack uncommitted.
+        let mut invalid = hex::decode(packs[0]["body"].as_str().unwrap()).unwrap();
+        *invalid.last_mut().unwrap() ^= 1;
+        let invalid_hash = object_hash(&invalid);
+        assert!(second
+            .command(&json!({
+                "op":"sync_ingest_pack","session":second_token,
+                "hash":invalid_hash,"body":hex::encode(invalid)
+            }))
+            .is_err());
+        assert!(
+            call(&mut second, second_token, json!({"op":"sync_inventory"}))["objects"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(call(
+            &mut second,
+            second_token,
+            json!({"op":"sync_receipts","packs":[invalid_hash]})
+        )["packs"]
+            .as_object()
+            .unwrap()
+            .is_empty());
+
+        let mut third = Vault::new();
+        join["path"] = json!(dir.path().join("c.db"));
+        let third_opened = third.command(&join).unwrap();
+        let third_token = third_opened["session"].as_str().unwrap();
+        for pack in packs.iter().rev() {
+            call(
+                &mut second,
+                second_token,
+                json!({
+                    "op":"sync_ingest_pack","hash":pack["hash"],"body":pack["body"]
+                }),
+            );
+        }
+        for pack in &packs {
+            call(
+                &mut third,
+                third_token,
+                json!({
+                    "op":"sync_ingest_pack","hash":pack["hash"],"body":pack["body"]
+                }),
+            );
+        }
+        assert_eq!(
+            call(&mut second, second_token, json!({"op":"list"})),
+            expected
+        );
+        assert_eq!(
+            call(&mut third, third_token, json!({"op":"list"})),
+            expected
+        );
+        second.command(&json!({"op":"lock"})).unwrap();
+        let reopened = second
+            .command(&json!({"op":"unlock","path":path,"password":password}))
+            .unwrap();
+        let second_token = reopened["session"].as_str().unwrap();
+        let receipts = call(
+            &mut second,
+            second_token,
+            json!({
+                "op":"sync_receipts","packs":packs.iter().map(|pack| &pack["hash"]).collect::<Vec<_>>()
+            }),
+        );
+        assert_eq!(receipts["packs"].as_object().unwrap().len(), packs.len());
+    }
+
+    #[test]
+    fn import_merges_exact_credentials_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.db");
+        let mut vault = Vault::new();
+        let opened = vault
+            .command(
+                &json!({"op":"create","path":path,"password":"public import fixture passphrase"}),
+            )
+            .unwrap();
+        let token = opened["session"].as_str().unwrap();
+        let mut saved = entry("original");
+        saved["notes"] = json!("Keep\n");
+        saved["tags"] = json!("置顶, Work");
+        call(&mut vault, token, json!({"op":"save","data":saved}));
+
+        let mut imported = entry("original");
+        imported["title"] = json!("Browser title");
+        imported["url"] = json!(" https://example.com ");
+        imported["notes"] = json!("Added");
+        imported["tags"] = json!("work；导入");
+        let changed_password = entry("changed");
+        let mut second_file = changed_password.clone();
+        second_file["notes"] = json!("Another export");
+        let mut untitled_site_a = entry("shared");
+        untitled_site_a["url"] = json!("");
+        let mut untitled_site_b = untitled_site_a.clone();
+        untitled_site_b["title"] = json!("Different item without a URL");
+
+        let request = json!({"op":"import","entries":[
+            imported, imported, changed_password, second_file, untitled_site_a, untitled_site_b
+        ]});
+        assert_eq!(
+            call(&mut vault, token, request.clone()),
+            json!({"imported":true,"added":3,"updated":1,"duplicates":3})
+        );
+        assert_eq!(
+            call(&mut vault, token, request),
+            json!({"imported":true,"added":0,"updated":0,"duplicates":6})
+        );
+        let listed = call(&mut vault, token, json!({"op":"list"}));
+        let rows = listed["entries"].as_array().unwrap();
+        assert_eq!(rows.len(), 4);
+        let original = rows
+            .iter()
+            .find(|r| r["data"]["password"] == "original")
+            .unwrap();
+        assert_eq!(original["data"]["title"], "测试账号");
+        assert_eq!(original["data"]["notes"], "Keep\n\n\nAdded");
+        assert_eq!(original["data"]["tags"], "置顶, Work, 导入");
+        let changed = rows
+            .iter()
+            .find(|r| r["data"]["password"] == "changed")
+            .unwrap();
+        assert_eq!(changed["data"]["notes"], "Another export");
+    }
+
+    #[test]
+    fn quick_delete_is_atomic_and_preserves_the_account_for_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.db");
+        let mut vault = Vault::new();
+        let opened = vault
+            .command(
+                &json!({"op":"create","path":path,"password":"public delete fixture passphrase"}),
+            )
+            .unwrap();
+        let token = opened["session"].as_str().unwrap();
+        call(
+            &mut vault,
+            token,
+            json!({"op":"import","entries":[entry("first"),entry("second")]}),
+        );
+        let listed = call(&mut vault, token, json!({"op":"list"}));
+        let rows = listed["entries"].as_array().unwrap();
+        let heads: Vec<_> = rows.iter().map(|r| &r["id"]).collect();
+        assert_eq!(
+            vault.command(&json!({"op":"set_deleted","session":token,"heads":[heads[0],"z-invalid"],"deleted":true})),
+            Err("entry_changed_reload")
+        );
+        assert_eq!(call(&mut vault, token, json!({"op":"list"})), listed);
+        assert_eq!(
+            call(
+                &mut vault,
+                token,
+                json!({"op":"set_deleted","heads":heads,"deleted":true})
+            ),
+            json!({"changed":2})
+        );
+        let deleted = call(&mut vault, token, json!({"op":"list"}));
+        let tombstones = deleted["entries"].as_array().unwrap();
+        assert!(tombstones.iter().all(|r| r["deleted"] == true));
+        let tombstone = &tombstones[0];
+        call(
+            &mut vault,
+            token,
+            json!({"op":"set_deleted","heads":[tombstone["id"]],"deleted":false}),
+        );
+        let restored = call(&mut vault, token, json!({"op":"list"}));
+        let current = restored["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["entry"] == tombstone["entry"])
+            .unwrap();
+        assert_eq!(current["deleted"], false);
+        assert_eq!(current["data"], tombstone["data"]);
+    }
+
     #[test]
     fn device_grants_are_one_use_bound_and_invalidated_by_lock() {
         let dir = tempfile::tempdir().unwrap();

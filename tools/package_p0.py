@@ -4,6 +4,7 @@ import os
 import platform
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -79,15 +80,35 @@ def macos():
     apps = list((APP / "build/macos/Build/Products/Release").glob("*.app"))
     if len(apps) != 1:
         raise SystemExit("Expected one macOS app")
-    bundle = apps[0]
-    dylib = bundle / "Contents/Frameworks/libwencrypt_core.dylib"
-    shutil.copy2(library, dylib)
-    run("codesign", "--force", "--sign", "-", str(dylib))
-    run("codesign", "--force", "--sign", "-", "--entitlements",
-        str(APP / "macos/Runner/Release.entitlements"), str(bundle))
-    run("codesign", "--verify", "--deep", "--strict", str(bundle))
-    run("ditto", "-c", "-k", "--keepParent", str(bundle),
-        str(OUTPUT / "wencrypt-macos-arm64.zip"))
+    package_macos_bundle(apps[0], library)
+
+
+def package_macos_bundle(app, library):
+    with tempfile.TemporaryDirectory(prefix="wencrypt-macos-") as tmp:
+        bundle = Path(tmp) / app.name
+        run("ditto", str(app), str(bundle))
+        dylib = bundle / "Contents/Frameworks/libwencrypt_core.dylib"
+        shutil.copy2(library, dylib)
+        run("codesign", "--force", "--sign", "-", str(dylib))
+        run("codesign", "--force", "--sign", "-", "--entitlements",
+            str(APP / "macos/Runner/Release.entitlements"), str(bundle))
+        run("codesign", "--verify", "--deep", "--strict", str(bundle))
+        run("ditto", "-c", "-k", "--keepParent", str(bundle),
+            str(OUTPUT / "wencrypt-macos-arm64.zip"))
+        macos_disk_image(bundle)
+
+
+def macos_disk_image(bundle):
+    image = OUTPUT / "wencrypt-macos-arm64.dmg"
+    with tempfile.TemporaryDirectory(prefix="wencrypt-dmg-") as tmp:
+        staging = Path(tmp) / "Wencrypt"
+        staging.mkdir()
+        run("ditto", str(bundle), str(staging / bundle.name))
+        (staging / "Applications").symlink_to("/Applications")
+        shutil.copy2(ROOT / "docs/macos-first-open.html", staging / "首次打开帮助.html")
+        run("hdiutil", "create", "-ov", "-volname", "Wencrypt", "-srcfolder",
+            str(staging), "-fs", "HFS+", "-format", "UDZO", str(image))
+    run("hdiutil", "verify", str(image))
 
 
 if __name__ == "__main__":
