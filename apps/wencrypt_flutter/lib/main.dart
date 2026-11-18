@@ -7,7 +7,8 @@ import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:file_selector/file_selector.dart';
-import 'package:csv/csv.dart';
+
+import 'browser_import.dart';
 
 import 'core.dart';
 import 'sync.dart';
@@ -144,6 +145,10 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
 
   String friendly(Object e) {
     final text = e.toString();
+    if (text.contains('csv_limit')) return '请选择不超过 1 MiB、最多 500 条账号的 CSV 文件。';
+    if (text.contains('csv_headers')) {
+      return '未识别密码文件。需要 url、username 和 password 列。';
+    }
     if (e is DavFailure) return e.toString();
     if (text.contains('biometric')) {
       return '指纹认证取消、密钥失效或设备保护不可用。请用主密码解锁；需要时重新启用指纹。';
@@ -683,79 +688,62 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   }
 
   Future<void> importCsv() async {
-    // The system picker locks the vault. Reauthenticate after reading the selected file.
     try {
+      final installed = await installedBrowsers();
+      if (!mounted) return;
+      if (installed.isNotEmpty) {
+        final choice = await showDialog<String>(
+          context: context,
+          builder: (ctx) => SimpleDialog(
+            title: const Text('导入浏览器密码'),
+            children: [
+              for (final name in installed.keys)
+                SimpleDialogOption(
+                  onPressed: () => Navigator.pop(ctx, name),
+                  child: Text('从 $name 导出密码…'),
+                ),
+              SimpleDialogOption(
+                onPressed: () => Navigator.pop(ctx, 'file'),
+                child: const Text('选择已导出的 CSV 文件…'),
+              ),
+            ],
+          ),
+        );
+        if (choice == null) return;
+        if (choice != 'file') {
+          await openExportSettings(choice, installed[choice]!);
+          if (mounted) setState(() => message = '导出 CSV 后，返回此处选择文件');
+          return;
+        }
+      }
       final file = await openFile();
       if (file == null) return;
       if (await file.length() > 1024 * 1024) throw StateError('csv_limit');
-      final rows = csv.decode(await file.readAsString());
-      if (rows.isEmpty || rows.length > 501) throw StateError('csv_limit');
-      final headers = rows.first
-          .map((v) => v.toString().replaceFirst('\ufeff', '').toLowerCase())
-          .toList();
-      if (!headers.contains('password') || !headers.contains('username')) {
-        throw StateError('csv_headers');
-      }
-      String value(List<dynamic> row, String name) {
-        final i = headers.indexOf(name);
-        return i < 0 || i >= row.length ? '' : row[i].toString();
-      }
-
-      final data = [
-        for (final row in rows.skip(1))
-          if (row.any((v) => v.toString().isNotEmpty))
-            {
-              'title': value(row, 'name').isNotEmpty
-                  ? value(row, 'name')
-                  : value(row, 'url').isNotEmpty
-                  ? value(row, 'url')
-                  : '导入账号',
-              'username': value(row, 'username'),
-              'password': value(row, 'password'),
-              'url': value(row, 'url'),
-              'notes': value(row, 'note'),
-              'tags': '导入',
-            },
-      ];
-      if (!mounted) return;
-      final accepted = await showDialog<bool>(
-        context: context,
-        builder: (context) => AlertDialog(
-          title: Text('导入 ${data.length} 个账号'),
-          content: const Text(
-            '支持 Chrome/Edge CSV。所有行将作为新账号加入，不覆盖已有条目，重复导入会产生重复账号。原始 CSV 含明文密码，请自行妥善处理。',
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('取消'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('继续'),
-            ),
-          ],
-        ),
-      );
-      if (accepted != true) return;
+      final batch = BrowserExport.parse(await file.readAsString());
       if (!mounted) return;
       final password = await passwordPrompt();
       if (password == null) return;
       await action(() async {
         final epoch = generation;
-        final unlocked = await core({
+        final opened = await core({
           'op': 'unlock',
           'path': path,
           'password': password,
         });
         if (epoch != generation) {
-          await core({'op': 'lock'});
+          lockCore();
           return;
         }
-        token = unlocked['session'] as String;
-        await request('import', {'entries': data});
+        token = opened['session'] as String;
         await refresh();
         touch();
+        await loadAuto();
+        if (!mounted || epoch != generation) return;
+        final selected = await selectPasswords(context, batch, entries);
+        if (selected == null || epoch != generation) return;
+        await request('import', {'entries': selected});
+        await refresh();
+        if (mounted) setState(() => message = '已导入 ${selected.length} 个账号');
       });
     } catch (e) {
       if (mounted) setState(() => message = friendly(e));
@@ -918,7 +906,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                   child: Text('关闭自动同步并清除凭据'),
                 ),
               if (exists)
-                const PopupMenuItem(value: 'csv', child: Text('导入浏览器 CSV')),
+                const PopupMenuItem(value: 'csv', child: Text('导入浏览器密码')),
               const PopupMenuItem(value: 'probe', child: Text('设备诊断')),
             ],
           ),

@@ -47,6 +47,21 @@ class MainFlutterWindow: NSWindow {
       self?.vaultDevice.cancel()
       deviceChannel.invokeMethod("systemLocked",arguments:nil)
     }
+    let browsers = ["Chrome": ("com.google.Chrome", "chrome://password-manager/settings"),
+                    "Edge": ("com.microsoft.edgemac", "edge://wallet/passwords"),
+                    "Firefox": ("org.mozilla.firefox", "about:logins")]
+    let browserChannel = FlutterMethodChannel(name:"org.wencrypt.browser-import", binaryMessenger:flutterViewController.engine.binaryMessenger)
+    browserChannel.setMethodCallHandler { call, result in
+      if call.method == "installed" {
+        result(browsers.keys.sorted().filter { NSWorkspace.shared.urlForApplication(withBundleIdentifier:browsers[$0]!.0) != nil })
+      } else if call.method == "open", let name = call.arguments as? String, let (id, page) = browsers[name],
+                let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier:id), let url = URL(string:page) {
+        NSWorkspace.shared.open([url],withApplicationAt:app,configuration:NSWorkspace.OpenConfiguration()) { _, error in
+          DispatchQueue.main.async { result(error == nil ? nil : FlutterError(code:"browser_open_failed",message:nil,details:nil)) }
+        }
+      } else { result(FlutterMethodNotImplemented) }
+    }
+
     super.awakeFromNib()
   }
 }
