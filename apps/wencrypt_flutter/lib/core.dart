@@ -52,6 +52,7 @@ String _request(String request) {
 }
 
 int _epoch = 0;
+int get nativeEpoch => _epoch;
 // Synchronous invalidation serializes with the Rust mutex before the app backgrounds.
 // Queued requests carry an older epoch and cannot reopen a locked vault.
 void lockCore() {

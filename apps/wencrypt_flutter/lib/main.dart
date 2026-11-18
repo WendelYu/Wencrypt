@@ -43,11 +43,23 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   bool exists = false, busy = false, trash = false;
   int generation = 0;
   List<Map<String, dynamic>> entries = [];
-  Timer? idle, clipboard;
+  Timer? idle, clipboard, autoTimer;
+  bool biometricEnabled = false,
+      authenticating = false,
+      autoEnabled = false,
+      syncing = false;
+  bool foreground = true;
+  String? binding;
+  NutstoreSync? activeSync;
+  static const device = MethodChannel('org.wencrypt.device/vault');
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    device.setMethodCallHandler((call) async {
+      if (call.method == 'systemLocked') lock();
+    });
     initialize();
   }
 
@@ -57,6 +69,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       await dir.create(recursive: true);
       path = '${dir.path}/wencrypt-alpha.db';
       exists = await File(path!).exists();
+      if (exists && (Platform.isMacOS || Platform.isAndroid)) {
+        await deviceStatus();
+      }
       if (mounted) setState(() => message = '本地加密 · 离线可用');
     } catch (_) {
       if (mounted) setState(() => message = '无法打开应用数据目录');
@@ -70,6 +85,8 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     confirm.dispose();
     idle?.cancel();
     clipboard?.cancel();
+    autoTimer?.cancel();
+    activeSync?.cancel();
     super.dispose();
   }
 
@@ -80,11 +97,20 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state != AppLifecycleState.resumed) lock();
+    foreground = state == AppLifecycleState.resumed;
+    if (state == AppLifecycleState.inactive && authenticating) return;
+    if (state != AppLifecycleState.resumed) {
+      lock();
+    } else if (token != null) {
+      scheduleAuto();
+    }
   }
 
   void lock() {
     generation++;
+    autoTimer?.cancel();
+    activeSync?.cancel();
+    device.invokeMethod<Object?>('cancel').catchError((Object _) => null);
     token = null;
     entries = [];
     master.clear();
@@ -118,6 +144,10 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
 
   String friendly(Object e) {
     final text = e.toString();
+    if (e is DavFailure) return e.toString();
+    if (text.contains('biometric')) {
+      return '指纹认证取消、密钥失效或设备保护不可用。请用主密码解锁；需要时重新启用指纹。';
+    }
     if (text.contains('backup_limit')) return '超出 Alpha 的 2 MiB 备份上限，导出已停止。';
     if (text.contains('free_budget')) return '已达到本机免费流量或请求预算，请稍后再试。';
     if (text.contains('remote_missing')) return '云端副本缺失，已停止同步；本地数据仍保留。';
@@ -152,6 +182,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     exists = true;
     touch();
     await refresh();
+    await loadAuto();
   });
   Future<Map<String, dynamic>> request(
     String op, [
@@ -175,6 +206,197 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> deviceStatus() async {
+    final info = await core({'op': 'device_info', 'path': path});
+    binding = info['binding'] as String;
+    final state = await device.invokeMapMethod<String, dynamic>('status', {
+      'binding': binding,
+    });
+    biometricEnabled = state?['enabled'] == true;
+  }
+
+  Future<void> enableBiometric() async {
+    final password = await passwordPrompt();
+    if (password == null) return;
+    await action(() async {
+      final snapshot = generation;
+      final grant = await request('device_grant', {'password': password});
+      binding = grant['binding'] as String;
+      authenticating = true;
+      try {
+        final result = await device.invokeMapMethod<String, dynamic>('enable', {
+          'binding': binding,
+          'ticket': grant['ticket'],
+        });
+        if (snapshot != generation) throw StateError('locked');
+        if (result?['enabled'] != true) throw StateError('biometric_failed');
+        setState(() {
+          biometricEnabled = true;
+          message = '已启用本机指纹解锁；主密码仍可用于恢复。';
+        });
+      } finally {
+        authenticating = false;
+      }
+    });
+  }
+
+  Future<void> biometricUnlock() => action(() async {
+    final snapshot = generation;
+    await deviceStatus();
+    authenticating = true;
+    try {
+      final result = await device.invokeMapMethod<String, dynamic>('unlock', {
+        'binding': binding,
+        'path': path,
+        'epoch': nativeEpoch,
+      });
+      if (snapshot != generation) {
+        lockCore();
+        return;
+      }
+      if (result?['session'] is! String) throw StateError('biometric_failed');
+      token = result!['session'] as String;
+      touch();
+      await refresh();
+      await loadAuto();
+    } finally {
+      authenticating = false;
+    }
+  });
+  Future<void> disableBiometric() => action(() async {
+    await deviceStatus();
+    final state = await device.invokeMapMethod<String, dynamic>('disable', {
+      'binding': binding,
+    });
+    if (state?['enabled'] != false) {
+      throw StateError('biometric_failed');
+    }
+    setState(() {
+      biometricEnabled = false;
+      message = '已关闭本机指纹解锁';
+    });
+  });
+  Future<void> loadAuto() async {
+    final settings =
+        (await request('sync_settings_get'))['settings']
+            as Map<String, dynamic>?;
+    autoEnabled = settings?['auto'] == true;
+    scheduleAuto();
+  }
+
+  void scheduleAuto() {
+    autoTimer?.cancel();
+    if (!autoEnabled || token == null || !foreground) return;
+    autoTimer = Timer(
+      const Duration(seconds: 30),
+      () => runSync(automatic: true),
+    );
+  }
+
+  Future<void> runSync({
+    required bool automatic,
+    String? username,
+    String? password,
+  }) async {
+    if (syncing || token == null || !foreground) return;
+    syncing = true;
+    final current = generation;
+    final stateFile = File('${File(path!).parent.path}/auto-sync-state.json');
+    var failures = 0;
+    bool attempted = false;
+    DateTime? next;
+    try {
+      if (await stateFile.exists()) {
+        final state =
+            jsonDecode(await stateFile.readAsString()) as Map<String, dynamic>;
+        failures = state['failures'] as int? ?? 0;
+        next = DateTime.tryParse(state['next'] as String? ?? '');
+      }
+      if (automatic && next != null && next.isAfter(DateTime.now().toUtc())) {
+        autoTimer = Timer(
+          next.difference(DateTime.now().toUtc()),
+          () => runSync(automatic: true),
+        );
+        return;
+      }
+      if (busy && automatic) {
+        scheduleAuto();
+        return;
+      }
+      if (username == null || password == null) {
+        final settings =
+            (await request('sync_settings_get'))['settings']
+                as Map<String, dynamic>?;
+        if (settings == null) return;
+        username = settings['username'] as String;
+        password = settings['password'] as String;
+      }
+      if (current != generation) return;
+      attempted = true;
+      // Persist cooldown before network I/O so relaunching does not bypass pacing.
+      await stateFile.writeAsString(
+        jsonEncode({
+          'next': DateTime.now()
+              .toUtc()
+              .add(const Duration(minutes: 15))
+              .toIso8601String(),
+          'failures': failures,
+        }),
+        flush: true,
+      );
+      if (current != generation || !foreground) return;
+      final sync = NutstoreSync(File(path!).parent, request);
+      activeSync = sync;
+      final result = await sync.sync(username, password);
+      if (current != generation) return;
+      await refresh();
+      failures = 0;
+      if (mounted) setState(() => message = result);
+    } catch (e) {
+      failures = (failures + 1).clamp(1, 4);
+      if (current == generation && mounted) {
+        setState(() => message = friendly(e));
+      }
+    } finally {
+      username = null;
+      password = null;
+      activeSync = null;
+      syncing = false;
+      if (attempted && current == generation) {
+        final minutes = failures == 0 ? 15 : 30 * (1 << (failures - 1));
+        try {
+          await stateFile.writeAsString(
+            jsonEncode({
+              'next': DateTime.now()
+                  .toUtc()
+                  .add(Duration(minutes: minutes))
+                  .toIso8601String(),
+              'failures': failures,
+            }),
+            flush: true,
+          );
+        } catch (_) {
+          autoEnabled = false;
+        }
+        if (autoEnabled && token != null && foreground) {
+          autoTimer = Timer(
+            Duration(minutes: minutes),
+            () => runSync(automatic: true),
+          );
+        }
+      }
+    }
+  }
+
+  Future<void> stopAuto() => action(() async {
+    autoTimer?.cancel();
+    activeSync?.cancel();
+    await request('sync_settings_clear');
+    setState(() {
+      autoEnabled = false;
+      message = '已关闭自动同步并清除本机保存的网盘凭据';
+    });
+  });
   Future<void> copy(String value) async {
     touch();
     if (Platform.isAndroid) {
@@ -543,52 +765,85 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   Future<void> sync() async {
     final user = TextEditingController();
     final password = TextEditingController();
+    bool automatic = autoEnabled;
+    if (token != null) {
+      final existing =
+          (await request('sync_settings_get'))['settings']
+              as Map<String, dynamic>?;
+      if (existing != null) {
+        user.text = existing['username'] as String;
+        password.text = existing['password'] as String;
+      }
+    }
+    if (!mounted) return;
     final accepted = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('坚果云同步'),
-        content: SizedBox(
-          width: 440,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Text(
-                '使用坚果云 WebDAV 应用密码。凭据仅在本次同步保留。新设备先恢复同一份加密备份。初版最多 598 个修订对象，达到上限会停止同步。',
+      builder: (context) => StatefulBuilder(
+        builder: (context, setLocal) => AlertDialog(
+          title: const Text('坚果云同步'),
+          content: SizedBox(
+            width: 440,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    '使用 WebDAV 应用密码。自动同步仅在前台解锁时进行，至少间隔15分钟；失败逐步退避。新设备先恢复同一加密备份。',
+                  ),
+                  TextField(
+                    controller: user,
+                    decoration: const InputDecoration(labelText: '坚果云账号'),
+                  ),
+                  TextField(
+                    controller: password,
+                    obscureText: true,
+                    autocorrect: false,
+                    enableSuggestions: false,
+                    decoration: const InputDecoration(labelText: 'WebDAV 应用密码'),
+                  ),
+                  CheckboxListTile(
+                    value: automatic,
+                    onChanged: (v) => setLocal(() => automatic = v!),
+                    title: const Text('加密保存凭据并开启自动同步'),
+                    subtitle: const Text('仅保存在本机，不随云同步或备份导出'),
+                  ),
+                ],
               ),
-              TextField(
-                controller: user,
-                decoration: const InputDecoration(labelText: '坚果云账号'),
-              ),
-              TextField(
-                controller: password,
-                obscureText: true,
-                autocorrect: false,
-                enableSuggestions: false,
-                decoration: const InputDecoration(labelText: 'WebDAV 应用密码'),
-              ),
-            ],
+            ),
           ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('保存并同步'),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('同步 / 首次创建云端副本'),
-          ),
-        ],
       ),
     );
     if (accepted == true && token != null) {
       await action(() async {
-        final result = await NutstoreSync(
-          File(path!).parent,
-          request,
-        ).sync(user.text, password.text);
-        await refresh();
-        if (mounted) setState(() => message = result);
+        if (automatic) {
+          await request('sync_settings_set', {
+            'settings': {
+              'username': user.text.trim(),
+              'password': password.text,
+              'auto': true,
+            },
+          });
+        } else {
+          await request('sync_settings_clear');
+          autoTimer?.cancel();
+        }
+        autoEnabled = automatic;
+        await runSync(
+          automatic: false,
+          username: user.text.trim(),
+          password: password.text,
+        );
       });
     }
     user.clear();
@@ -606,7 +861,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
         actions: [
           if (token != null)
             IconButton(
-              onPressed: busy ? null : sync,
+              onPressed: busy || syncing ? null : sync,
               icon: const Icon(Icons.sync),
               tooltip: '坚果云同步',
             ),
@@ -624,6 +879,15 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
             ),
           PopupMenuButton<String>(
             onSelected: (v) {
+              if (v == 'biometric') {
+                enableBiometric();
+              }
+              if (v == 'disableBiometric') {
+                disableBiometric();
+              }
+              if (v == 'stopAuto') {
+                stopAuto();
+              }
               if (v == 'csv') {
                 importCsv();
               }
@@ -638,6 +902,21 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
               }
             },
             itemBuilder: (_) => [
+              if (token != null && (Platform.isMacOS || Platform.isAndroid))
+                PopupMenuItem(
+                  value: 'biometric',
+                  child: Text(biometricEnabled ? '重新绑定指纹解锁' : '启用指纹解锁'),
+                ),
+              if (token != null && biometricEnabled)
+                const PopupMenuItem(
+                  value: 'disableBiometric',
+                  child: Text('关闭指纹解锁'),
+                ),
+              if (token != null && autoEnabled)
+                const PopupMenuItem(
+                  value: 'stopAuto',
+                  child: Text('关闭自动同步并清除凭据'),
+                ),
               if (exists)
                 const PopupMenuItem(value: 'csv', child: Text('导入浏览器 CSV')),
               const PopupMenuItem(value: 'probe', child: Text('设备诊断')),
@@ -697,6 +976,12 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                             : '创建密码库',
                       ),
                     ),
+                    if (exists && biometricEnabled)
+                      OutlinedButton.icon(
+                        onPressed: busy ? null : biometricUnlock,
+                        icon: const Icon(Icons.fingerprint),
+                        label: const Text('使用指纹解锁'),
+                      ),
                     if (!exists)
                       TextButton(
                         onPressed: busy || path == null ? null : restore,

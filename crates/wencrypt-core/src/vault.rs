@@ -3,7 +3,7 @@ use crate::{
     envelope::{self, Kind},
     graph,
 };
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -57,6 +57,12 @@ struct Session {
 pub struct Vault {
     session: Option<Session>,
     epoch: u64,
+    grant: Option<DeviceGrant>,
+}
+struct DeviceGrant {
+    ticket: String,
+    session: String,
+    expires: std::time::Instant,
 }
 fn random<const N: usize>() -> Result<[u8; N]> {
     let mut b = [0; N];
@@ -207,7 +213,66 @@ impl Vault {
         Self {
             session: None,
             epoch: 0,
+            grant: None,
         }
+    }
+    // Native-only: one-use grant issued after rechecking the master password.
+    pub(crate) fn take_device_key(&mut self, ticket: &str) -> Result<Zeroizing<[u8; 80]>> {
+        let grant = self.grant.take().ok_or("grant_missing")?;
+        let s = self.session.as_ref().ok_or("locked")?;
+        if grant.ticket != ticket
+            || grant.session != s.token
+            || std::time::Instant::now() > grant.expires
+        {
+            return Err("grant_expired");
+        }
+        let mut bytes = Zeroizing::new([0u8; 80]);
+        bytes[..16].copy_from_slice(&s.id);
+        bytes[16..48].copy_from_slice(&Sha256::digest(bootstrap(&s.db)?));
+        bytes[48..].copy_from_slice(&*s.dek);
+        Ok(bytes)
+    }
+    pub(crate) fn open_device_key(
+        &mut self,
+        path: &str,
+        payload: &[u8],
+        epoch: u64,
+    ) -> Result<String> {
+        if epoch != self.epoch {
+            return Err("session_expired");
+        }
+        self.session = None;
+        self.grant = None;
+        if payload.len() != 80 {
+            return Err("invalid_device_payload");
+        }
+        let db = connection(path, false)?;
+        let b = bootstrap(&db)?;
+        let id = crypto(envelope::parse(&b))?.0.vault_id;
+        if payload[..16] != id || payload[16..48] != Sha256::digest(&b)[..] {
+            return Err("device_binding_mismatch");
+        }
+        let mut dek = Zeroizing::new([0u8; 32]);
+        dek.copy_from_slice(&payload[48..]);
+        let proof: Vec<u8> = sql(db.query_row(
+            "SELECT value FROM metadata WHERE key='device-key-proof'",
+            [],
+            |r| r.get(0),
+        ))?;
+        let expected = crypto(envelope::decrypt_object(&dek, &id, Kind::Backup, &proof))?;
+        if expected.as_slice() != Sha256::digest(&b).as_slice() {
+            return Err("device_binding_mismatch");
+        }
+        let revisions = load(&db, &dek, &id)?;
+        let token = identifier()?;
+        self.session = Some(Session {
+            token: token.clone(),
+            db,
+            id,
+            dek,
+            revisions,
+        });
+        Ok(token)
     }
     pub fn command(&mut self, v: &Value) -> Result<Value> {
         let op = field(v, "op")?;
@@ -221,7 +286,14 @@ impl Vault {
         }
         if op == "lock" {
             self.session = None;
+            self.grant = None;
             return Ok(json!({"locked":true}));
+        }
+        if op == "device_info" {
+            let db = connection(field(v, "path")?, false)?;
+            let b = bootstrap(&db)?;
+            crypto(envelope::parse(&b))?;
+            return Ok(json!({"binding":hex::encode(Sha256::digest(&b))}));
         }
         if op == "restore" {
             self.session = None;
@@ -296,6 +368,88 @@ impl Vault {
             return Err("session_expired");
         }
         match op {
+            "device_grant" => {
+                let b = bootstrap(&s.db)?;
+                let key = crypto(envelope::unlock_bootstrap(field(v, "password")?, &b))?;
+                if *key != *s.dek {
+                    return Err("authentication_failed");
+                }
+                let proof = crypto(envelope::encrypt_object(
+                    &key,
+                    &s.id,
+                    Kind::Backup,
+                    &Sha256::digest(&b),
+                ))?;
+                sql(s.db.execute(
+                    "INSERT OR REPLACE INTO metadata VALUES ('device-key-proof',?1)",
+                    params![proof],
+                ))?;
+                let ticket = identifier()?;
+                self.grant = Some(DeviceGrant {
+                    ticket: ticket.clone(),
+                    session: s.token.clone(),
+                    expires: std::time::Instant::now() + std::time::Duration::from_secs(60),
+                });
+                Ok(json!({"ticket":ticket,"binding":hex::encode(Sha256::digest(&b))}))
+            }
+            "sync_settings_set" => {
+                let settings = v.get("settings").ok_or("invalid_settings")?;
+                let username = field(settings, "username")?;
+                let password = field(settings, "password")?;
+                if username.len() > 320 || password.len() > 1024 || username.contains(':') {
+                    return Err("invalid_settings");
+                }
+                let plain = Zeroizing::new(
+                    serde_json::to_vec(
+                        &json!({"purpose":"wencrypt-local-sync-settings-v1","settings":settings}),
+                    )
+                    .map_err(|_| "encode_failed")?,
+                );
+                let bytes = crypto(envelope::encrypt_object(
+                    &s.dek,
+                    &s.id,
+                    Kind::Backup,
+                    &plain,
+                ))?;
+                sql(s.db.execute(
+                    "INSERT OR REPLACE INTO metadata VALUES ('local-sync-settings',?1)",
+                    params![bytes],
+                ))?;
+                Ok(json!({"saved":true}))
+            }
+            "sync_settings_get" => {
+                let bytes: Option<Vec<u8>> = sql(s
+                    .db
+                    .query_row(
+                        "SELECT value FROM metadata WHERE key='local-sync-settings'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .optional())?;
+                match bytes {
+                    None => Ok(json!({"settings":null})),
+                    Some(bytes) => {
+                        let plain = crypto(envelope::decrypt_object(
+                            &s.dek,
+                            &s.id,
+                            Kind::Backup,
+                            &bytes,
+                        ))?;
+                        let value: Value =
+                            serde_json::from_slice(&plain).map_err(|_| "invalid_settings")?;
+                        if value["purpose"] != "wencrypt-local-sync-settings-v1" {
+                            return Err("invalid_settings");
+                        }
+                        Ok(json!({"settings":value["settings"]}))
+                    }
+                }
+            }
+            "sync_settings_clear" => {
+                sql(s
+                    .db
+                    .execute("DELETE FROM metadata WHERE key='local-sync-settings'", []))?;
+                Ok(json!({"removed":true}))
+            }
             "list" => {
                 // Refresh from disk so another writer cannot be silently overwritten.
                 s.revisions = load(&s.db, &s.dek, &s.id)?;
@@ -498,6 +652,90 @@ mod tests {
     fn call(v: &mut Vault, token: &str, mut request: Value) -> Value {
         request["session"] = json!(token);
         v.command(&request).unwrap()
+    }
+    #[test]
+    fn device_grants_are_one_use_bound_and_invalidated_by_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.db");
+        let mut v = Vault::new();
+        let pass = "device binding test password";
+        let t = v
+            .command(&json!({"op":"create","path":path,"password":pass}))
+            .unwrap()["session"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        call(
+            &mut v,
+            &t,
+            json!({"op":"save","data":entry("device-secret")}),
+        );
+        assert!(v
+            .command(&json!({"op":"device_grant","session":t,"password":"wrong"}))
+            .is_err());
+        let grant = call(&mut v, &t, json!({"op":"device_grant","password":pass}));
+        let ticket = grant["ticket"].as_str().unwrap();
+        let payload = v.take_device_key(ticket).unwrap();
+        assert!(v.take_device_key(ticket).is_err());
+        v.command(&json!({"op":"lock","epoch":1})).unwrap();
+        assert!(v
+            .open_device_key(path.to_str().unwrap(), &*payload, 0)
+            .is_err());
+        let t = v
+            .open_device_key(path.to_str().unwrap(), &*payload, 1)
+            .unwrap();
+        assert_eq!(
+            call(&mut v, &t, json!({"op":"list"}))["entries"][0]["data"]["password"],
+            "device-secret"
+        );
+        let mut wrong = payload.clone();
+        wrong[16] ^= 1;
+        assert!(v
+            .open_device_key(path.to_str().unwrap(), &*wrong, 1)
+            .is_err());
+        assert!(v.session.is_none());
+    }
+    #[test]
+    fn sync_credentials_stay_local_encrypted_and_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.db");
+        let mut v = Vault::new();
+        let pass = "local credentials test password";
+        let t = v
+            .command(&json!({"op":"create","path":path,"password":pass}))
+            .unwrap()["session"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let secret = "NEVER-SYNC-THIS-APP-PASSWORD";
+        call(
+            &mut v,
+            &t,
+            json!({"op":"sync_settings_set","settings":{"username":"test@example.com","password":secret,"auto":true}}),
+        );
+        assert_eq!(
+            call(&mut v, &t, json!({"op":"sync_settings_get"}))["settings"]["password"],
+            secret
+        );
+        let objects = call(&mut v, &t, json!({"op":"sync_objects"}));
+        assert!(objects["objects"].as_array().unwrap().is_empty());
+        let backup = call(&mut v, &t, json!({"op":"export","password":pass}));
+        let restored = dir.path().join("restored.db");
+        v.command(&json!({"op":"restore","path":restored,"password":pass,"bootstrap":backup["bootstrap"],"backup":backup["backup"]})).unwrap();
+        let t = v
+            .command(&json!({"op":"unlock","path":restored,"password":pass}))
+            .unwrap()["session"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            call(&mut v, &t, json!({"op":"sync_settings_get"}))["settings"],
+            Value::Null
+        );
+        for f in std::fs::read_dir(dir.path()).unwrap() {
+            let b = std::fs::read(f.unwrap().path()).unwrap();
+            assert!(!b.windows(secret.len()).any(|w| w == secret.as_bytes()));
+        }
     }
     #[test]
     fn queued_unlock_cannot_reopen_after_lock() {

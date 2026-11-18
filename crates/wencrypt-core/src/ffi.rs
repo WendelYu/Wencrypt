@@ -76,3 +76,61 @@ pub unsafe extern "C" fn wencrypt_result_free(ptr: *mut c_char) {
     let mut bytes = CString::from_raw(ptr).into_bytes_with_nul();
     bytes.zeroize();
 }
+
+/// # Safety
+/// Ticket must be valid UTF-8 bytes; output must point to 80 writable bytes.
+/// Called only by native platform code, never through a Dart byte array.
+#[no_mangle]
+pub unsafe extern "C" fn wencrypt_device_take(ticket: *const u8, len: usize, out: *mut u8) -> i32 {
+    if ticket.is_null() || out.is_null() || len != 32 {
+        return -1;
+    }
+    let result = std::panic::catch_unwind(|| {
+        let ticket =
+            std::str::from_utf8(std::slice::from_raw_parts(ticket, len)).map_err(|_| ())?;
+        let payload = VAULT
+            .lock()
+            .map_err(|_| ())?
+            .take_device_key(ticket)
+            .map_err(|_| ())?;
+        std::ptr::copy_nonoverlapping(payload.as_ptr(), out, 80);
+        Ok::<_, ()>(())
+    });
+    if matches!(result, Ok(Ok(()))) {
+        0
+    } else {
+        -1
+    }
+}
+/// # Safety
+/// Path points to path_len UTF-8 bytes, payload to 80 readable bytes,
+/// token_out to 32 writable bytes. Native caller must wipe payload after return.
+#[no_mangle]
+pub unsafe extern "C" fn wencrypt_device_open(
+    path: *const u8,
+    path_len: usize,
+    payload: *const u8,
+    epoch: u64,
+    token_out: *mut u8,
+) -> i32 {
+    if path.is_null() || payload.is_null() || token_out.is_null() || path_len > 8192 {
+        return -1;
+    }
+    let result = std::panic::catch_unwind(|| {
+        let path =
+            std::str::from_utf8(std::slice::from_raw_parts(path, path_len)).map_err(|_| ())?;
+        let payload = std::slice::from_raw_parts(payload, 80);
+        let token = VAULT
+            .lock()
+            .map_err(|_| ())?
+            .open_device_key(path, payload, epoch)
+            .map_err(|_| ())?;
+        std::ptr::copy_nonoverlapping(token.as_ptr(), token_out, 32);
+        Ok::<_, ()>(())
+    });
+    if matches!(result, Ok(Ok(()))) {
+        0
+    } else {
+        -1
+    }
+}

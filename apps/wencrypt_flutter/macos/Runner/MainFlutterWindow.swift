@@ -3,6 +3,7 @@ import FlutterMacOS
 
 class MainFlutterWindow: NSWindow {
   private let probe = DeviceProbe()
+  private let vaultDevice = DeviceVault()
   private let probeQueue = DispatchQueue(label: "org.wencrypt.p0.device")
 
   override func awakeFromNib() {
@@ -26,6 +27,26 @@ class MainFlutterWindow: NSWindow {
       }
     }
 
+    let deviceChannel = FlutterMethodChannel(name: "org.wencrypt.device/vault", binaryMessenger: flutterViewController.engine.binaryMessenger)
+    deviceChannel.setMethodCallHandler { [weak self] call, result in
+      guard let self else { result(FlutterMethodNotImplemented); return }
+      if call.method == "cancel" { self.vaultDevice.cancel(); result(nil); return }
+      let generation = self.vaultDevice.currentGeneration
+      let args = call.arguments as? [String:Any] ?? [:]
+      self.probeQueue.async {
+        let response = self.vaultDevice.perform(call.method, args, generation:generation)
+        DispatchQueue.main.async { result(response) }
+      }
+    }
+
+    DistributedNotificationCenter.default().addObserver(forName:NSNotification.Name("com.apple.screenIsLocked"),object:nil,queue:.main) { [weak self] _ in
+      self?.vaultDevice.cancel()
+      deviceChannel.invokeMethod("systemLocked",arguments:nil)
+    }
+    NSWorkspace.shared.notificationCenter.addObserver(forName:NSWorkspace.willSleepNotification,object:nil,queue:.main) { [weak self] _ in
+      self?.vaultDevice.cancel()
+      deviceChannel.invokeMethod("systemLocked",arguments:nil)
+    }
     super.awakeFromNib()
   }
 }

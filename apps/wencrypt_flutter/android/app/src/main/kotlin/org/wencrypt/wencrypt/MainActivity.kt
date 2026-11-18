@@ -27,9 +27,16 @@ class MainActivity : FlutterFragmentActivity() {
     }
 
     private val probe by lazy { DeviceProbe(this) }
+    private val vaultDevice by lazy { DeviceVault(this) }
+    override fun onStop() { vaultDevice.cancel(); probe.cancel(); super.onStop() }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "org.wencrypt.device/vault")
+            .setMethodCallHandler { call, result ->
+                @Suppress("UNCHECKED_CAST")
+                vaultDevice.perform(call.method, call.arguments as? Map<String, Any?> ?: emptyMap()) { result.success(it) }
+            }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "org.wencrypt.files")
             .setMethodCallHandler { call, result ->
                 if (call.method == "saveBackup") {

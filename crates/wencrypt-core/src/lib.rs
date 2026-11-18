@@ -34,5 +34,7 @@ pub extern "C" fn wencrypt_probe_unlock_ms() -> i64 {
     }
 }
 
+#[cfg(target_os = "android")]
+mod android_bridge;
 mod ffi;
 pub mod vault;

@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -19,6 +20,28 @@ class SyncBudget {
     try {
       await guard.lock(FileLock.exclusive);
       await _reserve(upload, download);
+    } finally {
+      await guard.unlock();
+      await guard.close();
+    }
+  }
+
+  Future<void> settleDownload(int unused, String reservedMonth) async {
+    if (unused <= 0) return;
+    final guard = await File('${file.path}.lock').open(mode: FileMode.append);
+    try {
+      await guard.lock(FileLock.exclusive);
+      if (!await file.exists()) return;
+      final data =
+          jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+      if (data['month'] != reservedMonth) return;
+      data['down'] = ((data['down'] as int) - unused).clamp(
+        0,
+        300 * 1024 * 1024,
+      );
+      final temp = File('${file.path}.tmp');
+      await temp.writeAsString(jsonEncode(data), flush: true);
+      await temp.rename(file.path);
     } finally {
       await guard.unlock();
       await guard.close();
@@ -61,36 +84,133 @@ class SyncBudget {
   }
 }
 
+class DavFailure implements Exception {
+  const DavFailure(this.stage, this.reason, [this.status]);
+  final String stage, reason;
+  final int? status;
+  Map<String, dynamic> get diagnostic => {
+    'stage': stage,
+    'reason': reason,
+    if (status != null) 'http_status': status,
+  };
+  @override
+  String toString() =>
+      '同步失败 [$stage / $reason${status == null ? '' : ' / HTTP $status'}]';
+}
+
+class DavReply {
+  DavReply(this.status, List<int> body) : body = Uint8List.fromList(body);
+  final int status;
+  final Uint8List body;
+}
+
+typedef DavWire = Future<DavReply> Function(
+  String method,
+  Uri uri,
+  List<int> body,
+  String depth,
+  int limit,
+);
+
+Set<String> parseDavListing(List<int> bytes, Uri folder) {
+  final text = utf8.decode(bytes);
+  if (text.toUpperCase().contains('<!DOCTYPE') ||
+      text.toUpperCase().contains('<!ENTITY')) {
+    throw const DavFailure('list', 'unsafe_xml');
+  }
+  final document = XmlDocument.parse(text);
+  final root = document.rootElement;
+  if (root.name.local != 'multistatus' || root.namespaceUri != 'DAV:') {
+    throw const DavFailure('list', 'invalid_multistatus');
+  }
+  final responses = root
+      .findElements('response', namespaceUri: 'DAV:')
+      .toList();
+  if (responses.length >= 600) {
+    throw const DavFailure('list', 'directory_limit');
+  }
+  final names = <String>{};
+  bool self = false;
+  for (final response in responses) {
+    final href = response.getElement('href', namespaceUri: 'DAV:')?.innerText;
+    if (href == null) throw const DavFailure('list', 'missing_href');
+    final uri = folder.resolve(href);
+    final path = uri.path.endsWith('/')
+        ? uri.path.substring(0, uri.path.length - 1)
+        : uri.path;
+    final parent = folder.path.substring(0, folder.path.length - 1);
+    if (uri.origin != folder.origin ||
+        uri.hasQuery ||
+        uri.hasFragment ||
+        (path != parent && !uri.path.startsWith(folder.path))) {
+      throw const DavFailure('list', 'unsafe_href');
+    }
+    final stats = response.findElements('propstat', namespaceUri: 'DAV:');
+    if (!stats.any(
+      (p) => RegExp(r'^HTTP/\S+ 200(?: |$)').hasMatch(
+        p.getElement('status', namespaceUri: 'DAV:')?.innerText.trim() ?? '',
+      ),
+    )) {
+      throw const DavFailure('list', 'partial_response');
+    }
+    if (path == parent) {
+      self = true;
+      continue;
+    }
+    final name = uri.path.substring(folder.path.length);
+    if (name != 'bootstrap.wenc' &&
+        !RegExp(r'^[0-9a-f]{64}\.wenc$').hasMatch(name)) {
+      throw const DavFailure('list', 'unexpected_file');
+    }
+    if (!names.add(name)) throw const DavFailure('list', 'duplicate_href');
+  }
+  if (!self) throw const DavFailure('list', 'missing_collection');
+  return names;
+}
+
 class NutstoreSync {
-  NutstoreSync(this.directory, this.request);
+  NutstoreSync(
+    this.directory,
+    this.request, {
+    this.wire,
+    this.pace = const Duration(seconds: 4),
+  });
   final Directory directory;
   final VaultRequest request;
+  final DavWire? wire;
+  final Duration pace;
   final HttpClient client = HttpClient()
     ..connectionTimeout = const Duration(seconds: 20);
-  late String auth;
+  String auth = '';
   late SyncBudget budget;
-  final Uri root = Uri.parse('https://dav.jianguoyun.com/dav/');
-  Future<(int, Uint8List)> send(
+  DateTime? last;
+  bool cancelled = false;
+  static final root = Uri.parse('https://dav.jianguoyun.com/dav/');
+  static final prop = utf8.encode(
+    '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>',
+  );
+  void cancel() {
+    cancelled = true;
+    client.close(force: true);
+  }
+
+  Future<DavReply> _http(
     String method,
-    Uri uri, {
-    List<int> body = const [],
-    int limit = 1024 * 1024,
-  }) async {
-    if (uri.scheme != 'https' ||
-        uri.host != root.host ||
-        uri.port != root.port ||
-        !uri.path.startsWith(root.path)) {
-      throw StateError('unsafe_url');
-    }
-    await budget.reserve(body.length + 2048, limit + 8192);
+    Uri uri,
+    List<int> body,
+    String depth,
+    int limit,
+  ) async {
     final req = await client
         .openUrl(method, uri)
         .timeout(const Duration(seconds: 20));
     req.followRedirects = false;
     req.headers.set(HttpHeaders.authorizationHeader, auth);
-    req.contentLength = body.length;
+    req.headers.set(HttpHeaders.userAgentHeader, 'Wencrypt/0.2');
+    if (method != 'GET' && method != 'HEAD') req.contentLength = body.length;
+    if (method == 'PUT') req.headers.contentType = ContentType.binary;
     if (method == 'PROPFIND') {
-      req.headers.set('Depth', '1');
+      req.headers.set('Depth', depth);
       req.headers.contentType = ContentType(
         'application',
         'xml',
@@ -98,34 +218,94 @@ class NutstoreSync {
       );
     }
     if (body.isNotEmpty) req.add(body);
-    final response = await req.close().timeout(const Duration(seconds: 30));
-    if (response.contentLength > limit) {
-      client.close(force: true);
-      throw StateError('response_limit');
+    final res = await req.close().timeout(const Duration(seconds: 30));
+    if (res.contentLength > limit) {
+      throw const DavFailure('response', 'size_limit');
     }
-    final result = BytesBuilder();
-    await for (final part in response.timeout(const Duration(seconds: 30))) {
-      if (result.length + part.length > limit) {
-        client.close(force: true);
-        throw StateError('response_limit');
+    final bytes = BytesBuilder();
+    await for (final chunk in res.timeout(const Duration(seconds: 30))) {
+      if (bytes.length + chunk.length > limit) {
+        throw const DavFailure('response', 'size_limit');
       }
-      result.add(part);
+      bytes.add(chunk);
     }
-    return (response.statusCode, result.takeBytes());
+    return DavReply(res.statusCode, bytes.takeBytes());
   }
 
-  List<int> unhex(String s) {
-    if (s.length.isOdd) throw StateError('invalid_hex');
-    return [
-      for (int i = 0; i < s.length; i += 2)
-        int.parse(s.substring(i, i + 2), radix: 16),
-    ];
+  Future<DavReply> send(
+    String stage,
+    String method,
+    Uri uri, {
+    List<int> body = const [],
+    String depth = '1',
+    int limit = 1024 * 1024,
+    Set<int> accepted = const {200},
+  }) async {
+    try {
+      if (uri.scheme != 'https' ||
+          uri.origin != root.origin ||
+          !uri.path.startsWith(root.path)) {
+        throw DavFailure(stage, 'unsafe_url');
+      }
+      if (last != null) {
+        final remaining = pace - DateTime.now().difference(last!);
+        if (remaining > Duration.zero) await Future<void>.delayed(remaining);
+      }
+      if (cancelled) throw DavFailure(stage, 'cancelled');
+      final now = DateTime.now().toUtc();
+      final month = '${now.year}-${now.month.toString().padLeft(2, '0')}';
+      await budget.reserve(body.length + 2048, limit + 8192);
+      last = DateTime.now();
+      final response = await (wire ?? _http)(method, uri, body, depth, limit);
+      if (response.body.length > limit) {
+        throw DavFailure(stage, 'response_limit', response.status);
+      }
+      await budget.settleDownload(limit - response.body.length, month);
+      if (!accepted.contains(response.status)) {
+        throw DavFailure(
+          stage,
+          response.status == 401 || response.status == 403
+              ? 'authentication_or_permission'
+              : response.status == 429
+              ? 'rate_limited'
+              : 'http_error',
+          response.status,
+        );
+      }
+      return response;
+    } on DavFailure catch (e) {
+      throw DavFailure(stage, e.reason, e.status);
+    } on HandshakeException {
+      throw DavFailure(stage, 'tls_failed');
+    } on SocketException {
+      throw DavFailure(stage, 'network_failed');
+    } on HttpException {
+      throw DavFailure(stage, 'network_failed');
+    } on TimeoutException {
+      throw DavFailure(stage, 'timeout');
+    } on FileSystemException {
+      throw DavFailure(stage, 'local_budget_storage_failed');
+    } on StateError catch (e) {
+      throw DavFailure(
+        stage,
+        e.message == 'free_budget_reached'
+            ? 'free_budget_reached'
+            : 'local_state_failed',
+      );
+    }
   }
 
+  List<int> unhex(String s) => [
+    for (int i = 0; i < s.length; i += 2)
+      int.parse(s.substring(i, i + 2), radix: 16),
+  ];
   String hex(List<int> b) =>
       b.map((v) => v.toRadixString(16).padLeft(2, '0')).join();
   Future<String> sync(String username, String password) async {
-    auth = 'Basic ${base64Encode(utf8.encode('$username:$password'))}';
+    if (username.trim().isEmpty || username.contains(':') || password.isEmpty) {
+      throw const DavFailure('configure', 'missing_credentials');
+    }
+    auth = 'Basic ${base64Encode(utf8.encode('${username.trim()}:$password'))}';
     budget = SyncBudget(File('${directory.path}/sync-budget.json'));
     try {
       final snapshot = await request('sync_objects');
@@ -133,92 +313,132 @@ class NutstoreSync {
       final folder = root.resolve('wc-${vault.substring(0, 16)}/');
       final remembered = File('${directory.path}/sync-$vault.bound');
       final bootstrap = unhex(snapshot['bootstrap'] as String);
-      final (status, remote) = await send(
+      // Authentication is diagnosed separately from missing collections.
+      await send(
+        'authenticate',
+        'PROPFIND',
+        root,
+        body: prop,
+        depth: '0',
+        limit: 64 * 1024,
+        accepted: {207},
+      );
+      var remote = await send(
+        'read_bootstrap',
         'GET',
         folder.resolve('bootstrap.wenc'),
-        limit: 1024,
+        limit: 8192,
+        accepted: {200, 404},
       );
-      if (status == 404) {
-        if (await remembered.exists()) throw StateError('remote_missing');
-        final (made, _) = await send('MKCOL', folder, limit: 8192);
-        if (made != 201) throw StateError('remote_folder_not_created');
-        final (put, _) = await send(
-          'PUT',
-          folder.resolve('bootstrap.wenc'),
-          body: bootstrap,
+      if (remote.status == 404) {
+        if (await remembered.exists()) {
+          throw const DavFailure('read_bootstrap', 'remote_missing');
+        }
+        final made = await send(
+          'create_directory',
+          'MKCOL',
+          folder,
           limit: 8192,
+          accepted: {201, 405},
         );
-        if (put != 201 && put != 204) throw StateError('upload_failed');
-      } else if (status != 200 || hex(remote) != hex(bootstrap)) {
-        throw StateError('remote_identity_or_auth_failed');
+        if (made.status == 405) {
+          final listed = await send(
+            'inspect_existing_directory',
+            'PROPFIND',
+            folder,
+            body: prop,
+            accepted: {207},
+          );
+          final names = parseDavListing(listed.body, folder);
+          if (names.contains('bootstrap.wenc')) {
+            remote = await send(
+              'reread_bootstrap',
+              'GET',
+              folder.resolve('bootstrap.wenc'),
+              limit: 8192,
+            );
+          } else if (names.isNotEmpty) {
+            throw const DavFailure('initialize', 'nonempty_unbound_directory');
+          }
+        }
+        if (remote.status == 404) {
+          await send(
+            'write_bootstrap',
+            'PUT',
+            folder.resolve('bootstrap.wenc'),
+            body: bootstrap,
+            limit: 8192,
+            accepted: {201, 204},
+          );
+          remote = await send(
+            'verify_bootstrap',
+            'GET',
+            folder.resolve('bootstrap.wenc'),
+            limit: 8192,
+          );
+        }
+      }
+      if (hex(remote.body) != hex(bootstrap)) {
+        throw const DavFailure('verify_bootstrap', 'vault_identity_mismatch');
       }
       await remembered.writeAsString('bound', flush: true);
-      final (listingCode, listing) = await send(
+      final listing = await send(
+        'list',
         'PROPFIND',
         folder,
-        body: utf8.encode(
-          '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>',
-        ),
+        body: prop,
+        accepted: {207},
       );
-      if (listingCode != 207) throw StateError('listing_failed');
-      final xml = XmlDocument.parse(utf8.decode(listing));
-      if (xml.descendants.any((n) => n is XmlDoctype)) {
-        throw StateError('invalid_xml');
+      final names = parseDavListing(listing.body, folder);
+      if (!names.contains('bootstrap.wenc')) {
+        throw const DavFailure('list', 'bootstrap_missing');
       }
-      final responses = xml.descendants
-          .whereType<XmlElement>()
-          .where((e) => e.name.local == 'response')
-          .toList();
-      // Stop well before the provider's 750-item truncation threshold.
-      if (responses.length >= 600) throw StateError('directory_limit');
-      final remoteHashes = <String>{};
-      for (final response in responses) {
-        final hrefs = response.descendants
-            .whereType<XmlElement>()
-            .where((e) => e.name.local == 'href')
-            .toList();
-        if (hrefs.length != 1) throw StateError('invalid_listing');
-        final uri = folder.resolve(hrefs.single.innerText);
-        if (uri.origin != folder.origin ||
-            !uri.path.startsWith(folder.path) ||
-            uri.hasQuery ||
-            uri.hasFragment) {
-          throw StateError('unsafe_listing');
-        }
-        final name = uri.path.substring(folder.path.length);
-        if (name.isEmpty || name == 'bootstrap.wenc') continue;
-        if (!RegExp(r'^[0-9a-f]{64}\.wenc$').hasMatch(name)) {
-          throw StateError('unexpected_remote_file');
-        }
-        remoteHashes.add(name.substring(0, 64));
-      }
+      final remoteHashes = names
+          .where((n) => n != 'bootstrap.wenc')
+          .map((n) => n.substring(0, 64))
+          .toSet();
       final objects = (snapshot['objects'] as List)
           .cast<Map<String, dynamic>>();
-      final localHashes = objects.map((o) => o['hash'] as String).toSet();
-      if (remoteHashes.union(localHashes).length >= 598) {
-        throw StateError('directory_limit');
+      final local = objects.map((o) => o['hash'] as String).toSet();
+      if (remoteHashes.union(local).length >= 598) {
+        throw const DavFailure('list', 'directory_limit');
       }
       int downloaded = 0, uploaded = 0;
-      for (final hash in remoteHashes.difference(localHashes)) {
-        final (code, bytes) = await send('GET', folder.resolve('$hash.wenc'));
-        if (code != 200) throw StateError('download_failed');
-        await request('ingest', {'hash': hash, 'body': hex(bytes)});
+      for (final hash in remoteHashes.difference(local)) {
+        final response = await send(
+          'download',
+          'GET',
+          folder.resolve('$hash.wenc'),
+        );
+        await request('ingest', {'hash': hash, 'body': hex(response.body)});
         downloaded++;
       }
       for (final object in objects.where(
         (o) => !remoteHashes.contains(o['hash']),
       )) {
-        // Filename is a SHA-256 of ciphertext; equal names represent equal immutable objects.
-        final (code, _) = await send(
+        await send(
+          'upload',
           'PUT',
           folder.resolve('${object['hash']}.wenc'),
           body: unhex(object['body'] as String),
           limit: 8192,
+          accepted: {201, 204},
         );
-        if (code != 201 && code != 204) throw StateError('upload_failed');
         uploaded++;
       }
-      return '本轮上传 $uploaded、下载 $downloaded。其他设备新增内容将在下次同步发现。';
+      return '本轮上传 $uploaded、下载 $downloaded；其他设备的新内容会在后续同步发现。';
+    } catch (e) {
+      final safe = e is DavFailure
+          ? e
+          : const DavFailure('merge_or_parse', 'validation_failed');
+      await File('${directory.path}/last-sync-diagnostic.json').writeAsString(
+        jsonEncode({
+          ...safe.diagnostic,
+          'time': DateTime.now().toUtc().toIso8601String(),
+        }),
+        flush: true,
+      );
+      throw safe;
     } finally {
       auth = '';
       client.close(force: true);
