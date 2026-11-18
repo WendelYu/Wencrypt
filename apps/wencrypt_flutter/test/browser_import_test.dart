@@ -43,58 +43,72 @@ void main() {
     expect(batch.rows.first['password'], '00123');
   });
 
-  test('watcher ignores existing and non-password CSVs, captures new browser CSV, and shredFile deletes it', () async {
-    final tempDir = await Directory.systemTemp.createTemp('wencrypt-watch-');
-    try {
-      // Pre-existing browser CSV should be ignored by baseline snapshot.
-      final oldCsv = File('${tempDir.path}/old-passwords.csv');
-      await oldCsv.writeAsString(
-        'name,url,username,password\nOld,https://old.example,olduser,oldpass\n',
-      );
+  test(
+    'watcher ignores existing and non-password CSVs, captures new browser CSV, and shredFile deletes it',
+    () async {
+      final sep = Platform.pathSeparator;
+      final tempDir = await Directory.systemTemp.createTemp('wencrypt-watch-');
+      try {
+        // Pre-existing browser CSV should be ignored by baseline snapshot.
+        final oldCsv = File('${tempDir.path}${sep}old-passwords.csv');
+        await oldCsv.writeAsString(
+          'name,url,username,password\nOld,https://old.example,olduser,oldpass\n',
+          flush: true,
+        );
 
-      final watcher = BrowserCsvWatcher(
-        [tempDir],
-        pollInterval: const Duration(milliseconds: 50),
-        stabilityDelay: const Duration(milliseconds: 30),
-      );
-      await watcher.start();
+        final watcher = BrowserCsvWatcher(
+          [tempDir],
+          pollInterval: const Duration(milliseconds: 50),
+          stabilityDelay: const Duration(milliseconds: 30),
+        );
+        await watcher.start();
 
-      final completer = Completer<CapturedBrowserCsv>();
-      final sub = watcher.onCaptured.listen((captured) {
-        if (!completer.isCompleted) completer.complete(captured);
-      });
+        final completer = Completer<CapturedBrowserCsv>();
+        final sub = watcher.onCaptured.listen((captured) {
+          if (!completer.isCompleted) completer.complete(captured);
+        });
 
-      // Unrelated CSV without url/username/password headers should be ignored.
-      final unrelated = File('${tempDir.path}/statement.csv');
-      await unrelated.writeAsString('date,amount,merchant\n2026-11-18,12.5,Cafe\n');
+        // Unrelated CSV without url/username/password headers should be ignored.
+        final unrelated = File('${tempDir.path}${sep}statement.csv');
+        await unrelated.writeAsString(
+          'date,amount,merchant\n2026-11-18,12.5,Cafe\n',
+          flush: true,
+        );
 
-      await Future<void>.delayed(const Duration(milliseconds: 120));
-      expect(completer.isCompleted, isFalse);
+        await Future<void>.delayed(const Duration(milliseconds: 120));
+        expect(completer.isCompleted, isFalse);
 
-      // Newly exported Edge/Chrome CSV should be captured.
-      final exported = File('${tempDir.path}/Microsoft Edge Passwords.csv');
-      await exported.writeAsString(
-        'name,url,username,password\nGitHub,https://github.com,wen,s3cr3t!\n',
-      );
+        // Newly exported Edge/Chrome CSV should be captured.
+        final exported = File(
+          '${tempDir.path}${sep}Microsoft Edge Passwords.csv',
+        );
+        await exported.writeAsString(
+          'name,url,username,password\nGitHub,https://github.com,wen,s3cr3t!\n',
+          flush: true,
+        );
 
-      final captured = await completer.future.timeout(
-        const Duration(seconds: 3),
-      );
-      expect(captured.file.path, exported.path);
-      expect(captured.export.rows.single['title'], 'GitHub');
-      expect(captured.export.rows.single['password'], 's3cr3t!');
+        final captured = await completer.future.timeout(
+          const Duration(seconds: 5),
+        );
+        expect(
+          captured.file.path.replaceAll('\\', '/'),
+          exported.path.replaceAll('\\', '/'),
+        );
+        expect(captured.export.rows.single['title'], 'GitHub');
+        expect(captured.export.rows.single['password'], 's3cr3t!');
 
-      // Shredding should delete the temporary CSV file cleanly.
-      await shredFile(captured.file);
-      expect(await exported.exists(), isFalse);
-      expect(await unrelated.exists(), isTrue);
+        // Shredding should delete the temporary CSV file cleanly.
+        await shredFile(captured.file);
+        expect(await exported.exists(), isFalse);
+        expect(await unrelated.exists(), isTrue);
 
-      await sub.cancel();
-      watcher.dispose();
-    } finally {
-      if (await tempDir.exists()) {
-        await tempDir.delete(recursive: true);
+        await sub.cancel();
+        watcher.dispose();
+      } finally {
+        if (await tempDir.exists()) {
+          await tempDir.delete(recursive: true);
+        }
       }
-    }
-  });
+    },
+  );
 }

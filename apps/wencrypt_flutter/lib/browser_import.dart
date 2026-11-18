@@ -230,7 +230,8 @@ class BrowserCsvWatcher {
   }
 
   Future<void> addDirectory(Directory directory) async {
-    if (_directories.any((d) => d.path == directory.path)) return;
+    final target = _normPath(directory.path);
+    if (_directories.any((d) => _normPath(d.path) == target)) return;
     _directories.add(directory);
     await _snapshotDirectory(directory);
   }
@@ -247,13 +248,18 @@ class BrowserCsvWatcher {
       await for (final entity in dir.list(followLinks: false)) {
         if (entity is File && _isCandidateCsv(entity.path)) {
           final stat = await entity.stat();
-          _seenSignatures[entity.path] = _signature(stat);
+          if (stat.size > 0) {
+            _seenSignatures[_normPath(entity.path)] = _signature(stat);
+          }
         }
       }
     } catch (_) {
       // Directory may be inaccessible or removed.
     }
   }
+
+  String _normPath(String path) =>
+      path.replaceAll('\\', '/').replaceAll(RegExp(r'/+$'), '');
 
   bool _isCandidateCsv(String path) {
     final lower = path.toLowerCase();
@@ -279,20 +285,30 @@ class BrowserCsvWatcher {
             if (entity is! File || !_isCandidateCsv(entity.path)) continue;
             final stat = await entity.stat();
             if (stat.size <= 0 || stat.size > 1024 * 1024) continue;
+            final key = _normPath(entity.path);
             final sig = _signature(stat);
-            if (_seenSignatures[entity.path] == sig) continue;
+            if (_seenSignatures[key] == sig) continue;
 
             // Wait briefly to confirm browser finished flushing/renaming the file.
             await Future<void>.delayed(stabilityDelay);
             if (_disposed || !await entity.exists()) continue;
             final afterStat = await entity.stat();
+            if (afterStat.size <= 0) continue;
             final afterSig = _signature(afterStat);
             if (afterSig != sig) continue;
 
+            String content;
             try {
-              final content = await entity.readAsString();
+              content = await entity.readAsString();
+            } on FileSystemException {
+              // On Windows the writer process may still hold an exclusive lock; retry on next tick.
+              continue;
+            }
+            if (content.trim().isEmpty) continue;
+
+            try {
               final parsed = BrowserExport.parse(content);
-              _seenSignatures[entity.path] = afterSig;
+              _seenSignatures[key] = afterSig;
               if (parsed.rows.isNotEmpty) {
                 if (!_controller.isClosed) {
                   _controller.add(CapturedBrowserCsv(entity, parsed));
@@ -301,8 +317,8 @@ class BrowserCsvWatcher {
                 return;
               }
             } catch (_) {
-              // Ignore non-password CSVs or incomplete writes; mark signature so we don't spin on unrelated files.
-              _seenSignatures[entity.path] = afterSig;
+              // Non-password CSVs are marked so we don't re-parse them on every tick.
+              _seenSignatures[key] = afterSig;
             }
           }
         } catch (_) {
