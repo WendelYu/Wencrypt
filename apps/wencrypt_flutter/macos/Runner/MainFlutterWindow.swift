@@ -47,6 +47,21 @@ class MainFlutterWindow: NSWindow {
       self?.vaultDevice.cancel()
       deviceChannel.invokeMethod("systemLocked",arguments:nil)
     }
+    let imageChannel = FlutterMethodChannel(
+      name: "org.wencrypt.entry-image",
+      binaryMessenger: flutterViewController.engine.binaryMessenger
+    )
+    imageChannel.setMethodCallHandler { call, result in
+      guard call.method == "copyPng" else { result(FlutterMethodNotImplemented); return }
+      guard let png = call.arguments as? FlutterStandardTypedData, !png.data.isEmpty else {
+        result(FlutterError(code: "invalid_image", message: nil, details: nil))
+        return
+      }
+      let clipboard = NSPasteboard.general
+      clipboard.clearContents()
+      result(clipboard.setData(png.data, forType: .png))
+    }
+
     let browsers = [
       "Chrome": ("com.google.Chrome", "chrome://password-manager/settings"),
       "Edge": ("com.microsoft.edgemac", "edge://settings/autofill/passwords"),

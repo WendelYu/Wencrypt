@@ -35,6 +35,22 @@ final class NativeVaultBridge {
         guard status==0 else {throw DeviceVaultError.failed}
         return String(decoding:output,as:UTF8.self)
     }
+    func backupGrant(_ payload: Data, _ epoch: UInt64) throws -> String {
+        typealias Grant = @convention(c) (UnsafePointer<UInt8>, UInt64, UnsafeMutablePointer<UInt8>) -> Int32
+        guard payload.count == 80, let symbol = dlsym(handle, "wencrypt_device_backup_grant") else {
+            throw DeviceVaultError.failed
+        }
+        let call = unsafeBitCast(symbol, to: Grant.self)
+        var output = [UInt8](repeating: 0, count: 32)
+        let status = payload.withUnsafeBytes { body in
+            output.withUnsafeMutableBufferPointer { ticket in
+                call(body.bindMemory(to: UInt8.self).baseAddress!, epoch, ticket.baseAddress!)
+            }
+        }
+        guard status == 0 else { throw DeviceVaultError.failed }
+        return String(decoding: output, as: UTF8.self)
+    }
+
 }
 enum DeviceVaultError: Error { case failed, cancelled }
 final class DeviceVault {
@@ -53,10 +69,10 @@ final class DeviceVault {
         return directory.appendingPathComponent(binding+".json")
     }
     private func info(_ binding:String)->Data {Data(("wencrypt-local-device-key-v1/"+binding).utf8)}
-    private func unwrap(_ wrapped:Wrapped,_ binding:String,_ expected:UInt64)throws->Data {
+    private func unwrap(_ wrapped:Wrapped,_ binding:String,_ expected:UInt64, backup: Bool = false)throws->Data {
         guard wrapped.version==1,wrapped.peer.count==64,wrapped.salt.count==32,wrapped.body.count==108 else{throw DeviceVaultError.failed}
         try check(expected)
-        let ctx=LAContext();ctx.localizedReason="使用 Touch ID 解锁 Wencrypt 密码库";ctx.localizedFallbackTitle="";ctx.touchIDAuthenticationAllowableReuseDuration=0
+        let ctx=LAContext();ctx.localizedReason=backup ? "使用 Touch ID 授权导出 Wencrypt 加密备份" : "使用 Touch ID 解锁 Wencrypt 密码库";ctx.localizedFallbackTitle="";ctx.touchIDAuthenticationAllowableReuseDuration=0
         mutex.lock();context=ctx;mutex.unlock()
         defer{ctx.invalidate();mutex.lock();context=nil;mutex.unlock()}
         try check(expected)
@@ -96,14 +112,20 @@ final class DeviceVault {
                 try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:url.path)
                 return ["enabled":true]
             }
-            if method=="unlock" {
-                guard let path=args["path"] as? String,let epoch=args["epoch"] as? NSNumber else{throw DeviceVaultError.failed}
+            if method == "unlock" || method == "authorizeBackup" {
+                guard let epoch = args["epoch"] as? NSNumber else { throw DeviceVaultError.failed }
                 let size=try url.resourceValues(forKeys:[.fileSizeKey]).fileSize ?? 0
                 guard size>0,size<16384 else{throw DeviceVaultError.failed}
                 let wrapped=try JSONDecoder().decode(Wrapped.self,from:Data(contentsOf:url))
-                var payload=try unwrap(wrapped,binding,expected);defer{payload.resetBytes(in:0..<payload.count)}
+                let backup = method == "authorizeBackup"
+                var payload = try unwrap(wrapped, binding, expected, backup: backup)
+                defer { payload.resetBytes(in: 0..<payload.count) }
                 try check(expected)
-                return ["session":try bridge.open(path,payload,epoch.uint64Value)]
+                if backup {
+                    return ["ticket": try bridge.backupGrant(payload, epoch.uint64Value)]
+                }
+                guard let path = args["path"] as? String else { throw DeviceVaultError.failed }
+                return ["session": try bridge.open(path, payload, epoch.uint64Value)]
             }
             throw DeviceVaultError.failed
         }catch{return ["error":"biometric_cancelled_invalidated_or_failed"]}

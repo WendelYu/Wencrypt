@@ -49,12 +49,30 @@ struct Revision {
     updated_at: u64,
     data: Entry,
 }
+// Encode clearing the trash as a schema-1 tombstone so earlier clients
+// can still decrypt its revision and follow the same ancestry.
+const DISCARDED_TITLE: &str = "已从回收站清除";
+const DISCARDED_TAG: &str = "wencrypt:discarded:v1";
+
+impl Revision {
+    fn discarded(&self) -> bool {
+        self.deleted
+            && self.data.title == DISCARDED_TITLE
+            && self.data.tags == DISCARDED_TAG
+            && self.data.username.is_empty()
+            && self.data.password.is_empty()
+            && self.data.url.is_empty()
+            && self.data.notes.is_empty()
+    }
+}
+
 struct Session {
     token: String,
     db: Connection,
     id: [u8; 16],
     dek: Zeroizing<[u8; 32]>,
     revisions: BTreeMap<String, Revision>,
+    backup_grant: Option<(String, std::time::Instant)>,
 }
 #[derive(Default)]
 pub struct Vault {
@@ -434,8 +452,28 @@ impl Vault {
             id,
             dek,
             revisions,
+            backup_grant: None,
         });
         Ok(token)
+    }
+    pub(crate) fn authorize_device_backup(&mut self, payload: &[u8], epoch: u64) -> Result<String> {
+        if epoch != self.epoch {
+            return Err("session_expired");
+        }
+        let s = self.session.as_mut().ok_or("locked")?;
+        if payload.len() != 80
+            || payload[..16] != s.id
+            || payload[16..48] != Sha256::digest(bootstrap(&s.db)?)[..]
+            || payload[48..] != s.dek[..]
+        {
+            return Err("device_binding_mismatch");
+        }
+        let ticket = identifier()?;
+        s.backup_grant = Some((
+            ticket.clone(),
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        ));
+        Ok(ticket)
     }
     pub fn command(&mut self, v: &Value) -> Result<Value> {
         let op = field(v, "op")?;
@@ -539,6 +577,7 @@ impl Vault {
                 id,
                 dek,
                 revisions,
+                backup_grant: None,
             });
             return Ok(json!({"session":token}));
         }
@@ -617,10 +656,14 @@ impl Vault {
                 // Refresh from disk so another writer cannot be silently overwritten.
                 s.revisions = load(&s.db, &s.dek, &s.id)?;
                 let state = view(&s.revisions)?;
-                let entries = state
-                    .heads
-                    .iter()
-                    .map(|id| &s.revisions[id])
+                let heads = state.heads.iter().map(|id| &s.revisions[id]);
+                let visible = heads
+                    .clone()
+                    .filter(|r| !r.discarded())
+                    .map(|r| &r.entry)
+                    .collect::<BTreeSet<_>>();
+                let entries = heads
+                    .filter(|r| visible.contains(&r.entry))
                     .collect::<Vec<_>>();
                 Ok(
                     json!({"entries":entries,"pending":state.pending.len(),"vault":hex::encode(s.id)}),
@@ -710,14 +753,15 @@ impl Vault {
                     json!({"imported":true,"added":added,"updated":updated,"duplicates":entries.len()-added}),
                 )
             }
-            "set_deleted" => {
+            "set_deleted" | "discard_trash" => {
                 let ids: BTreeSet<String> =
                     serde_json::from_value(v.get("heads").cloned().ok_or("invalid_entry_id")?)
                         .map_err(|_| "invalid_entry_id")?;
-                let deleted = v
-                    .get("deleted")
-                    .and_then(Value::as_bool)
-                    .ok_or("invalid_entry")?;
+                let discard = op == "discard_trash";
+                let deleted = discard
+                    || v.get("deleted")
+                        .and_then(Value::as_bool)
+                        .ok_or("invalid_entry")?;
                 let tx = sql(s
                     .db
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
@@ -740,12 +784,23 @@ impl Vault {
                         .filter(|r| {
                             state.heads.contains(id)
                                 && head_counts[&r.entry] == 1
-                                && r.deleted != deleted
+                                && !r.discarded()
+                                && r.deleted == (discard || !deleted)
                         })
                         .ok_or("entry_changed_reload")?;
                     let mut revision = head.clone();
                     revision.id = identifier()?;
                     revision.parents = vec![id.clone()];
+                    if discard {
+                        revision.data = Entry {
+                            title: DISCARDED_TITLE.to_owned(),
+                            tags: DISCARDED_TAG.to_owned(),
+                            username: String::new(),
+                            password: String::new(),
+                            url: String::new(),
+                            notes: String::new(),
+                        };
+                    }
                     revision.deleted = deleted;
                     revision.updated_at = now()?;
                     write_revision(&tx, &s.dek, &s.id, &revision)?;
@@ -786,6 +841,9 @@ impl Vault {
                     || parents.len() != heads.len()
                     || parents.len() > 64
                 {
+                    return Err("entry_changed_reload");
+                }
+                if !heads.is_empty() && heads.iter().all(|id| current[id].discarded()) {
                     return Err("entry_changed_reload");
                 }
                 if !state.pending.is_empty() {
@@ -910,9 +968,17 @@ impl Vault {
                     return Err("incomplete_backup");
                 }
                 let b = bootstrap(&s.db)?;
-                let key = crypto(envelope::unlock_bootstrap(field(v, "password")?, &b))?;
-                if *key != *s.dek {
-                    return Err("authentication_failed");
+                if let Some(ticket) = v.get("biometric_ticket").and_then(Value::as_str) {
+                    let (expected, expires) =
+                        s.backup_grant.take().ok_or("biometric_grant_expired")?;
+                    if ticket != expected || std::time::Instant::now() > expires {
+                        return Err("biometric_grant_expired");
+                    }
+                } else {
+                    let key = crypto(envelope::unlock_bootstrap(field(v, "password")?, &b))?;
+                    if *key != *s.dek {
+                        return Err("authentication_failed");
+                    }
                 }
                 let mut stmt = sql(s.db.prepare("SELECT body FROM objects ORDER BY hash"))?;
                 let objects = sql(stmt.query_map([], |r| r.get::<_, Vec<u8>>(0)))?
@@ -1186,6 +1252,130 @@ mod tests {
             .unwrap();
         assert_eq!(current["deleted"], false);
         assert_eq!(current["data"], tombstone["data"]);
+    }
+
+    #[test]
+    fn cleared_trash_is_hidden_on_a_peer_but_keeps_ciphertext_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let pass = "public trash fixture passphrase";
+        let mut source = Vault::new();
+        let opened = source
+            .command(&json!({"op":"create","path":dir.path().join("source.db"),"password":pass}))
+            .unwrap();
+        let token = opened["session"].as_str().unwrap();
+        call(
+            &mut source,
+            token,
+            json!({"op":"save","data":entry("archived")}),
+        );
+        let listed = call(&mut source, token, json!({"op":"list"}));
+        let active = &listed["entries"][0]["id"];
+        assert_eq!(
+            source.command(&json!({"op":"discard_trash","heads":[active],"session":token})),
+            Err("entry_changed_reload")
+        );
+        call(
+            &mut source,
+            token,
+            json!({"op":"set_deleted","heads":[active],"deleted":true}),
+        );
+        let listed = call(&mut source, token, json!({"op":"list"}));
+        let trash = &listed["entries"][0];
+        call(
+            &mut source,
+            token,
+            json!({"op":"discard_trash","heads":[trash["id"]]}),
+        );
+        assert_eq!(
+            call(&mut source, token, json!({"op":"list"}))["entries"],
+            json!([])
+        );
+        let history = call(
+            &mut source,
+            token,
+            json!({"op":"history","entry":trash["entry"]}),
+        );
+        let revisions = history["revisions"].as_array().unwrap();
+        assert_eq!(revisions.len(), 3);
+        let clear = revisions
+            .iter()
+            .find(|revision| revision["data"]["tags"] == DISCARDED_TAG)
+            .unwrap();
+        assert_eq!(clear["data"]["password"], "");
+        assert_eq!(
+            source.command(
+                &json!({"op":"set_deleted","heads":[clear["id"]],"session":token,"deleted":false})
+            ),
+            Err("entry_changed_reload")
+        );
+
+        let snapshot = call(&mut source, token, json!({"op":"sync_objects"}));
+        let mut peer = Vault::new();
+        let opened = peer
+            .command(&json!({"op":"join","path":dir.path().join("peer.db"),"password":pass,"bootstrap":snapshot["bootstrap"]}))
+            .unwrap();
+        let peer_token = opened["session"].as_str().unwrap();
+        for object in snapshot["objects"].as_array().unwrap() {
+            call(
+                &mut peer,
+                peer_token,
+                json!({"op":"ingest","hash":object["hash"],"body":object["body"]}),
+            );
+        }
+        let listed = call(&mut peer, peer_token, json!({"op":"list"}));
+        assert_eq!(listed["entries"], json!([]));
+        assert_eq!(listed["pending"], 0);
+    }
+
+    #[test]
+    fn fingerprint_export_grant_is_one_use_and_backup_restores_with_master_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let pass = "public backup fixture passphrase";
+        let mut source = Vault::new();
+        let opened = source
+            .command(&json!({"op":"create","path":dir.path().join("source.db"),"password":pass}))
+            .unwrap();
+        let token = opened["session"].as_str().unwrap();
+        call(
+            &mut source,
+            token,
+            json!({"op":"save","data":entry("portable")}),
+        );
+        let grant = call(
+            &mut source,
+            token,
+            json!({"op":"device_grant","password":pass}),
+        );
+        let payload = source
+            .take_device_key(grant["ticket"].as_str().unwrap())
+            .unwrap();
+        assert!(source.authorize_device_backup(&*payload, 42).is_err());
+        let ticket = source.authorize_device_backup(&*payload, 0).unwrap();
+        let request = json!({"op":"export","biometric_ticket":ticket,"session":token});
+        let backup = source.command(&request).unwrap();
+        assert_eq!(source.command(&request), Err("biometric_grant_expired"));
+        assert_eq!(
+            call(&mut source, token, json!({"op":"list"}))["entries"][0]["data"]["password"],
+            "portable"
+        );
+
+        let destination = dir.path().join("restored.db");
+        let mut restored = Vault::new();
+        restored
+            .command(&json!({
+                "op":"restore","path":destination,"password":pass,
+                "bootstrap":backup["bootstrap"],"backup":backup["backup"]
+            }))
+            .unwrap();
+        let opened = restored
+            .command(&json!({"op":"unlock","path":destination,"password":pass}))
+            .unwrap();
+        let listed = call(
+            &mut restored,
+            opened["session"].as_str().unwrap(),
+            json!({"op":"list"}),
+        );
+        assert_eq!(listed["entries"][0]["data"]["password"], "portable");
     }
 
     #[test]

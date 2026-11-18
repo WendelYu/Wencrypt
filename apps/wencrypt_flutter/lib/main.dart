@@ -10,6 +10,7 @@ import 'package:path_provider/path_provider.dart';
 
 import 'browser_import.dart';
 import 'core.dart';
+import 'entry_image.dart';
 import 'probe_page.dart' show WencryptProbeApp;
 import 'sync.dart';
 
@@ -149,11 +150,13 @@ enum FirstRunStep { welcome, create, join }
 class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   static const _pinTag = '置顶';
   static const _presetGroups = ['工作', '财务', '社交', '开发', '购物', '生活'];
+  static const entryImage = MethodChannel('org.wencrypt.entry-image');
   static const device = MethodChannel('org.wencrypt.device/vault');
 
   final master = TextEditingController();
   final confirm = TextEditingController();
   final searchController = TextEditingController();
+  Timer? _searchUpdate;
 
   String? path, token, binding, vaultId, syncUsername;
   String message = '正在加载…', query = '';
@@ -182,6 +185,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    searchController.addListener(_scheduleSearch);
     device.setMethodCallHandler((call) async {
       if (call.method == 'systemLocked') lock();
     });
@@ -208,12 +212,29 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     master.dispose();
     confirm.dispose();
+    _searchUpdate?.cancel();
     searchController.dispose();
     idle?.cancel();
     clipboard?.cancel();
     autoTimer?.cancel();
     activeSync?.cancel();
     super.dispose();
+  }
+
+  void _scheduleSearch() {
+    _searchUpdate?.cancel();
+    if (token == null) return;
+    final value = searchController.value;
+    if (value.composing.isValid && !value.composing.isCollapsed) return;
+    if (value.text == query) return;
+    touch();
+    _searchUpdate = Timer(const Duration(milliseconds: 120), () {
+      if (!mounted || token == null) return;
+      setState(() {
+        query = value.text;
+        deleteSelection?.clear();
+      });
+    });
   }
 
   void touch() {
@@ -244,6 +265,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
 
   void lock() {
     generation++;
+    _searchUpdate?.cancel();
     autoTimer?.cancel();
     activeSync?.cancel();
     device.invokeMethod<Object?>('cancel').catchError((Object _) => null);
@@ -311,6 +333,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     if (text.contains('biometric')) {
       return '指纹认证取消、密钥失效或设备保护不可用。请用主密码解锁；需要时重新启用指纹。';
     }
+    if (text.contains('image_export_failed')) return '无法导出账号图片，请重试。';
     if (text.contains('backup_limit')) return '超出 Alpha 的 2 MiB 备份上限，导出已停止。';
     if (text.contains('vault_already_exists')) return '这台设备已有密码库，请返回解锁。';
     if (text.contains('entry_changed')) return '条目已被修改，请重新打开后编辑。';
@@ -481,15 +504,24 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     ];
   }
 
+  bool _hasSyncCredentials(Map<String, dynamic>? settings) {
+    final username = settings?['username'];
+    final password = settings?['password'];
+    return username is String &&
+        username.trim().isNotEmpty &&
+        password is String &&
+        password.isNotEmpty;
+  }
+
   Future<void> loadAuto() async {
     final settings =
         (await request('sync_settings_get'))['settings']
             as Map<String, dynamic>?;
     if (!mounted) return;
     setState(() {
-      syncConfigured = settings != null;
+      syncConfigured = _hasSyncCredentials(settings);
       syncUsername = settings?['username'] as String?;
-      autoEnabled = settings?['auto'] == true;
+      autoEnabled = syncConfigured && settings?['auto'] == true;
       initialSyncPending = settings?['joinPending'] == true;
       if (initialSyncPending) message = '本机已加入已有库，首次同步尚未完成';
       syncTargets = settings == null
@@ -553,8 +585,11 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
             (await request('sync_settings_get'))['settings']
                 as Map<String, dynamic>?;
         if (username == null || password == null) {
-          if (savedSettings == null) return;
-          username = savedSettings['username'] as String;
+          if (!_hasSyncCredentials(savedSettings)) {
+            if (mounted) setState(() => message = '请先保存本机的坚果云同步配置');
+            return;
+          }
+          username = savedSettings!['username'] as String;
           password = savedSettings['password'] as String;
         }
       }
@@ -730,16 +765,23 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     });
   }
 
-  Future<void> _setDeleted(List<String> heads, {required bool deleted}) async {
+  Future<void> _setDeleted(
+    List<String> heads, {
+    required bool deleted,
+    bool discard = false,
+  }) async {
     if (heads.isEmpty || busy) return;
     touch();
     final epoch = generation;
-    if (heads.length > 1) {
+    if (discard || heads.length > 1) {
+      final verb = discard ? '从回收站清除' : '移入回收站';
       final confirmed = await showDialog<bool>(
         context: context,
         builder: (ctx) => AlertDialog(
-          title: Text('将 ${heads.length} 个账号移入回收站？'),
-          content: const Text('可以在回收站恢复这些账号。'),
+          title: Text('$verb ${heads.length} 个账号？'),
+          content: Text(
+            discard ? '清除后无法从回收站恢复。已有密文历史和备份仍会保留。' : '可以在回收站恢复这些账号。',
+          ),
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(ctx),
@@ -747,7 +789,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
             ),
             FilledButton(
               onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('移入回收站'),
+              child: Text(verb),
             ),
           ],
         ),
@@ -755,10 +797,17 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       if (confirmed != true || !mounted || generation != epoch) return;
     }
     await action(() async {
-      await request('set_deleted', {'heads': heads, 'deleted': deleted});
+      await request(discard ? 'discard_trash' : 'set_deleted', {
+        'heads': heads,
+        if (!discard) 'deleted': deleted,
+      });
       await refresh();
       if (!mounted || epoch != generation) return;
-      final result = deleted ? '已将 ${heads.length} 个账号移入回收站' : '已恢复账号';
+      final result = discard
+          ? '已从回收站清除 ${heads.length} 个账号'
+          : deleted
+          ? '已将 ${heads.length} 个账号移入回收站'
+          : '已恢复账号';
       setState(() {
         deleteSelection = null;
         message = result;
@@ -859,15 +908,19 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
               : (revision?['data'][key] as String? ?? ''),
         ),
     };
+    final tagController = controllers['tags']!;
+    final committedTags = ValueNotifier(tagController.text);
+    tagController.addListener(() {
+      final value = tagController.value;
+      if (!value.composing.isValid || value.composing.isCollapsed) {
+        committedTags.value = value.text;
+      }
+    });
     bool reveal = false;
-    final result = await showDialog<String>(
+    final route = DialogRoute<String>(
       context: context,
       builder: (context) => StatefulBuilder(
         builder: (context, setLocal) {
-          final currentGroups = _splitTags(controllers['tags']!.text);
-          final currentGroupKeys = currentGroups
-              .map((group) => group.toLowerCase())
-              .toSet();
           return AlertDialog(
             title: Row(
               children: [
@@ -943,9 +996,6 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                           autocorrect: false,
                           enableSuggestions: false,
                           maxLines: key == 'notes' ? 3 : 1,
-                          onChanged: key == 'tags'
-                              ? (_) => setLocal(() {})
-                              : null,
                           decoration: InputDecoration(
                             labelText: const {
                               'title': '名称',
@@ -1007,37 +1057,40 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                       if (key == 'tags') ...[
                         Padding(
                           padding: const EdgeInsets.only(bottom: 12),
-                          child: Wrap(
-                            spacing: 6,
-                            runSpacing: 6,
-                            children: [
-                              for (final preset in groupOptions)
-                                FilterChip(
-                                  label: Text(preset),
-                                  selected: currentGroupKeys.contains(
-                                    preset.toLowerCase(),
-                                  ),
-                                  visualDensity: VisualDensity.compact,
-                                  onSelected: (selected) {
-                                    final next = List<String>.from(
-                                      currentGroups,
-                                    );
-                                    if (selected) {
-                                      if (!next.contains(preset)) {
-                                        next.add(preset);
-                                      }
-                                    } else {
-                                      next.removeWhere(
-                                        (name) =>
-                                            name.toLowerCase() ==
-                                            preset.toLowerCase(),
-                                      );
-                                    }
-                                    controllers['tags']!.text = next.join(', ');
-                                    setLocal(() {});
-                                  },
-                                ),
-                            ],
+                          child: ValueListenableBuilder<String>(
+                            valueListenable: committedTags,
+                            builder: (_, tags, _) {
+                              final groups = _splitTags(tags);
+                              final keys = groups
+                                  .map((name) => name.toLowerCase())
+                                  .toSet();
+                              return Wrap(
+                                spacing: 6,
+                                runSpacing: 6,
+                                children: [
+                                  for (final preset in groupOptions)
+                                    FilterChip(
+                                      label: Text(preset),
+                                      selected: keys.contains(
+                                        preset.toLowerCase(),
+                                      ),
+                                      visualDensity: VisualDensity.compact,
+                                      onSelected: (selected) {
+                                        if (selected) {
+                                          groups.add(preset);
+                                        } else {
+                                          groups.removeWhere(
+                                            (name) =>
+                                                name.toLowerCase() ==
+                                                preset.toLowerCase(),
+                                          );
+                                        }
+                                        tagController.text = groups.join(', ');
+                                      },
+                                    ),
+                                ],
+                              );
+                            },
                           ),
                         ),
                       ],
@@ -1085,6 +1138,8 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
         },
       ),
     );
+    final result = await Navigator.of(context).push(route);
+    await route.completed;
     if (result != null && epoch == generation) {
       final cleanedGroups = _splitTags(controllers['tags']!.text)
           .where((t) => !_isPinTag(t))
@@ -1105,64 +1160,139 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       });
     }
     for (final c in controllers.values) {
-      c.clear();
       c.dispose();
     }
+    committedTags.dispose();
   }
 
-  Future<String?> passwordPrompt() async {
+  Future<({String? password, bool fingerprint})?> _reauthenticate({
+    bool allowFingerprint = false,
+  }) async {
     final controller = TextEditingController();
-    final result = await showDialog<String>(
+    final route = DialogRoute<({String? password, bool fingerprint})>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('确认主密码'),
-        content: TextField(
-          controller: controller,
-          obscureText: true,
-          autocorrect: false,
-          enableSuggestions: false,
-          decoration: const InputDecoration(labelText: '主密码'),
-          onSubmitted: (_) => Navigator.pop(context, controller.text),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('取消'),
+      builder: (context) {
+        void confirm() => Navigator.pop(context, (
+          password: controller.text,
+          fingerprint: false,
+        ));
+        return AlertDialog(
+          title: Text(allowFingerprint ? '授权导出加密备份' : '确认主密码'),
+          content: TextField(
+            controller: controller,
+            obscureText: true,
+            autocorrect: false,
+            enableSuggestions: false,
+            decoration: const InputDecoration(labelText: '主密码'),
+            onSubmitted: (_) => confirm(),
           ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, controller.text),
-            child: const Text('确认'),
-          ),
-        ],
-      ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('取消'),
+            ),
+            if (allowFingerprint)
+              OutlinedButton.icon(
+                onPressed: () =>
+                    Navigator.pop(context, (password: null, fingerprint: true)),
+                icon: const Icon(Icons.fingerprint),
+                label: const Text('使用指纹'),
+              ),
+            FilledButton(onPressed: confirm, child: const Text('确认主密码')),
+          ],
+        );
+      },
     );
-    controller.clear();
+    final result = await Navigator.of(context).push(route);
+    await route.completed;
     controller.dispose();
     return result;
   }
 
+  Future<String?> passwordPrompt() async => (await _reauthenticate())?.password;
+
   Future<void> backup() async {
-    final password = await passwordPrompt();
-    if (password == null) return;
+    final snapshot = generation;
+    final authorization = await _reauthenticate(
+      allowFingerprint:
+          biometricEnabled && (Platform.isMacOS || Platform.isAndroid),
+    );
+    if (authorization == null || !mounted || snapshot != generation) return;
     await action(() async {
-      final data = await request('export', {'password': password});
+      final args = <String, dynamic>{};
+      if (authorization.fingerprint) {
+        authenticating = true;
+        try {
+          final result = await device.invokeMapMethod<String, dynamic>(
+            'authorizeBackup',
+            {'binding': binding, 'epoch': nativeEpoch},
+          );
+          if (!mounted || snapshot != generation) return;
+          if (result?['ticket'] is! String) {
+            throw StateError('biometric_failed');
+          }
+          args['biometric_ticket'] = result!['ticket'];
+        } finally {
+          authenticating = false;
+        }
+      } else {
+        args['password'] = authorization.password;
+      }
+      final data = await request('export', args);
       final bytes = utf8.encode(jsonEncode(data));
       if (bytes.length > 2 * 1024 * 1024) {
         throw StateError('backup_limit');
       }
+      bool saved;
       if (Platform.isAndroid) {
-        await const MethodChannel('org.wencrypt.files')
-            .invokeMethod('saveBackup', {'bytes': Uint8List.fromList(bytes)});
+        saved =
+            await const MethodChannel('org.wencrypt.files').invokeMethod<bool>(
+              'saveBackup',
+              {'bytes': Uint8List.fromList(bytes)},
+            ) ==
+            true;
       } else {
         final location = await getSaveLocation(
           suggestedName: 'wencrypt-backup.wenback',
         );
+        saved = location != null;
         if (location != null) {
           await XFile.fromData(Uint8List.fromList(bytes)).saveTo(location.path);
         }
       }
-      if (mounted) setState(() => message = '备份导出操作已结束');
+      if (mounted && snapshot == generation) {
+        setState(() => message = saved ? '已保存加密备份' : '已取消保存备份');
+      }
     });
+  }
+
+  Future<void> _exportEntryImage(Map<String, dynamic> data) async {
+    final epoch = generation;
+    final toAlbum = Platform.isAndroid;
+    touch();
+    final png = await showDialog<Uint8List>(
+      context: context,
+      builder: (_) => EntryImageDialog(entry: data, toAlbum: toAlbum),
+    );
+    if (png == null) return;
+    try {
+      if (!mounted || epoch != generation || busy) return;
+      await action(() async {
+        final saved = await entryImage.invokeMethod<bool>(
+          toAlbum ? 'savePng' : 'copyPng',
+          png,
+        );
+        if (saved != true) throw StateError('image_export_failed');
+        if (mounted && epoch == generation) {
+          final result = toAlbum ? '图片已保存到 Wencrypt 相册' : '图片已复制到剪贴板';
+          setState(() => message = result);
+          ScaffoldMessenger.of(context)
+              .showSnackBar(SnackBar(content: Text(result)));
+        }
+      });
+    } finally {
+      png.fillRange(0, png.length, 0);
+    }
   }
 
   Future<void> restore() async {
@@ -1642,10 +1772,11 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
         (await request('sync_settings_get'))['settings']
             as Map<String, dynamic>?;
     if (!mounted || epoch != generation) return;
-    if (!configure && existing != null) {
+    final savedCredentials = _hasSyncCredentials(existing);
+    if (!configure && savedCredentials) {
       await runSync(
         automatic: false,
-        username: existing['username'] as String,
+        username: existing!['username'] as String,
         password: existing['password'] as String,
         targetsOverride: _normalizeTargets(existing['targets']),
       );
@@ -1655,7 +1786,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     final password = TextEditingController(
       text: existing?['password'] as String?,
     );
-    var remember = true;
+    var editCredentials = !savedCredentials;
     var automatic = existing?['auto'] == true;
     final targets = _normalizeTargets(existing?['targets'])
         .map((t) => Map<String, dynamic>.from(t))
@@ -1675,24 +1806,38 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                 children: [
                   const Text('使用坚果云生成的 WebDAV 应用密码。支持配置多个同步备份目录，自由勾选是否同步。'),
                   const SizedBox(height: 14),
-                  TextField(
-                    controller: user,
-                    decoration: const InputDecoration(
-                      labelText: '坚果云账号',
-                      prefixIcon: Icon(Icons.cloud_outlined),
+                  if (editCredentials) ...[
+                    TextField(
+                      controller: user,
+                      decoration: const InputDecoration(
+                        labelText: '坚果云账号',
+                        prefixIcon: Icon(Icons.cloud_outlined),
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: password,
-                    obscureText: true,
-                    autocorrect: false,
-                    enableSuggestions: false,
-                    decoration: const InputDecoration(
-                      labelText: 'WebDAV 应用密码',
-                      prefixIcon: Icon(Icons.key_outlined),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: password,
+                      obscureText: true,
+                      autocorrect: false,
+                      enableSuggestions: false,
+                      decoration: const InputDecoration(
+                        labelText: 'WebDAV 应用密码',
+                        prefixIcon: Icon(Icons.key_outlined),
+                      ),
                     ),
-                  ),
+                    const SizedBox(height: 8),
+                    const Text('凭据会加密保存在本机，下次同步自动使用。'),
+                  ] else
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.lock_outline),
+                      title: Text(user.text),
+                      subtitle: const Text('凭据已加密保存在本机'),
+                      trailing: TextButton(
+                        onPressed: () => setLocal(() => editCredentials = true),
+                        child: const Text('更换'),
+                      ),
+                    ),
                   const SizedBox(height: 16),
                   Row(
                     children: [
@@ -1809,21 +1954,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                     ),
                   const SizedBox(height: 4),
                   CheckboxListTile(
-                    value: remember,
-                    contentPadding: EdgeInsets.zero,
-                    onChanged: (v) => setLocal(() {
-                      remember = v == true;
-                      if (!remember) automatic = false;
-                    }),
-                    title: const Text('在本机加密保存凭据与备份目标'),
-                    subtitle: const Text('之后可直接一键同步已勾选的备份目录'),
-                  ),
-                  CheckboxListTile(
                     value: automatic,
                     contentPadding: EdgeInsets.zero,
-                    onChanged: remember
-                        ? (v) => setLocal(() => automatic = v == true)
-                        : null,
+                    onChanged: (v) => setLocal(() => automatic = v == true),
                     title: const Text('自动同步'),
                     subtitle: const Text('仅在前台解锁时运行'),
                   ),
@@ -1838,7 +1971,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
             ),
             FilledButton(
               onPressed: () => Navigator.pop(context, true),
-              child: Text(remember ? '保存并同步' : '仅同步本次'),
+              child: const Text('保存并同步'),
             ),
           ],
         ),
@@ -1856,25 +1989,23 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       return;
     }
 
-    if (remember) {
-      await request('sync_settings_set', {
-        'settings': {
-          'username': username,
-          'password': appPassword,
-          'auto': automatic,
-          'targets': targets,
-          if (initialSyncPending) 'joinPending': true,
-        },
-      });
-      if (!mounted || epoch != generation) return;
-      setState(() {
-        syncConfigured = true;
-        syncUsername = username;
-        autoEnabled = automatic;
-        syncTargets = targets;
-      });
-      autoTimer?.cancel();
-    }
+    await request('sync_settings_set', {
+      'settings': {
+        'username': username,
+        'password': appPassword,
+        'auto': automatic,
+        'targets': targets,
+        if (initialSyncPending) 'joinPending': true,
+      },
+    });
+    if (!mounted || epoch != generation) return;
+    setState(() {
+      syncConfigured = true;
+      syncUsername = username;
+      autoEnabled = automatic;
+      syncTargets = targets;
+    });
+    autoTimer?.cancel();
     await runSync(
       automatic: false,
       username: username,
@@ -2317,13 +2448,6 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                   Expanded(
                     child: TextField(
                       controller: searchController,
-                      onChanged: (v) {
-                        touch();
-                        setState(() {
-                          query = v;
-                          deleteSelection?.clear();
-                        });
-                      },
                       decoration: InputDecoration(
                         prefixIcon: const Icon(Icons.search),
                         hintText: '搜索名称、用户名、网址、分组或备注',
@@ -2424,9 +2548,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                 children: [
                   Expanded(child: _buildStatusPill(context)),
                   const SizedBox(width: 12),
-                  if (!trash &&
-                      deleteSelection == null &&
-                      visibleHeads.isNotEmpty)
+                  if (deleteSelection == null && visibleHeads.isNotEmpty)
                     TextButton.icon(
                       onPressed: busy
                           ? null
@@ -2459,10 +2581,15 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                     FilledButton.tonalIcon(
                       onPressed: busy || selection.isEmpty
                           ? null
-                          : () =>
-                                _setDeleted(selection.toList(), deleted: true),
+                          : () => _setDeleted(
+                              selection.toList(),
+                              deleted: true,
+                              discard: trash,
+                            ),
                       icon: const Icon(Icons.delete_outline),
-                      label: Text('移入回收站 (${selection.length})'),
+                      label: Text(
+                        '${trash ? '从回收站清除' : '移入回收站'} (${selection.length})',
+                      ),
                     ),
                   ],
                 ),
@@ -2693,19 +2820,35 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                                     ),
                                   ),
                                   if (selection == null) ...[
-                                    IconButton(
-                                      tooltip: pinned ? '取消置顶' : '置顶',
-                                      icon: Icon(
-                                        pinned
-                                            ? Icons.push_pin
-                                            : Icons.push_pin_outlined,
-                                        size: 20,
-                                        color: pinned ? scheme.primary : null,
+                                    if (trash)
+                                      IconButton(
+                                        tooltip: '从回收站清除',
+                                        icon: const Icon(
+                                          Icons.delete_forever_outlined,
+                                          size: 20,
+                                        ),
+                                        onPressed: busy || hasConflict
+                                            ? null
+                                            : () => _setDeleted(
+                                                [revisionId],
+                                                deleted: true,
+                                                discard: true,
+                                              ),
+                                      )
+                                    else
+                                      IconButton(
+                                        tooltip: pinned ? '取消置顶' : '置顶',
+                                        icon: Icon(
+                                          pinned
+                                              ? Icons.push_pin
+                                              : Icons.push_pin_outlined,
+                                          size: 20,
+                                          color: pinned ? scheme.primary : null,
+                                        ),
+                                        onPressed: busy
+                                            ? null
+                                            : () => _togglePin(r),
                                       ),
-                                      onPressed: busy
-                                          ? null
-                                          : () => _togglePin(r),
-                                    ),
                                     IconButton(
                                       tooltip: '复制用户名',
                                       icon: const Icon(
@@ -2736,6 +2879,8 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                                           edit(r);
                                         } else if (v == 'history') {
                                           history(r);
+                                        } else if (v == 'exportImage') {
+                                          _exportEntryImage(data);
                                         } else if (v == 'trash') {
                                           _setDeleted([
                                             revisionId,
@@ -2766,6 +2911,15 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                                           value: 'history',
                                           child: Text('历史版本'),
                                         ),
+                                        if (!trash &&
+                                            !hasConflict &&
+                                            (Platform.isAndroid ||
+                                                Platform.isMacOS ||
+                                                Platform.isWindows))
+                                          const PopupMenuItem(
+                                            value: 'exportImage',
+                                            child: Text('导出账号图片'),
+                                          ),
                                         if (!hasConflict)
                                           PopupMenuItem(
                                             value: 'trash',

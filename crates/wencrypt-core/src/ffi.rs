@@ -134,3 +134,32 @@ pub unsafe extern "C" fn wencrypt_device_open(
         -1
     }
 }
+
+/// # Safety
+/// Payload must point to 80 readable bytes and ticket_out to 32 writable bytes.
+/// Only the native hardware-backed authentication bridge calls this function.
+#[no_mangle]
+pub unsafe extern "C" fn wencrypt_device_backup_grant(
+    payload: *const u8,
+    epoch: u64,
+    ticket_out: *mut u8,
+) -> i32 {
+    if payload.is_null() || ticket_out.is_null() {
+        return -1;
+    }
+    let result = std::panic::catch_unwind(|| {
+        let payload = std::slice::from_raw_parts(payload, 80);
+        let ticket = VAULT
+            .lock()
+            .map_err(|_| ())?
+            .authorize_device_backup(payload, epoch)
+            .map_err(|_| ())?;
+        std::ptr::copy_nonoverlapping(ticket.as_ptr(), ticket_out, 32);
+        Ok::<_, ()>(())
+    });
+    if matches!(result, Ok(Ok(()))) {
+        0
+    } else {
+        -1
+    }
+}

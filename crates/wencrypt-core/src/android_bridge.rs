@@ -59,3 +59,35 @@ pub extern "system" fn Java_org_wencrypt_wencrypt_NativeVaultBridge_open(
     }));
     result.ok().flatten().unwrap_or(std::ptr::null_mut())
 }
+
+#[no_mangle]
+pub extern "system" fn Java_org_wencrypt_wencrypt_NativeVaultBridge_backupGrant(
+    env: JNIEnv,
+    _this: JObject,
+    body: JByteArray,
+    epoch: jlong,
+) -> jstring {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let body = Zeroizing::new(env.convert_byte_array(&body).ok()?);
+        if body.len() != 80 || epoch < 0 {
+            return None;
+        }
+        let mut ticket = Zeroizing::new([0u8; 32]);
+        if unsafe {
+            crate::ffi::wencrypt_device_backup_grant(
+                body.as_ptr(),
+                epoch as u64,
+                ticket.as_mut_ptr(),
+            )
+        } != 0
+        {
+            return None;
+        }
+        Some(
+            env.new_string(std::str::from_utf8(&*ticket).ok()?)
+                .ok()?
+                .into_raw(),
+        )
+    }));
+    result.ok().flatten().unwrap_or(std::ptr::null_mut())
+}

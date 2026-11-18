@@ -1,5 +1,8 @@
 package org.wencrypt.wencrypt
 
+import android.content.ContentValues
+import android.os.Environment
+import android.provider.MediaStore
 import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -29,6 +32,28 @@ class MainActivity : FlutterFragmentActivity() {
     private val probe by lazy { DeviceProbe(this) }
     private val vaultDevice by lazy { DeviceVault(this) }
     override fun onStop() { vaultDevice.cancel(); probe.cancel(); super.onStop() }
+
+    private fun saveEntryImage(bytes: ByteArray) {
+        val images = MediaStore.Images.Media
+            .getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, "Wencrypt-${java.util.UUID.randomUUID()}.png")
+            put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+            put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/Wencrypt")
+            put(MediaStore.Images.Media.IS_PENDING, 1)
+        }
+        val uri = checkNotNull(contentResolver.insert(images, values))
+        try {
+            checkNotNull(contentResolver.openOutputStream(uri)).use { it.write(bytes) }
+            val published = ContentValues().apply {
+                put(MediaStore.Images.Media.IS_PENDING, 0)
+            }
+            check(contentResolver.update(uri, published, null, null) == 1)
+        } catch (error: Exception) {
+            runCatching { contentResolver.delete(uri, null, null) }
+            throw error
+        }
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -60,6 +85,24 @@ class MainActivity : FlutterFragmentActivity() {
                     manager.setPrimaryClip(clip)
                     result.success(null)
                 } else result.notImplemented()
+            }
+
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "org.wencrypt.entry-image")
+            .setMethodCallHandler { call, result ->
+                if (call.method != "savePng") {
+                    result.notImplemented()
+                    return@setMethodCallHandler
+                }
+                val bytes = call.arguments as? ByteArray
+                if (bytes == null || bytes.isEmpty()) {
+                    result.error("invalid_image", null, null)
+                    return@setMethodCallHandler
+                }
+                Thread {
+                    val saved = runCatching { saveEntryImage(bytes) }.isSuccess
+                    bytes.fill(0)
+                    runOnUiThread { result.success(saved) }
+                }.start()
             }
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "org.wencrypt.p0/device")

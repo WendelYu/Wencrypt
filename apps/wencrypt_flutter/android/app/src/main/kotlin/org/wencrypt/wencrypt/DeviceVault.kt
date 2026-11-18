@@ -23,6 +23,7 @@ object NativeVaultBridge {
     init { System.loadLibrary("wencrypt_core") }
     external fun take(ticket: String): ByteArray?
     external fun open(path: String, payload: ByteArray, epoch: Long): String?
+    external fun backupGrant(payload: ByteArray, epoch: Long): String?
 }
 
 // Only ciphertext, opaque tickets and session identifiers cross the Flutter channel.
@@ -56,8 +57,9 @@ class DeviceVault(private val activity: FragmentActivity) {
                 if (target.exists()) { val alias=read(target).getString("alias"); store.deleteEntry(alias); check(target.delete()) }
                 done(mapOf("enabled" to false)); return
             }
-            require(method == "enable" || method == "unlock")
+            require(method == "enable" || method == "unlock" || method == "authorizeBackup")
             val create = method == "enable"
+            val backup = method == "authorizeBackup"
             val previous = if (target.exists()) read(target) else null
             val alias = if (create) "org.wencrypt.device.${UUID.randomUUID()}" else previous!!.getString("alias")
             if (create) {
@@ -111,15 +113,26 @@ class DeviceVault(private val activity: FragmentActivity) {
                             val sealed=Base64.decode(previous!!.getString("body"), Base64.NO_WRAP)
                             require(sealed.size == 96)
                             plain = authorized.doFinal(sealed)
-                            val token = NativeVaultBridge.open(args["path"] as String, plain!!, (args["epoch"] as Number).toLong()) ?: error("session_expired")
-                            finish(mapOf("session" to token))
+                            val epoch = (args["epoch"] as Number).toLong()
+                            if (backup) {
+                                val ticket = NativeVaultBridge.backupGrant(plain!!, epoch) ?: error("session_expired")
+                                finish(mapOf("ticket" to ticket))
+                            } else {
+                                val token = NativeVaultBridge.open(args["path"] as String, plain!!, epoch) ?: error("session_expired")
+                                finish(mapOf("session" to token))
+                            }
                         }
                     } catch (_: Exception) { finish(mapOf("error" to "biometric_cancelled_invalidated_or_failed")) }
                     finally { plain?.fill(0) }
                 }
             })
             prompt = biometric
-            biometric.authenticate(BiometricPrompt.PromptInfo.Builder().setTitle(if (create) "为 Wencrypt 启用指纹解锁" else "解锁 Wencrypt 密码库")
+            val title = when {
+                create -> "为 Wencrypt 启用指纹解锁"
+                backup -> "授权导出 Wencrypt 加密备份"
+                else -> "解锁 Wencrypt 密码库"
+            }
+            biometric.authenticate(BiometricPrompt.PromptInfo.Builder().setTitle(title)
                 .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG).setNegativeButtonText("取消").build(), BiometricPrompt.CryptoObject(cipher))
         } catch (_: Exception) {
             newAlias?.let { try { store.deleteEntry(it) } catch (_: Exception) {} }

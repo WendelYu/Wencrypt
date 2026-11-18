@@ -1,5 +1,6 @@
 #include "flutter_window.h"
 
+#include <cstring>
 #include <optional>
 #include <flutter/method_channel.h>
 #include <flutter/standard_method_codec.h>
@@ -7,6 +8,39 @@
 #include "../../../../platform_probes/windows/device_probe.h"
 
 #include "flutter/generated_plugin_registrant.h"
+
+namespace {
+bool CopyPng(HWND owner, const std::vector<uint8_t>& png) {
+  if (png.empty()) {
+    return false;
+  }
+  const UINT format = RegisterClipboardFormatW(L"PNG");
+  if (format == 0) {
+    return false;
+  }
+  HGLOBAL buffer = GlobalAlloc(GMEM_MOVEABLE, png.size());
+  if (!buffer) {
+    return false;
+  }
+  void* destination = GlobalLock(buffer);
+  if (!destination) {
+    GlobalFree(buffer);
+    return false;
+  }
+  std::memcpy(destination, png.data(), png.size());
+  GlobalUnlock(buffer);
+  if (!OpenClipboard(owner)) {
+    GlobalFree(buffer);
+    return false;
+  }
+  const bool copied = EmptyClipboard() && SetClipboardData(format, buffer);
+  CloseClipboard();
+  if (!copied) {
+    GlobalFree(buffer);
+  }
+  return copied;
+}
+}  // namespace
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
@@ -34,6 +68,19 @@ bool FlutterWindow::OnCreate() {
       &flutter::StandardMethodCodec::GetInstance());
   device_channel.SetMethodCallHandler([](const auto& call, auto result) {
     result->Success(WindowsDeviceProbe(call.method_name()));
+  });
+  flutter::MethodChannel<flutter::EncodableValue> image_channel(
+      flutter_controller_->engine()->messenger(), "org.wencrypt.entry-image",
+      &flutter::StandardMethodCodec::GetInstance());
+  image_channel.SetMethodCallHandler([this](const auto& call, auto result) {
+    if (call.method_name() != "copyPng") {
+      result->NotImplemented();
+      return;
+    }
+    const auto* bytes = call.arguments()
+        ? std::get_if<std::vector<uint8_t>>(call.arguments())
+        : nullptr;
+    result->Success(flutter::EncodableValue(bytes && CopyPng(GetHandle(), *bytes)));
   });
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
