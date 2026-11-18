@@ -89,8 +89,35 @@ Future<Map<String, String>> installedBrowsers() async {
   return found;
 }
 
-Future<void> openExportSettings(String browser, String app) async {
+Future<bool> openExportSettings(
+  BuildContext context,
+  String browser,
+  String app,
+) async {
   if (Platform.isMacOS) {
+    final address = _settings[browser]!;
+    final proceed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('从 $browser 导出密码'),
+        content: Text(
+          '打开浏览器后，将复制的地址粘贴到地址栏。'
+          '在密码管理页面导出 CSV，再回到 Wencrypt 选择文件。\n\n$address',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text('复制地址并打开 $browser'),
+          ),
+        ],
+      ),
+    );
+    if (proceed != true) return false;
+    await Clipboard.setData(ClipboardData(text: address));
     await _browserChannel.invokeMethod<void>('open', browser);
   }
   if (Platform.isWindows) {
@@ -98,6 +125,7 @@ Future<void> openExportSettings(String browser, String app) async {
       _settings[browser]!,
     ], mode: ProcessStartMode.detached);
   }
+  return true;
 }
 
 Future<List<Map<String, String>>?> selectPasswords(

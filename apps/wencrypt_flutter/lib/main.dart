@@ -709,10 +709,16 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
             ],
           ),
         );
-        if (choice == null) return;
+        if (!mounted || choice == null) return;
         if (choice != 'file') {
-          await openExportSettings(choice, installed[choice]!);
-          if (mounted) setState(() => message = '导出 CSV 后，返回此处选择文件');
+          final opened = await openExportSettings(
+            context,
+            choice,
+            installed[choice]!,
+          );
+          if (mounted && opened) {
+            setState(() => message = '导出 CSV 后，返回此处选择文件');
+          }
           return;
         }
       }

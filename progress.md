@@ -37,3 +37,5 @@ Mac v2 实现已编译。沙箱内 SecureEnclave.isAvailable=false，需授权�
 最终dbb9942的Actions 44093230639四个job全部success。Mac首轮62cfd30产物摘要与GitHub一致、codesign严格验证通过；CUA实测创建公开测试库、保存编辑账号、退出重开后主密码解锁且账号保留。测试主密码为公开fixture `Wencrypt Alpha public test 2026!`，仅本机测试数据。中文粘贴存在自动化AX文本与Flutter提交时机不一致，未计为通过，保留真实输入法验收。
 
 2026-11-18：交付 0.2 Alpha d3ac1a5。Rust 绑定与还原真实库、独立进程 Touch ID 三轮及双库 WebDAV 模拟收发已验证。自动同步限定前台解锁，保留月度与滚动请求预算。浏览器来源识别、记录勾选及重复排除已加入。三端 CI 通过，实机范围见 reports/p0-status.md。
+
+2026-11-18：增加 Mac 浏览器导出引导和 409 兼容初始化。旧绑定出现 409 时停止同步并保留 HTTP 状态。首次写入要求条件创建，创建后重读核对。增加 409 初始化和旧绑定保护的回归测试。Flutter 本机分析首次因沙箱无法写用户级遥测目录退出，经授权运行后发现异步 mounted 检查遗漏，已补上。

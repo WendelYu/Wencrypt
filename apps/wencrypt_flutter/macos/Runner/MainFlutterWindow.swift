@@ -47,17 +47,28 @@ class MainFlutterWindow: NSWindow {
       self?.vaultDevice.cancel()
       deviceChannel.invokeMethod("systemLocked",arguments:nil)
     }
-    let browsers = ["Chrome": ("com.google.Chrome", "chrome://password-manager/settings"),
-                    "Edge": ("com.microsoft.edgemac", "edge://wallet/passwords"),
-                    "Firefox": ("org.mozilla.firefox", "about:logins")]
+    let browsers = [
+      "Chrome": "com.google.Chrome",
+      "Edge": "com.microsoft.edgemac",
+      "Firefox": "org.mozilla.firefox"
+    ]
     let browserChannel = FlutterMethodChannel(name:"org.wencrypt.browser-import", binaryMessenger:flutterViewController.engine.binaryMessenger)
     browserChannel.setMethodCallHandler { call, result in
       if call.method == "installed" {
-        result(browsers.keys.sorted().filter { NSWorkspace.shared.urlForApplication(withBundleIdentifier:browsers[$0]!.0) != nil })
-      } else if call.method == "open", let name = call.arguments as? String, let (id, page) = browsers[name],
-                let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier:id), let url = URL(string:page) {
-        NSWorkspace.shared.open([url],withApplicationAt:app,configuration:NSWorkspace.OpenConfiguration()) { _, error in
-          DispatchQueue.main.async { result(error == nil ? nil : FlutterError(code:"browser_open_failed",message:nil,details:nil)) }
+        result(browsers.keys.sorted().filter {
+          guard let id = browsers[$0] else { return false }
+          return NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) != nil
+        })
+      } else if call.method == "open", let name = call.arguments as? String, let id = browsers[name] {
+        guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) else {
+          result(FlutterError(code: "browser_open_failed", message: nil, details: nil))
+          return
+        }
+        // Internal browser URLs are only handled inside the browser, not by Launch Services.
+        NSWorkspace.shared.openApplication(at: app, configuration: NSWorkspace.OpenConfiguration()) { _, error in
+          DispatchQueue.main.async {
+            result(error == nil ? nil : FlutterError(code: "browser_open_failed", message: nil, details: nil))
+          }
         }
       } else { result(FlutterMethodNotImplemented) }
     }

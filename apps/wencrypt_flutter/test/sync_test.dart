@@ -128,4 +128,81 @@ void main() {
       }
     },
   );
+
+  group('Nutstore bootstrap GET returns 409', () {
+    const vault = '0123456789abcdef0123456789abcdef';
+    Future<Map<String, dynamic>> snapshot(
+      String op, [
+      Map<String, dynamic> args = const {},
+    ]) async => {'vault': vault, 'bootstrap': '010203', 'objects': []};
+
+    test('creates the missing directory and verifies the bootstrap', () async {
+      final dir = await Directory.systemTemp.createTemp('wencrypt-sync-test');
+      addTearDown(() => dir.delete(recursive: true));
+      final calls = <String>[];
+      var created = false;
+      var written = false;
+      final sync = NutstoreSync(
+        dir,
+        snapshot,
+        pace: Duration.zero,
+        wire: (method, uri, body, depth, limit) async {
+          calls.add(method);
+          switch (method) {
+            case 'PROPFIND':
+              return DavReply(
+                207,
+                depth == '0'
+                    ? []
+                    : utf8.encode(listing(uri.path, ['bootstrap.wenc'])),
+              );
+            case 'GET':
+              return written ? DavReply(200, [1, 2, 3]) : DavReply(409, []);
+            case 'MKCOL':
+              created = true;
+              return DavReply(201, []);
+            case 'PUT':
+              expect(created, isTrue);
+              expect(body, [1, 2, 3]);
+              written = true;
+              return DavReply(201, []);
+            default:
+              throw StateError('Unexpected $method');
+          }
+        },
+      );
+      expect(
+        await sync.sync('test@example.com', 'test-only'),
+        contains('上传 0'),
+      );
+      expect(calls, ['PROPFIND', 'GET', 'MKCOL', 'PUT', 'GET', 'PROPFIND']);
+      expect(await File('${dir.path}/sync-$vault.bound').exists(), isTrue);
+    });
+
+    test('leaves an already-bound directory untouched', () async {
+      final dir = await Directory.systemTemp.createTemp('wencrypt-sync-test');
+      addTearDown(() => dir.delete(recursive: true));
+      await File('${dir.path}/sync-$vault.bound').writeAsString('bound');
+      final calls = <String>[];
+      final sync = NutstoreSync(
+        dir,
+        snapshot,
+        pace: Duration.zero,
+        wire: (method, uri, body, depth, limit) async {
+          calls.add(method);
+          return DavReply(method == 'GET' ? 409 : 207, []);
+        },
+      );
+      await expectLater(
+        sync.sync('test@example.com', 'test-only'),
+        throwsA(
+          isA<DavFailure>()
+              .having((e) => e.stage, 'stage', 'read_bootstrap')
+              .having((e) => e.reason, 'reason', 'remote_missing')
+              .having((e) => e.status, 'status', 409),
+        ),
+      );
+      expect(calls, ['PROPFIND', 'GET']);
+    });
+  });
 }

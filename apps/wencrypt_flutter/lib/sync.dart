@@ -199,14 +199,16 @@ class NutstoreSync {
     Uri uri,
     List<int> body,
     String depth,
-    int limit,
-  ) async {
+    int limit, {
+    required bool createOnly,
+  }) async {
     final req = await client
         .openUrl(method, uri)
         .timeout(const Duration(seconds: 20));
     req.followRedirects = false;
     req.headers.set(HttpHeaders.authorizationHeader, auth);
     req.headers.set(HttpHeaders.userAgentHeader, 'Wencrypt/0.2');
+    if (createOnly) req.headers.set(HttpHeaders.ifNoneMatchHeader, '*');
     if (method != 'GET' && method != 'HEAD') req.contentLength = body.length;
     if (method == 'PUT') req.headers.contentType = ContentType.binary;
     if (method == 'PROPFIND') {
@@ -240,6 +242,7 @@ class NutstoreSync {
     String depth = '1',
     int limit = 1024 * 1024,
     Set<int> accepted = const {200},
+    bool createOnly = false,
   }) async {
     try {
       if (uri.scheme != 'https' ||
@@ -256,7 +259,9 @@ class NutstoreSync {
       final month = '${now.year}-${now.month.toString().padLeft(2, '0')}';
       await budget.reserve(body.length + 2048, limit + 8192);
       last = DateTime.now();
-      final response = await (wire ?? _http)(method, uri, body, depth, limit);
+      final response =
+          await (wire?.call(method, uri, body, depth, limit) ??
+              _http(method, uri, body, depth, limit, createOnly: createOnly));
       if (response.body.length > limit) {
         throw DavFailure(stage, 'response_limit', response.status);
       }
@@ -328,12 +333,14 @@ class NutstoreSync {
         'GET',
         folder.resolve('bootstrap.wenc'),
         limit: 8192,
-        accepted: {200, 404},
+        accepted: {200, 404, 409},
       );
-      if (remote.status == 404) {
+      if (remote.status != 200) {
         if (await remembered.exists()) {
-          throw const DavFailure('read_bootstrap', 'remote_missing');
+          throw DavFailure('read_bootstrap', 'remote_missing', remote.status);
         }
+        // Nutstore can return 409 for a file inside a missing collection.
+        // Confirm the directory is new or empty before writing the bootstrap.
         final made = await send(
           'create_directory',
           'MKCOL',
@@ -361,14 +368,15 @@ class NutstoreSync {
             throw const DavFailure('initialize', 'nonempty_unbound_directory');
           }
         }
-        if (remote.status == 404) {
+        if (remote.status != 200) {
           await send(
             'write_bootstrap',
             'PUT',
             folder.resolve('bootstrap.wenc'),
             body: bootstrap,
             limit: 8192,
-            accepted: {201, 204},
+            createOnly: true,
+            accepted: {201, 204, 412},
           );
           remote = await send(
             'verify_bootstrap',

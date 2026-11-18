@@ -42,3 +42,9 @@
 - [x] Mac Secure Enclave和Android CryptoObject接入真实DEK，DEK不经Dart。
 - [x] 本地加密保存同步设置、前台解锁时自动同步、退避与停止机制。
 - [ ] 三端CI、Mac实测、用户坚果云及Android验收。
+
+## 0.2.1 Alpha 兼容修复
+
+- [x] 修复 macOS 浏览器导出入口。
+- [x] 处理坚果云读取引导文件的 HTTP 409，回归已有绑定保护。
+- [ ] 确认三端构建并交付。用户账号实网复测单独记录。
