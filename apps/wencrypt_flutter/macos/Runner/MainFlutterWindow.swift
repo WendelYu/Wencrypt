@@ -49,7 +49,7 @@ class MainFlutterWindow: NSWindow {
     }
     let browsers = [
       "Chrome": ("com.google.Chrome", "chrome://password-manager/settings"),
-      "Edge": ("com.microsoft.edgemac", "edge://settings/passwords"),
+      "Edge": ("com.microsoft.edgemac", "edge://settings/autofill/passwords"),
       "Firefox": ("org.mozilla.firefox", "about:logins")
     ]
     let browserChannel = FlutterMethodChannel(name:"org.wencrypt.browser-import", binaryMessenger:flutterViewController.engine.binaryMessenger)

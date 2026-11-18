@@ -84,7 +84,7 @@ class BrowserWatchResult {
 const _browserChannel = MethodChannel('org.wencrypt.browser-import');
 const _settings = {
   'Chrome': 'chrome://password-manager/settings',
-  'Edge': 'edge://settings/passwords',
+  'Edge': 'edge://settings/autofill/passwords',
   'Firefox': 'about:logins',
 };
 
