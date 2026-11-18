@@ -306,7 +306,24 @@ class NutstoreSync {
   ];
   String hex(List<int> b) =>
       b.map((v) => v.toRadixString(16).padLeft(2, '0')).join();
-  Future<String> sync(String username, String password) async {
+  String _normalizeFolder(String? remoteFolder, String vault) {
+    final raw = (remoteFolder ?? '').trim();
+    if (raw.isEmpty) return 'wc-${vault.substring(0, 16)}/';
+    final cleaned = raw.replaceAll('\\', '/').replaceAll(RegExp(r'^/+|/+$'), '');
+    if (cleaned.isEmpty ||
+        cleaned.contains('..') ||
+        cleaned.contains('/') ||
+        cleaned.length > 32) {
+      throw const DavFailure('configure', 'invalid_remote_folder');
+    }
+    return '$cleaned/';
+  }
+
+  Future<String> sync(
+    String username,
+    String password, {
+    String? remoteFolder,
+  }) async {
     if (username.trim().isEmpty || username.contains(':') || password.isEmpty) {
       throw const DavFailure('configure', 'missing_credentials');
     }
@@ -315,8 +332,13 @@ class NutstoreSync {
     try {
       final snapshot = await request('sync_objects');
       final vault = snapshot['vault'] as String;
-      final folder = root.resolve('wc-${vault.substring(0, 16)}/');
-      final remembered = File('${directory.path}/sync-$vault.bound');
+      final folderName = _normalizeFolder(remoteFolder, vault);
+      final isDefaultFolder = folderName == 'wc-${vault.substring(0, 16)}/';
+      final folder = root.resolve(folderName);
+      final boundKey = isDefaultFolder
+          ? vault
+          : '$vault-${base64Url.encode(utf8.encode(folderName))}';
+      final remembered = File('${directory.path}/sync-$boundKey.bound');
       final bootstrap = unhex(snapshot['bootstrap'] as String);
       // Authentication is diagnosed separately from missing collections.
       await send(
