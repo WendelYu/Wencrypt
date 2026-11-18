@@ -36,3 +36,11 @@ GitHub Actions 产物文件名为 wencrypt-windows-x64.zip、wencrypt-macos-arm6
 - 交付目录 `build/alpha-dbb9942/`（忽略，不提交二进制），包含三端包、Mac解压应用和SHA256SUMS.txt。
 - 本机实测创建了仅含公开fixture的Alpha库，主密码 `Wencrypt Alpha public test 2026!`。这不是用户真实主密码，也不能用于真实密码库。
 - 当前仍是测试数据Alpha；正式生物识别DEK集成、自动同步、跨设备网盘验收及独立安全评审未完成，详见 docs/08-alpha-guide.md。
+
+## Alpha 0.2 实机和同步验证（2026-11-18）
+
+在本机用新版 DeviceVault.swift 和 Rust release 动态库创建独立 SQLite 密码库，写入公开测试条目。主密码重认证后 Touch ID 成功绑定 DEK，新进程使用 Touch ID 打开同一库并读回条目。第三次在系统提示中取消，新进程保持锁定。该项证据来自原生桥接和 Rust 核心；Android 实际设备及完整应用锁屏矩阵待复测。
+
+两份独立 SQLite 库使用 Flutter 的 NutstoreSync 和模拟 WebDAV 传输，验证双向收发、离线条目合并、重复同步无新增上传。用户之前遇到的“操作未完成”缺少阶段信息，此次账号级失败原因仍待真实服务复测。
+
+d3ac1a5 的 [GitHub Actions](https://github.com/WendelYu/Wencrypt/actions/runs/44210310091) 核心及三个平台构建全部成功，三端 Flutter 检查和测试通过。Android 调试包的签名证书不同于 dbb9942，旧版有数据时先保存可恢复的加密备份，再安排换包。浏览器导入通过勾选回归测试，纯数字密码保留前导零。坚果云账号端的复测需用户在新包内输入应用密码。

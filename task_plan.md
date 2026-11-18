@@ -37,8 +37,8 @@
 - [ ] Windows/Android Alpha安装验收、正式DEK生物识别集成、完整平台保护矩阵。
 
 ## 生物识别与自动同步
-- [ ] 坚果云分阶段诊断、初始化恢复、严格DAV解析与限额结算。
-- [ ] Rust原生设备绑定票据与密钥解包入口、bootstrap绑定及过期回调测试。
-- [ ] Mac Secure Enclave和Android CryptoObject接入真实DEK，DEK不经Dart。
-- [ ] 本地加密保存同步设置、前台解锁时自动同步、退避与停止机制。
+- [x] 坚果云分阶段诊断、初始化恢复、严格DAV解析与限额结算。
+- [x] Rust原生设备绑定票据与密钥解包入口、bootstrap绑定及过期回调测试。
+- [x] Mac Secure Enclave和Android CryptoObject接入真实DEK，DEK不经Dart。
+- [x] 本地加密保存同步设置、前台解锁时自动同步、退避与停止机制。
 - [ ] 三端CI、Mac实测、用户坚果云及Android验收。

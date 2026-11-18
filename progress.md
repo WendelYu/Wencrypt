@@ -35,3 +35,5 @@ Mac v2 实现已编译。沙箱内 SecureEnclave.isAvailable=false，需授权�
 62cfd30已推送，Actions 44040800579产出Windows/macOS/Android三端Alpha。新增会话epoch拒绝过期解锁，Rust4项vault测试通过，Flutter分析无问题。正在下载Mac首轮包实测，再推送epoch补丁生成最终包。
 
 最终dbb9942的Actions 44093230639四个job全部success。Mac首轮62cfd30产物摘要与GitHub一致、codesign严格验证通过；CUA实测创建公开测试库、保存编辑账号、退出重开后主密码解锁且账号保留。测试主密码为公开fixture `Wencrypt Alpha public test 2026!`，仅本机测试数据。中文粘贴存在自动化AX文本与Flutter提交时机不一致，未计为通过，保留真实输入法验收。
+
+2026-11-18：交付 0.2 Alpha d3ac1a5。Rust 绑定与还原真实库、独立进程 Touch ID 三轮及双库 WebDAV 模拟收发已验证。自动同步限定前台解锁，保留月度与滚动请求预算。浏览器来源识别、记录勾选及重复排除已加入。三端 CI 通过，实机范围见 reports/p0-status.md。
