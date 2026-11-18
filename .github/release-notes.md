@@ -15,6 +15,14 @@
 
 1. 打开官方 Release 下载的 DMG，把 Wencrypt 拖到「应用程序」，然后从「应用程序」尝试打开。DMG 里的「首次打开帮助.html」提供直达系统设置的链接。
 2. 如果提示无法验证开发者或无法检查 App，关闭提示后前往「系统设置 → 隐私与安全性」。滚动到「安全性」，点「仍要打开」并按提示确认。
-3. 如果提示「已损坏」或仍然无法打开，重新下载 Apple 芯片版 DMG。可在终端运行 `shasum -a 256 ~/Downloads/wencrypt-macos-arm64.dmg`，并与 `SHA256SUMS.txt` 中该文件的摘要比对。重新安装后仍提示损坏、校验不符，或系统明确警告 App 会损坏电脑时，请停止打开，并在本仓库提交问题，附上 macOS 版本和完整提示。
+3. 如果仍提示「已损坏」或无法打开，请重新下载本仓库的 Apple 芯片版 DMG，并核对 `SHA256SUMS.txt`。可运行 `shasum -a 256 "$HOME/Downloads/wencrypt-macos-arm64.dmg"` 查看摘要。
+
+确认摘要一致、应用已拖入「应用程序」，且系统未提示恶意软件时，可在终端执行下面的命令清除该应用的下载隔离标记，然后重新打开 Wencrypt。
+
+```sh
+xattr -dr com.apple.quarantine "/Applications/wencrypt.app"
+```
+
+校验不符、系统提示 App 会损坏电脑，或执行后仍无法打开时，请停止尝试并提交问题，附上 macOS 版本和完整提示。
 
 [Apple 官方首次打开说明](https://support.apple.com/zh-cn/102445)
