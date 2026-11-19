@@ -1,4 +1,4 @@
-name: P0 checks and development packages
+name: Android join verification package
 on:
   push:
   pull_request:
@@ -9,37 +9,12 @@ concurrency:
   group: p0-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
-  core:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-      - run: cargo fmt --all -- --check
-      - run: cargo test --workspace --locked
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: python -m unittest discover -s tools -p 'test_*.py' -v
   packages:
-    needs: core
     timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
-            target: windows
-            rust-target: x86_64-pc-windows-msvc
-            artifact: build/p0/wencrypt-windows-x64.zip
-          - os: macos-15
-            target: macos
-            rust-target: aarch64-apple-darwin
-            artifact: |
-              build/p0/wencrypt-macos-arm64.zip
-              build/p0/wencrypt-macos-arm64.dmg
           - os: ubuntu-latest
             target: android
             rust-target: aarch64-linux-android
@@ -92,72 +67,3 @@ jobs:
           path: ${{ matrix.artifact }}
           if-no-files-found: error
           retention-days: 14
-  release:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'WendelYu/Wencrypt'
-    needs: packages
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    concurrency:
-      group: wencrypt-release
-    steps:
-      - uses: actions/checkout@v4
-      - name: Check version
-        id: version
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          version=$(sed -nE 's/^version: ([0-9]+\.[0-9]+\.[0-9]+)\+[0-9]+$/\1/p' apps/wencrypt_flutter/pubspec.yaml)
-          test -n "$version"
-          tag="v$version"
-          # If main was bumped again during this build, the newer workflow owns the release.
-          git fetch --no-tags origin main
-          latest=$(git show FETCH_HEAD:apps/wencrypt_flutter/pubspec.yaml |
-            sed -nE 's/^version: ([0-9]+\.[0-9]+\.[0-9]+)\+[0-9]+$/\1/p')
-          test "$latest" = "$version" || exit 0
-          if gh release view "$tag" --json isDraft --jq 'select(.isDraft == false)' | grep -q .; then
-            exit 0
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-      - uses: actions/download-artifact@v4
-        if: steps.version.outputs.tag != ''
-        with:
-          pattern: wencrypt-p0-*-${{ github.sha }}
-          path: release-assets
-          merge-multiple: true
-      - name: Publish release
-        if: steps.version.outputs.tag != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.version.outputs.tag }}
-        working-directory: release-assets
-        run: |
-          assets=()
-          for package in wencrypt-macos-arm64.dmg wencrypt-windows-x64.zip wencrypt-android-arm64-debug.apk; do
-            name="wencrypt-$TAG-${package#wencrypt-}"
-            mv -- "$package" "$name"
-            assets+=("$name")
-          done
-          sha256sum "${assets[@]}" > SHA256SUMS.txt
-          notes="$RUNNER_TEMP/wencrypt-release-notes.md"
-          version_notes="../.github/releases/$TAG.md"
-          if [ -f "$version_notes" ]; then
-            cat "$version_notes" > "$notes"
-            printf '\n\n' >> "$notes"
-          else
-            : > "$notes"
-          fi
-          sed "s/@TAG@/$TAG/g" ../.github/release-notes.md >> "$notes"
-          if gh release view "$TAG" --json isDraft --jq '.isDraft' | grep -qx true; then
-            previous=$(gh release view "$TAG" --json targetCommitish --jq '.targetCommitish')
-            if [ "$previous" != "$GITHUB_SHA" ]; then
-              echo "Draft $TAG targets $previous. Rerun that build to finish publishing it."
-              exit 1
-            fi
-            gh release upload "$TAG" "${assets[@]}" SHA256SUMS.txt --clobber
-            gh release edit "$TAG" --draft=false
-          else
-            gh release create "$TAG" "${assets[@]}" SHA256SUMS.txt \
-              --target "$GITHUB_SHA" --title "Wencrypt $TAG" \
-              --notes-file "$notes" --generate-notes
-          fi
