@@ -267,20 +267,25 @@ fn seal_sync_history(s: &Session, record: &SyncHistoryEntry) -> Result<Vec<u8>> 
 }
 
 const BOOTSTRAP_PREDECESSORS: &str = "local-bootstrap-predecessors-v1";
+const PENDING_CLOUD_BOOTSTRAP: &str = "local-cloud-password-update-v1";
+const MASTER_AUTHENTICATION: &str = "local-master-authentication-v1";
+const MASTER_AUTH_INTERVAL: u64 = 72 * 60 * 60;
+const RECOVERY_FORMAT: &str = "WENCRYPT-RECOVERY-1";
+
+fn metadata(db: &Connection, key: &str) -> Result<Option<Vec<u8>>> {
+    sql(db
+        .query_row("SELECT value FROM metadata WHERE key=?1", [key], |row| {
+            row.get(0)
+        })
+        .optional())
+}
 
 fn bootstrap_predecessors(
     db: &Connection,
     dek: &[u8; 32],
     id: &[u8; 16],
 ) -> Result<BTreeSet<String>> {
-    let body: Option<Vec<u8>> = sql(db
-        .query_row(
-            "SELECT value FROM metadata WHERE key=?1",
-            params![BOOTSTRAP_PREDECESSORS],
-            |row| row.get(0),
-        )
-        .optional())?;
-    let Some(body) = body else {
+    let Some(body) = metadata(db, BOOTSTRAP_PREDECESSORS)? else {
         return Ok(BTreeSet::new());
     };
     let plain = crypto(envelope::decrypt_object(dek, id, Kind::Backup, &body))?;
@@ -291,12 +296,151 @@ fn bootstrap_predecessors(
     serde_json::from_value(value["hashes"].clone()).map_err(|_| "invalid_bootstrap")
 }
 
+fn record_bootstrap_predecessor(
+    db: &Connection,
+    dek: &[u8; 32],
+    id: &[u8; 16],
+    current: &[u8],
+) -> Result<()> {
+    let mut hashes = bootstrap_predecessors(db, dek, id)?;
+    hashes.insert(object_hash(current));
+    let plain = Zeroizing::new(
+        serde_json::to_vec(&json!({"purpose":BOOTSTRAP_PREDECESSORS,"hashes":hashes}))
+            .map_err(|_| "encode_failed")?,
+    );
+    let body = crypto(envelope::encrypt_object(dek, id, Kind::Backup, &plain))?;
+    sql(db.execute(
+        "INSERT OR REPLACE INTO metadata VALUES (?1,?2)",
+        params![BOOTSTRAP_PREDECESSORS, body],
+    ))?;
+    Ok(())
+}
+
+fn save_master_authentication(
+    db: &Connection,
+    dek: &[u8; 32],
+    id: &[u8; 16],
+    timestamp: u64,
+) -> Result<()> {
+    let mut plain = MASTER_AUTHENTICATION.as_bytes().to_vec();
+    plain.extend_from_slice(&timestamp.to_le_bytes());
+    let body = crypto(envelope::encrypt_object(dek, id, Kind::Backup, &plain))?;
+    sql(db.execute(
+        "INSERT OR REPLACE INTO metadata VALUES (?1,?2)",
+        params![MASTER_AUTHENTICATION, body],
+    ))?;
+    Ok(())
+}
+
+fn master_authentication(db: &Connection, dek: &[u8; 32], id: &[u8; 16]) -> Result<Option<u64>> {
+    let Some(body) = metadata(db, MASTER_AUTHENTICATION)? else {
+        return Ok(None);
+    };
+    let plain = crypto(envelope::decrypt_object(dek, id, Kind::Backup, &body))?;
+    let timestamp = plain
+        .strip_prefix(MASTER_AUTHENTICATION.as_bytes())
+        .and_then(|value| value.try_into().ok())
+        .map(u64::from_le_bytes)
+        .ok_or("invalid_authentication_time")?;
+    Ok(Some(timestamp))
+}
+
+fn require_recent_master(
+    db: &Connection,
+    dek: &[u8; 32],
+    id: &[u8; 16],
+    timestamp: u64,
+) -> Result<()> {
+    if master_authentication(db, dek, id)?
+        .and_then(|last| timestamp.checked_sub(last))
+        .is_none_or(|elapsed| elapsed >= MASTER_AUTH_INTERVAL)
+    {
+        return Err("master_password_required");
+    }
+    Ok(())
+}
+
+fn recovery_phrase(value: &str) -> Result<Zeroizing<String>> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("invalid_recovery_key");
+    }
+    Ok(Zeroizing::new(format!(
+        "{RECOVERY_FORMAT}:{}",
+        value.to_ascii_lowercase()
+    )))
+}
+
+fn local_sync_settings(db: &Connection, dek: &[u8; 32], id: &[u8; 16]) -> Result<Value> {
+    let Some(body) = metadata(db, "local-sync-settings")? else {
+        return Ok(Value::Null);
+    };
+    let plain = crypto(envelope::decrypt_object(dek, id, Kind::Backup, &body))?;
+    let value: Value = serde_json::from_slice(&plain).map_err(|_| "invalid_settings")?;
+    if value["purpose"] != "wencrypt-local-sync-settings-v1" {
+        return Err("invalid_settings");
+    }
+    Ok(value["settings"].clone())
+}
+
+fn confirm_local_key(
+    db: &Connection,
+    dek: &[u8; 32],
+    id: &[u8; 16],
+    revisions: &BTreeMap<String, Revision>,
+) -> Result<()> {
+    if revisions.is_empty()
+        && master_authentication(db, dek, id)?.is_none()
+        && local_sync_settings(db, dek, id)?.is_null()
+    {
+        return Err("recovery_identity_unverified");
+    }
+    Ok(())
+}
+
+fn cloud_bootstrap_proof(current: &[u8], remote: &[u8]) -> Vec<u8> {
+    let mut proof = PENDING_CLOUD_BOOTSTRAP.as_bytes().to_vec();
+    proof.extend_from_slice(&Sha256::digest(current));
+    proof.extend_from_slice(&Sha256::digest(remote));
+    proof
+}
+
+fn open_pending_cloud_bootstrap(
+    stored: &[u8],
+    current: &[u8],
+    id: &[u8; 16],
+    password: &str,
+) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>)> {
+    let (remote, proof) = stored
+        .split_at_checked(envelope::BOOTSTRAP_LEN)
+        .ok_or("invalid_bootstrap")?;
+    if crypto(envelope::parse(remote))?.0.vault_id != *id {
+        return Err("vault_identity_mismatch");
+    }
+    let dek = crypto(envelope::unlock_bootstrap(password, remote))?;
+    let expected = crypto(envelope::decrypt_object(&dek, id, Kind::Backup, proof))?;
+    if expected.as_slice() != cloud_bootstrap_proof(current, remote) {
+        return Err("invalid_bootstrap");
+    }
+    Ok((remote.to_vec(), dek))
+}
+
+fn adopt_bootstrap(db: &Connection, value: &[u8]) -> Result<()> {
+    sql(db.execute(
+        "DELETE FROM metadata WHERE key=?1",
+        params![BOOTSTRAP_PREDECESSORS],
+    ))?;
+    replace_bootstrap(db, value)
+}
+
 fn replace_bootstrap(db: &Connection, value: &[u8]) -> Result<()> {
     sql(db.execute(
         "UPDATE metadata SET value=?1 WHERE key='bootstrap'",
         params![value],
     ))?;
-    sql(db.execute("DELETE FROM metadata WHERE key='device-key-proof'", []))?;
+    sql(db.execute(
+        "DELETE FROM metadata WHERE key IN ('device-key-proof',?1)",
+        params![PENDING_CLOUD_BOOTSTRAP],
+    ))?;
     Ok(())
 }
 
@@ -565,6 +709,7 @@ impl Vault {
         if expected.as_slice() != Sha256::digest(&b).as_slice() {
             return Err("device_binding_mismatch");
         }
+        require_recent_master(&db, &dek, &id, now()?)?;
         let revisions = load(&db, &dek, &id)?;
         let token = identifier()?;
         self.session = Some(Session {
@@ -589,6 +734,7 @@ impl Vault {
         {
             return Err("device_binding_mismatch");
         }
+        require_recent_master(&s.db, &s.dek, &s.id, now()?)?;
         let ticket = identifier()?;
         s.backup_grant = Some((
             ticket.clone(),
@@ -615,7 +761,10 @@ impl Vault {
             let db = connection(field(v, "path")?, false)?;
             let b = bootstrap(&db)?;
             crypto(envelope::parse(&b))?;
-            return Ok(json!({"binding":hex::encode(Sha256::digest(&b))}));
+            return Ok(json!({
+                "binding":hex::encode(Sha256::digest(&b)),
+                "cloud_update_pending":metadata(&db, PENDING_CLOUD_BOOTSTRAP)?.is_some(),
+            }));
         }
         if op == "restore" {
             self.session = None;
@@ -654,6 +803,48 @@ impl Vault {
             install(path, &b, &bodies, None)?;
             return Ok(json!({"restored":true}));
         }
+        if op == "recover_master_password" {
+            self.session = None;
+            self.grant = None;
+            let password = field(v, "new_password")?;
+            if password.chars().count() < 12 || password.len() > 1024 {
+                return Err("password_length");
+            }
+            let kit = v.get("kit").ok_or("invalid_recovery_file")?;
+            if kit["format"] != RECOVERY_FORMAT {
+                return Err("invalid_recovery_file");
+            }
+            let wrapped =
+                hex::decode(field(kit, "wrapped")?).map_err(|_| "invalid_recovery_file")?;
+            let phrase = recovery_phrase(field(v, "recovery_key")?)?;
+            let header = crypto(envelope::parse(&wrapped))?.0;
+            let mut db = connection(field(v, "path")?, false)?;
+            let tx = sql(db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
+            let current = bootstrap(&tx)?;
+            let id = crypto(envelope::parse(&current))?.0.vault_id;
+            if header.kind != Kind::Bootstrap || header.vault_id != id {
+                return Err("vault_identity_mismatch");
+            }
+            let dek = envelope::unlock_bootstrap(&phrase, &wrapped)
+                .map_err(|_| "invalid_recovery_key")?;
+            let revisions = load(&tx, &dek, &id)?;
+            confirm_local_key(&tx, &dek, &id, &revisions)?;
+            let next = crypto(envelope::create_bootstrap(password, &id, &dek))?;
+            let token = identifier()?;
+            record_bootstrap_predecessor(&tx, &dek, &id, &current)?;
+            replace_bootstrap(&tx, &next)?;
+            save_master_authentication(&tx, &dek, &id, now()?)?;
+            sql(tx.commit())?;
+            self.session = Some(Session {
+                token: token.clone(),
+                db,
+                id,
+                dek,
+                revisions,
+                backup_grant: None,
+            });
+            return Ok(json!({"session":token}));
+        }
         if matches!(op, "create" | "unlock" | "join") {
             self.session = None;
             let path = field(v, "path")?;
@@ -689,15 +880,34 @@ impl Vault {
             } else {
                 None
             };
-            let db = connection(path, false)?;
-            let b = bootstrap(&db)?;
+            let mut db = connection(path, false)?;
+            let tx = sql(db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
+            let b = bootstrap(&tx)?;
             let id = crypto(envelope::parse(&b))?.0.vault_id;
+            let mut adopted = false;
             let dek = match joined_key {
                 Some(key) => key,
-                None => crypto(envelope::unlock_bootstrap(password, &b))?,
+                None => match envelope::unlock_bootstrap(password, &b) {
+                    Ok(key) => key,
+                    Err(envelope::Error::Authentication) if op == "unlock" => {
+                        let stored = metadata(&tx, PENDING_CLOUD_BOOTSTRAP)?
+                            .ok_or("authentication_or_format_failed")?;
+                        let (remote, key) =
+                            open_pending_cloud_bootstrap(&stored, &b, &id, password)?;
+                        adopt_bootstrap(&tx, &remote)?;
+                        adopted = true;
+                        key
+                    }
+                    Err(_) => return Err("authentication_or_format_failed"),
+                },
             };
-            let revisions = load(&db, &dek, &id)?;
+            let revisions = load(&tx, &dek, &id)?;
+            if adopted {
+                confirm_local_key(&tx, &dek, &id, &revisions)?;
+            }
             let token = identifier()?;
+            save_master_authentication(&tx, &dek, &id, now()?)?;
+            sql(tx.commit())?;
             self.session = Some(Session {
                 token: token.clone(),
                 db,
@@ -706,7 +916,7 @@ impl Vault {
                 revisions,
                 backup_grant: None,
             });
-            return Ok(json!({"session":token}));
+            return Ok(json!({"session":token,"adopted_cloud_password":adopted}));
         }
         let s = self.session.as_mut().ok_or("locked")?;
         if field(v, "session")? != s.token {
@@ -719,6 +929,7 @@ impl Vault {
                 if *key != *s.dek {
                     return Err("authentication_failed");
                 }
+                save_master_authentication(&s.db, &key, &s.id, now()?)?;
                 let proof = crypto(envelope::encrypt_object(
                     &key,
                     &s.id,
@@ -736,6 +947,22 @@ impl Vault {
                     expires: std::time::Instant::now() + std::time::Duration::from_secs(60),
                 });
                 Ok(json!({"ticket":ticket,"binding":hex::encode(Sha256::digest(&b))}))
+            }
+            "make_recovery_kit" => {
+                let b = bootstrap(&s.db)?;
+                let key = crypto(envelope::unlock_bootstrap(field(v, "password")?, &b))?;
+                if *key != *s.dek {
+                    return Err("authentication_failed");
+                }
+                save_master_authentication(&s.db, &key, &s.id, now()?)?;
+                let secret = Zeroizing::new(random::<32>()?);
+                let recovery_key = Zeroizing::new(hex::encode(secret.as_slice()));
+                let phrase = recovery_phrase(&recovery_key)?;
+                let wrapped = crypto(envelope::create_bootstrap(&phrase, &s.id, &key))?;
+                Ok(json!({
+                    "recovery_key":recovery_key.as_str(),
+                    "kit":{"format":RECOVERY_FORMAT,"wrapped":hex::encode(wrapped)},
+                }))
             }
             "change_master_password" | "adopt_cloud_password" => {
                 let new_password = field(v, "new_password")?;
@@ -758,10 +985,6 @@ impl Vault {
                     if current == remote {
                         return Ok(json!({"changed":false}));
                     }
-                    sql(tx.execute(
-                        "DELETE FROM metadata WHERE key=?1",
-                        params![BOOTSTRAP_PREDECESSORS],
-                    ))?;
                     remote
                 } else {
                     let old_password = field(v, "old_password")?;
@@ -773,27 +996,15 @@ impl Vault {
                         return Err("password_unchanged");
                     }
                     let next = crypto(envelope::create_bootstrap(new_password, &s.id, &s.dek))?;
-                    let mut hashes = bootstrap_predecessors(&tx, &s.dek, &s.id)?;
-                    hashes.insert(object_hash(&current));
-                    let plain = Zeroizing::new(
-                        serde_json::to_vec(
-                            &json!({"purpose":BOOTSTRAP_PREDECESSORS,"hashes":hashes}),
-                        )
-                        .map_err(|_| "encode_failed")?,
-                    );
-                    let body = crypto(envelope::encrypt_object(
-                        &s.dek,
-                        &s.id,
-                        Kind::Backup,
-                        &plain,
-                    ))?;
-                    sql(tx.execute(
-                        "INSERT OR REPLACE INTO metadata VALUES (?1,?2)",
-                        params![BOOTSTRAP_PREDECESSORS, body],
-                    ))?;
+                    record_bootstrap_predecessor(&tx, &s.dek, &s.id, &current)?;
                     next
                 };
-                replace_bootstrap(&tx, &replacement)?;
+                if adopting {
+                    adopt_bootstrap(&tx, &replacement)?;
+                } else {
+                    replace_bootstrap(&tx, &replacement)?;
+                }
+                save_master_authentication(&tx, &s.dek, &s.id, now()?)?;
                 sql(tx.commit())?;
                 self.grant = None;
                 s.backup_grant = None;
@@ -801,11 +1012,43 @@ impl Vault {
             }
             "sync_bootstrap_relation" => {
                 let body = hex::decode(field(v, "bootstrap")?).map_err(|_| "invalid_bootstrap")?;
-                let same_vault =
-                    envelope::parse(&body).is_ok_and(|(header, _, _)| header.vault_id == s.id);
+                let same_vault = envelope::parse(&body).is_ok_and(|(header, _, _)| {
+                    header.kind == Kind::Bootstrap && header.vault_id == s.id
+                });
                 let previous = same_vault
                     && bootstrap_predecessors(&s.db, &s.dek, &s.id)?.contains(&object_hash(&body));
                 Ok(json!({"same_vault":same_vault,"previous":previous}))
+            }
+            "stage_cloud_password" => {
+                let remote =
+                    hex::decode(field(v, "bootstrap")?).map_err(|_| "invalid_bootstrap")?;
+                let header = crypto(envelope::parse(&remote))?.0;
+                if header.kind != Kind::Bootstrap || header.vault_id != s.id {
+                    return Err("vault_identity_mismatch");
+                }
+                let tx = sql(s
+                    .db
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
+                let current = bootstrap(&tx)?;
+                if remote == current
+                    || bootstrap_predecessors(&tx, &s.dek, &s.id)?.contains(&object_hash(&remote))
+                {
+                    return Ok(json!({"pending":false}));
+                }
+                let proof = crypto(envelope::encrypt_object(
+                    &s.dek,
+                    &s.id,
+                    Kind::Backup,
+                    &cloud_bootstrap_proof(&current, &remote),
+                ))?;
+                let mut stored = remote;
+                stored.extend_from_slice(&proof);
+                sql(tx.execute(
+                    "INSERT OR REPLACE INTO metadata VALUES (?1,?2)",
+                    params![PENDING_CLOUD_BOOTSTRAP, stored],
+                ))?;
+                sql(tx.commit())?;
+                Ok(json!({"pending":true}))
             }
             "sync_history_list" => {
                 sync_history_table(&s.db)?;
@@ -921,31 +1164,7 @@ impl Vault {
                 Ok(json!({"saved":true}))
             }
             "sync_settings_get" => {
-                let bytes: Option<Vec<u8>> = sql(s
-                    .db
-                    .query_row(
-                        "SELECT value FROM metadata WHERE key='local-sync-settings'",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .optional())?;
-                match bytes {
-                    None => Ok(json!({"settings":null})),
-                    Some(bytes) => {
-                        let plain = crypto(envelope::decrypt_object(
-                            &s.dek,
-                            &s.id,
-                            Kind::Backup,
-                            &bytes,
-                        ))?;
-                        let value: Value =
-                            serde_json::from_slice(&plain).map_err(|_| "invalid_settings")?;
-                        if value["purpose"] != "wencrypt-local-sync-settings-v1" {
-                            return Err("invalid_settings");
-                        }
-                        Ok(json!({"settings":value["settings"]}))
-                    }
-                }
+                Ok(json!({"settings":local_sync_settings(&s.db, &s.dek, &s.id)?}))
             }
             "sync_settings_clear" => {
                 sql(s
@@ -1275,11 +1494,13 @@ impl Vault {
                     if ticket != expected || std::time::Instant::now() > expires {
                         return Err("biometric_grant_expired");
                     }
+                    require_recent_master(&s.db, &s.dek, &s.id, now()?)?;
                 } else {
                     let key = crypto(envelope::unlock_bootstrap(field(v, "password")?, &b))?;
                     if *key != *s.dek {
                         return Err("authentication_failed");
                     }
+                    save_master_authentication(&s.db, &key, &s.id, now()?)?;
                 }
                 let mut stmt = sql(s.db.prepare("SELECT body FROM objects ORDER BY hash"))?;
                 let objects = sql(stmt.query_map([], |r| r.get::<_, Vec<u8>>(0)))?
@@ -1467,6 +1688,166 @@ mod tests {
             .is_err());
         assert!(peer
             .command(&json!({"op":"unlock","path":other,"password":updated}))
+            .is_ok());
+    }
+
+    #[test]
+    fn cached_cloud_update_allows_new_password_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.db");
+        let old = "cached cloud old fixture password";
+        let new = "cached cloud new fixture password";
+        let mut peer = Vault::new();
+        let opened = peer
+            .command(&json!({"op":"create","path":path,"password":old}))
+            .unwrap();
+        let token = opened["session"].as_str().unwrap();
+        call(
+            &mut peer,
+            token,
+            json!({"op":"save","data":entry("existing")}),
+        );
+        let session = peer.session.as_ref().unwrap();
+        let other_key = Zeroizing::new(random::<32>().unwrap());
+        let wrong = envelope::create_bootstrap(new, &session.id, &other_key).unwrap();
+        let next = envelope::create_bootstrap(new, &session.id, &session.dek).unwrap();
+        for candidate in [&wrong, &next] {
+            assert_eq!(
+                call(
+                    &mut peer,
+                    token,
+                    json!({"op":"stage_cloud_password","bootstrap":hex::encode(candidate)}),
+                ),
+                json!({"pending":true})
+            );
+            let mut reopened = Vault::new();
+            let info = reopened
+                .command(&json!({"op":"device_info","path":path}))
+                .unwrap();
+            assert_eq!(info["cloud_update_pending"], true);
+            let result = reopened.command(&json!({"op":"unlock","path":path,"password":new}));
+            if candidate == &wrong {
+                assert!(result.is_err());
+                let db = connection(path.to_str().unwrap(), false).unwrap();
+                assert!(envelope::unlock_bootstrap(old, &bootstrap(&db).unwrap()).is_ok());
+            } else {
+                let opened = result.unwrap();
+                assert_eq!(opened["adopted_cloud_password"], true);
+                assert_eq!(
+                    call(
+                        &mut reopened,
+                        opened["session"].as_str().unwrap(),
+                        json!({"op":"list"})
+                    )["entries"][0]["data"]["password"],
+                    "existing"
+                );
+                let info = reopened
+                    .command(&json!({"op":"device_info","path":path}))
+                    .unwrap();
+                assert_eq!(info["cloud_update_pending"], false);
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_file_requires_its_separate_key_and_preserves_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.db");
+        let old = "recovery old fixture password";
+        let new = "recovery new fixture password";
+        let mut vault = Vault::new();
+        let result = vault
+            .command(&json!({"op":"create","path":path,"password":old}))
+            .unwrap();
+        let token = result["session"].as_str().unwrap();
+        call(
+            &mut vault,
+            token,
+            json!({"op":"save","data":entry("retained")}),
+        );
+        let before = call(&mut vault, token, json!({"op":"sync_inventory"}));
+        let result = call(
+            &mut vault,
+            token,
+            json!({"op":"make_recovery_kit","password":old}),
+        );
+        let key = result["recovery_key"].as_str().unwrap();
+        let kit = &result["kit"];
+        assert!(!kit.to_string().contains(key));
+        assert!(!kit.to_string().contains("retained"));
+        vault.command(&json!({"op":"lock"})).unwrap();
+        assert_eq!(
+            vault.command(&json!({
+                "op":"recover_master_password","path":path,"kit":kit,
+                "recovery_key":"0".repeat(64),"new_password":new
+            })),
+            Err("invalid_recovery_key")
+        );
+        let result = vault
+            .command(&json!({
+                "op":"recover_master_password","path":path,"kit":kit,
+                "recovery_key":key,"new_password":new
+            }))
+            .unwrap();
+        let token = result["session"].as_str().unwrap();
+        let after = call(&mut vault, token, json!({"op":"sync_inventory"}));
+        assert_eq!(before["vault"], after["vault"]);
+        assert_eq!(before["objects"], after["objects"]);
+        assert_ne!(before["bootstrap"], after["bootstrap"]);
+        assert_eq!(
+            call(
+                &mut vault,
+                token,
+                json!({"op":"sync_bootstrap_relation","bootstrap":before["bootstrap"]})
+            )["previous"],
+            true
+        );
+        assert!(vault
+            .command(&json!({"op":"unlock","path":path,"password":old}))
+            .is_err());
+        assert!(vault
+            .command(&json!({"op":"unlock","path":path,"password":new}))
+            .is_ok());
+    }
+
+    #[test]
+    fn biometric_reauthentication_is_required_at_72_hours() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.db");
+        let pass = "biometric timeout fixture password";
+        let mut vault = Vault::new();
+        let result = vault
+            .command(&json!({"op":"create","path":path,"password":pass}))
+            .unwrap();
+        let token = result["session"].as_str().unwrap();
+        let result = call(
+            &mut vault,
+            token,
+            json!({"op":"device_grant","password":pass}),
+        );
+        let payload = vault
+            .take_device_key(result["ticket"].as_str().unwrap())
+            .unwrap();
+        let session = vault.session.as_ref().unwrap();
+        let last = now().unwrap() - MASTER_AUTH_INTERVAL;
+        save_master_authentication(&session.db, &session.dek, &session.id, last).unwrap();
+        let check = |time| require_recent_master(&session.db, &session.dek, &session.id, time);
+        assert_eq!(check(last - 1), Err("master_password_required"));
+        assert_eq!(check(last + MASTER_AUTH_INTERVAL - 1), Ok(()));
+        assert_eq!(
+            check(last + MASTER_AUTH_INTERVAL),
+            Err("master_password_required")
+        );
+        vault.command(&json!({"op":"lock"})).unwrap();
+        assert_eq!(
+            vault.open_device_key(path.to_str().unwrap(), &*payload, 0),
+            Err("master_password_required")
+        );
+        vault
+            .command(&json!({"op":"unlock","path":path,"password":pass}))
+            .unwrap();
+        assert!(vault
+            .open_device_key(path.to_str().unwrap(), &*payload, 0)
             .is_ok());
     }
 

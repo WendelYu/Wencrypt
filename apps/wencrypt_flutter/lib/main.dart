@@ -118,6 +118,8 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   bool showSyncHistory = false;
   int syncHistoryRevision = 0;
   String? runningSyncRecord;
+  bool cloudUpdatePending = false;
+  bool _cloudPasswordPromptOpen = false;
   VaultInvite? pendingInvite;
   Timer? _searchUpdate;
 
@@ -177,7 +179,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       await dir.create(recursive: true);
       path = '${dir.path}/wencrypt-alpha.db';
       exists = await File(path!).exists();
-      if (exists && (Platform.isMacOS || Platform.isAndroid)) {
+      if (exists) {
         await deviceStatus();
       }
       if (mounted) setState(() => message = '本地加密 · 离线可用');
@@ -305,7 +307,8 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
         'remote_missing' => '云端副本缺失，已停止同步。本地数据仍保留。',
         'missing_credentials' => '请填写坚果云账号和 WebDAV 应用密码。',
         'invalid_remote_folder' => '请填写有效的坚果云同步目录名，最长 32 个字符。',
-        'cloud_password_changed' => '云端主密码已有更新，请从菜单选择「采用云端主密码」。',
+        'cloud_password_changed' => '云端主密码已有更新，请输入新主密码后继续同步。',
+        'bootstrap_update_unconfirmed' => '未能确认云端主密码更新，请重新同步。',
         'strong_etag_required' => '本机主密码已更新，云端未提供可用于安全更新的文件版本标识。',
         'vault_identity_mismatch' => '所选目录属于另一个密码库。请核对原设备的同步目录。',
         'free_budget_reached' => '已达到本机同步额度，已传输内容会保留，请稍后继续。',
@@ -316,7 +319,12 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       };
     }
     if (text.contains('biometric')) {
-      return '指纹认证取消、密钥失效或设备保护不可用。请用主密码解锁；需要时重新启用指纹。';
+      return '指纹验证未通过。请使用主密码，每 72 小时仍需输入一次主密码。';
+    }
+    if (text.contains('invalid_recovery_file')) return '无法读取 Wencrypt 恢复文件。';
+    if (text.contains('invalid_recovery_key')) return '恢复密钥与所选恢复文件不匹配。';
+    if (text.contains('recovery_identity_unverified')) {
+      return '无法确认恢复文件属于这台设备的密码库。';
     }
     if (text.contains('invitation_vault_mismatch')) return '邀请链接和云端密码库不匹配。';
     if (text.contains('vault_identity_mismatch')) return '所选目录属于另一个密码库。';
@@ -356,9 +364,14 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     }
     token = result['session'] as String;
     exists = true;
+    final adopted = result['adopted_cloud_password'] == true;
+    if (adopted) _didUpdateMasterPassword();
     touch();
     await refresh();
     await loadAuto();
+    if (adopted && syncConfigured) {
+      await runSync(automatic: false, promptForPasswordUpdate: false);
+    }
     if (creating && mounted && epoch == generation) {
       setState(() => message = '密码库已创建。可在「坚果云设置」开启跨设备同步。');
     }
@@ -428,6 +441,8 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
 
   Future<void> deviceStatus() async {
     final info = await core({'op': 'device_info', 'path': path});
+    cloudUpdatePending = info['cloud_update_pending'] == true;
+    if (!Platform.isMacOS && !Platform.isAndroid) return;
     binding = info['binding'] as String;
     final state = await device.invokeMapMethod<String, dynamic>('status', {
       'binding': binding,
@@ -599,6 +614,8 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
 
   Future<void> runSync({
     required bool automatic,
+    bool promptForPasswordUpdate = true,
+    bool recoveringPassword = false,
     String? username,
     String? password,
     List<Map<String, dynamic>>? targetsOverride,
@@ -618,6 +635,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     var failures = 0;
     bool attempted = false;
     DateTime? next;
+    CloudPasswordChanged? passwordUpdate;
     try {
       if (await stateFile.exists()) {
         final state =
@@ -706,6 +724,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
             password,
             remoteFolder: folder.isEmpty ? null : folder,
             existingOnly: target['existingOnly'] == true,
+            recoveringPassword: recoveringPassword,
             onProgress: (report) async {
               progress = report;
               if (mounted && current == generation) {
@@ -773,6 +792,18 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     } catch (e) {
       failures = (failures + 1).clamp(1, 4);
       if (current == generation && mounted) {
+        if (e is CloudPasswordChanged) {
+          passwordUpdate = e;
+          try {
+            final staged = await request('stage_cloud_password', {
+              'bootstrap': e.bootstrap,
+            });
+            if (staged['pending'] == true) cloudUpdatePending = true;
+          } catch (_) {
+            // An unlocked vault can still verify the downloaded update.
+          }
+        }
+        if (!mounted || current != generation) return;
         setState(() {
           message = friendly(e);
         });
@@ -809,6 +840,14 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
           );
         }
       }
+    }
+    if (promptForPasswordUpdate &&
+        passwordUpdate != null &&
+        mounted &&
+        current == generation &&
+        foreground &&
+        await _confirmCloudPasswordUpdate(passwordUpdate, current)) {
+      await runSync(automatic: false, promptForPasswordUpdate: false);
     }
   }
 
@@ -1467,6 +1506,19 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
 
   Future<String?> passwordPrompt() async => (await _reauthenticate())?.password;
 
+  Future<bool> _saveEncryptedFile(Uint8List bytes, String name) async {
+    if (Platform.isAndroid) {
+      return await const MethodChannel(
+            'org.wencrypt.files',
+          ).invokeMethod<bool>('saveBackup', {'bytes': bytes, 'name': name}) ==
+          true;
+    }
+    final location = await getSaveLocation(suggestedName: name);
+    if (location == null) return false;
+    await XFile.fromData(bytes).saveTo(location.path);
+    return true;
+  }
+
   Future<void> backup() async {
     final snapshot = generation;
     final authorization = await _reauthenticate(
@@ -1499,27 +1551,225 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       if (bytes.length > 2 * 1024 * 1024) {
         throw StateError('backup_limit');
       }
-      bool saved;
-      if (Platform.isAndroid) {
-        saved =
-            await const MethodChannel('org.wencrypt.files').invokeMethod<bool>(
-              'saveBackup',
-              {'bytes': Uint8List.fromList(bytes)},
-            ) ==
-            true;
-      } else {
-        final location = await getSaveLocation(
-          suggestedName: 'wencrypt-backup.wenback',
-        );
-        saved = location != null;
-        if (location != null) {
-          await XFile.fromData(Uint8List.fromList(bytes)).saveTo(location.path);
-        }
-      }
+      final saved = await _saveEncryptedFile(
+        Uint8List.fromList(bytes),
+        'wencrypt-backup.wenback',
+      );
       if (mounted && snapshot == generation) {
         setState(() => message = saved ? '已保存加密备份' : '已取消保存备份');
       }
     });
+  }
+
+  Future<void> _createRecoveryKit() async {
+    if (token == null || busy || syncing) return;
+    final epoch = generation;
+    final password = await passwordPrompt();
+    if (password == null || !mounted || epoch != generation) return;
+    await action(() async {
+      final result = await request('make_recovery_kit', {'password': password});
+      if (!mounted || epoch != generation) return;
+      final key = result['recovery_key'] as String;
+      final accepted = await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => AlertDialog(
+          title: const Text('保存密码恢复材料'),
+          content: SizedBox(
+            width: 440,
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text('把下面的恢复密钥保存在纸上或另一处安全位置。恢复文件可上传到坚果云，密钥请与文件分开保存。'),
+                  const SizedBox(height: 12),
+                  SelectableText(
+                    key.replaceAllMapped(
+                      RegExp(r'.{8}(?=.)'),
+                      (part) => '${part[0]} ',
+                    ),
+                    style: TextStyle(fontFamily: wMonoFamily),
+                  ),
+                  TextButton.icon(
+                    onPressed: () => copy(key, label: '恢复密钥'),
+                    icon: const Icon(Icons.copy),
+                    label: const Text('复制恢复密钥'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('已记下密钥，保存恢复文件'),
+            ),
+          ],
+        ),
+      );
+      if (accepted != true || !mounted || epoch != generation) return;
+      final bytes = utf8.encode(jsonEncode(result['kit']));
+      final saved = await _saveEncryptedFile(
+        Uint8List.fromList(bytes),
+        recoveryFileName,
+      );
+      if (mounted && epoch == generation) {
+        setState(() => message = saved ? '恢复文件已保存。' : '已取消保存恢复文件。');
+      }
+    });
+  }
+
+  Future<void> _recoverMasterPassword() async {
+    if (!exists || token != null || busy || path == null) return;
+    try {
+      final proceed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('忘记主密码'),
+          content: const Text(
+            '如果之前创建过恢复文件，请从坚果云或其他保存位置下载 wencrypt-recovery.wenrecover，并准备单独保存的恢复密钥。',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('选择恢复文件'),
+            ),
+          ],
+        ),
+      );
+      if (proceed != true || !mounted || token != null || busy) return;
+      final file = await openFile();
+      if (file == null || !mounted || token != null) return;
+      final epoch = generation;
+      if (await file.length() > 4096) throw StateError('invalid_recovery_file');
+      final Map<String, dynamic> kit;
+      try {
+        kit = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+        if (kit['format'] != 'WENCRYPT-RECOVERY-1' ||
+            kit['wrapped'] is! String) {
+          throw const FormatException();
+        }
+      } catch (_) {
+        throw StateError('invalid_recovery_file');
+      }
+      if (!mounted || epoch != generation) return;
+      final recoveryKey = TextEditingController();
+      final newPassword = TextEditingController();
+      final confirmation = TextEditingController();
+      final form = GlobalKey<FormState>();
+      final dialog = DialogRoute<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('用恢复文件重置主密码'),
+          content: SizedBox(
+            width: 440,
+            child: SingleChildScrollView(
+              child: Form(
+                key: form,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Text(
+                      '已选择 ${file.name}。输入单独保存的恢复密钥，然后设置新主密码。已绑定坚果云时，应用也会尝试更新云端主密码。',
+                    ),
+                    const SizedBox(height: 10),
+                    TextFormField(
+                      controller: recoveryKey,
+                      obscureText: true,
+                      enableSuggestions: false,
+                      autocorrect: false,
+                      decoration: const InputDecoration(labelText: '恢复密钥'),
+                      validator: (value) =>
+                          RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(
+                            (value ?? '').replaceAll(RegExp(r'\s+'), ''),
+                          )
+                          ? null
+                          : '请输入保存的 64 位恢复密钥',
+                    ),
+                    const SizedBox(height: 10),
+                    TextFormField(
+                      controller: newPassword,
+                      obscureText: true,
+                      enableSuggestions: false,
+                      autocorrect: false,
+                      decoration: const InputDecoration(labelText: '新主密码'),
+                      validator: (value) => (value ?? '').runes.length >= 12
+                          ? null
+                          : '请至少输入 12 个字符',
+                    ),
+                    const SizedBox(height: 10),
+                    TextFormField(
+                      controller: confirmation,
+                      obscureText: true,
+                      enableSuggestions: false,
+                      autocorrect: false,
+                      decoration: const InputDecoration(labelText: '确认新主密码'),
+                      validator: (value) =>
+                          value == newPassword.text ? null : '两次输入不一致',
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () {
+                if (form.currentState!.validate()) Navigator.pop(context, true);
+              },
+              child: const Text('重置并解锁'),
+            ),
+          ],
+        ),
+      );
+      final accepted = await Navigator.of(context).push(dialog);
+      await dialog.completed;
+      final key = recoveryKey.text.replaceAll(RegExp(r'\s+'), '');
+      final next = newPassword.text;
+      recoveryKey.dispose();
+      newPassword.dispose();
+      confirmation.dispose();
+      if (accepted != true || !mounted || epoch != generation) return;
+      await action(() async {
+        final result = await core({
+          'op': 'recover_master_password',
+          'path': path,
+          'kit': kit,
+          'recovery_key': key,
+          'new_password': next,
+        });
+        if (!mounted || epoch != generation) return;
+        token = result['session'] as String;
+        _didUpdateMasterPassword();
+        master.clear();
+        touch();
+        await refresh();
+        await loadAuto();
+        if (syncConfigured) {
+          await runSync(
+            automatic: false,
+            promptForPasswordUpdate: false,
+            recoveringPassword: true,
+          );
+        }
+      });
+    } catch (error) {
+      if (mounted) setState(() => message = friendly(error));
+    }
   }
 
   Future<void> _exportEntryImage(Map<String, dynamic> data) async {
@@ -1709,6 +1959,113 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     await copy(invitation.toUri().toString(), label: '邀请链接');
   }
 
+  void _didUpdateMasterPassword() {
+    setState(() {
+      biometricEnabled = false;
+      binding = null;
+      cloudUpdatePending = false;
+      message = '本机主密码已更新。';
+    });
+  }
+
+  Future<bool> _confirmCloudPasswordUpdate(
+    CloudPasswordChanged update,
+    int epoch,
+  ) async {
+    if (_cloudPasswordPromptOpen) return false;
+    _cloudPasswordPromptOpen = true;
+    touch();
+    final password = TextEditingController();
+    var verifying = false;
+    String? error;
+    final dialog = DialogRoute<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setLocal) {
+          Future<void> verify() async {
+            if (verifying || epoch != generation) return;
+            if (password.text.isEmpty) {
+              setLocal(() => error = '请输入新主密码');
+              return;
+            }
+            touch();
+            setLocal(() {
+              verifying = true;
+              error = null;
+            });
+            final input = password.text;
+            password.clear();
+            try {
+              final result = await request('adopt_cloud_password', {
+                'new_password': input,
+                'bootstrap': update.bootstrap,
+              });
+              if (!mounted || epoch != generation) return;
+              if (result['changed'] == true) _didUpdateMasterPassword();
+              if (context.mounted) Navigator.of(context).pop(true);
+            } catch (failure) {
+              if (!context.mounted || epoch != generation) return;
+              setLocal(() {
+                verifying = false;
+                error = friendly(failure);
+              });
+            }
+          }
+
+          return AlertDialog(
+            title: const Text('云端主密码已更新'),
+            scrollable: true,
+            content: SizedBox(
+              width: 400,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text('输入新主密码以更新本机并继续同步「${update.folder}」。'),
+                  const SizedBox(height: 14),
+                  TextField(
+                    controller: password,
+                    autofocus: true,
+                    enabled: !verifying,
+                    obscureText: true,
+                    enableSuggestions: false,
+                    autocorrect: false,
+                    decoration: InputDecoration(
+                      labelText: '新主密码',
+                      errorText: error,
+                    ),
+                    onSubmitted: (_) => verify(),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: verifying
+                    ? null
+                    : () => Navigator.of(context).pop(false),
+                child: const Text('稍后'),
+              ),
+              FilledButton(
+                onPressed: verifying ? null : verify,
+                child: Text(verifying ? '正在验证…' : '验证并继续同步'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    try {
+      final accepted = await Navigator.of(context).push(dialog);
+      await dialog.completed;
+      return accepted == true && mounted && epoch == generation;
+    } finally {
+      _cloudPasswordPromptOpen = false;
+      password.dispose();
+    }
+  }
+
   Future<void> _changeMasterPassword({bool adopt = false}) async {
     if (token == null || busy || syncing) return;
     touch();
@@ -1839,11 +2196,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
         setState(() => message = '本机已经使用该主密码。');
         return;
       }
-      setState(() {
-        biometricEnabled = false;
-        binding = null;
-        message = '本机主密码已更新。';
-      });
+      _didUpdateMasterPassword();
       if (syncConfigured) await runSync(automatic: false);
     });
   }
@@ -3330,7 +3683,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
             FirstRunStep.join => '加入已有密码库',
           };
     final subtitle = exists
-        ? '使用已有密码库的主密码解锁。'
+        ? cloudUpdatePending
+              ? '检测到云端主密码更新，可直接输入新主密码解锁。'
+              : '使用已有密码库的主密码解锁。'
         : switch (firstRunStep) {
             FirstRunStep.welcome => '本地加密、离线可用。所有密码只保存在这台设备上。',
             FirstRunStep.create => '请设置独立的长口令。Wencrypt 无法找回主密码，请妥善保存。',
@@ -3413,6 +3768,11 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                 ),
               ),
             ],
+            if (exists)
+              TextButton(
+                onPressed: busy ? null : _recoverMasterPassword,
+                child: const Text('忘记主密码？'),
+              ),
           ],
           if (!exists && firstRunStep != FirstRunStep.welcome) ...[
             const SizedBox(height: 4),
@@ -4130,6 +4490,12 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
               icon: Icons.password_rounded,
               enabled: !busy && !syncing,
               onTap: _changeMasterPassword,
+            ),
+            WMenuEntry(
+              label: '创建主密码恢复文件',
+              icon: Icons.vpn_key_outlined,
+              enabled: !busy && !syncing,
+              onTap: _createRecoveryKit,
             ),
             if (syncConfigured)
               WMenuEntry(

@@ -98,6 +98,13 @@ class DavFailure implements Exception {
       '同步失败 [$stage / $reason${status == null ? '' : ' / HTTP $status'}]';
 }
 
+class CloudPasswordChanged extends DavFailure {
+  const CloudPasswordChanged(String stage, this.bootstrap, this.folder)
+    : super(stage, 'cloud_password_changed');
+
+  final String bootstrap, folder;
+}
+
 class DavReply {
   DavReply(this.status, List<int> body, {this.etag})
     : body = Uint8List.fromList(body);
@@ -119,6 +126,7 @@ enum DavContents { vault, packBuckets, packs }
 final _revisionFile = RegExp(r'^[0-9a-f]{64}\.wenc$');
 final _packFile = RegExp(r'^[0-9a-f]{64}\.pack$');
 final _bucketName = RegExp(r'^[01][0-9a-f]$');
+const recoveryFileName = 'wencrypt-recovery.wenrecover';
 
 Set<String> parseDavListing(
   List<int> bytes,
@@ -174,6 +182,7 @@ Set<String> parseDavListing(
       DavContents.vault =>
         name == 'bootstrap.wenc' ||
             name == 'packs-v1' ||
+            name == recoveryFileName ||
             _revisionFile.hasMatch(name),
       DavContents.packBuckets => _bucketName.hasMatch(name),
       DavContents.packs => _packFile.hasMatch(name),
@@ -472,6 +481,7 @@ class NutstoreSync {
     String password, {
     String? remoteFolder,
     bool existingOnly = false,
+    bool recoveringPassword = false,
     Future<void> Function(SyncReport report)? onProgress,
   }) async {
     _configure(username, password);
@@ -552,16 +562,20 @@ class NutstoreSync {
         }
       }
       if (hex(remote.body) != hex(bootstrap)) {
+        final remoteBootstrap = hex(remote.body);
         final relation = await request('sync_bootstrap_relation', {
-          'bootstrap': hex(remote.body),
+          'bootstrap': remoteBootstrap,
         });
-        if (relation['previous'] != true) {
-          throw DavFailure(
-            'verify_bootstrap',
-            relation['same_vault'] == true
-                ? 'cloud_password_changed'
-                : 'vault_identity_mismatch',
-          );
+        if (relation['previous'] != true &&
+            !(recoveringPassword && relation['same_vault'] == true)) {
+          if (relation['same_vault'] == true) {
+            throw CloudPasswordChanged(
+              'verify_bootstrap',
+              remoteBootstrap,
+              folderName,
+            );
+          }
+          throw const DavFailure('verify_bootstrap', 'vault_identity_mismatch');
         }
         final etag = remote.etag;
         if (etag == null || !RegExp(r'^"[!#-~]+"$').hasMatch(etag)) {
@@ -583,7 +597,23 @@ class NutstoreSync {
           limit: 8192,
         );
         if (hex(verified.body) != hex(bootstrap)) {
-          throw const DavFailure('update_bootstrap', 'cloud_password_changed');
+          final latest = hex(verified.body);
+          final relation = await request('sync_bootstrap_relation', {
+            'bootstrap': latest,
+          });
+          if (relation['same_vault'] != true) {
+            throw const DavFailure(
+              'update_bootstrap',
+              'vault_identity_mismatch',
+            );
+          }
+          if (relation['previous'] == true) {
+            throw const DavFailure(
+              'update_bootstrap',
+              'bootstrap_update_unconfirmed',
+            );
+          }
+          throw CloudPasswordChanged('update_bootstrap', latest, folderName);
         }
       }
       await remembered.writeAsString('bound', flush: true);

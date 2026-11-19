@@ -101,7 +101,11 @@ class MainActivity : FlutterFragmentActivity() {
                         startActivityForResult(android.content.Intent(android.content.Intent.ACTION_CREATE_DOCUMENT).apply {
                             addCategory(android.content.Intent.CATEGORY_OPENABLE)
                             type = "application/octet-stream"
-                            putExtra(android.content.Intent.EXTRA_TITLE, "wencrypt-backup.wenback")
+                            val name = when (call.argument<String>("name")) {
+                                "wencrypt-recovery.wenrecover" -> "wencrypt-recovery.wenrecover"
+                                else -> "wencrypt-backup.wenback"
+                            }
+                            putExtra(Intent.EXTRA_TITLE, name)
                         }, 7401)
                     } catch (_: Exception) { backupBytes = null; backupResult = null; result.error("save_failed", "File picker unavailable", null) }
                 } else if (call.method == "copySensitive") {

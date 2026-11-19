@@ -121,8 +121,11 @@ void main() {
       dir,
       (op, [args = const {}]) async {
         if (op == 'sync_bootstrap_relation') {
-          expect(args['bootstrap'], '0102');
-          return {'same_vault': true, 'previous': true};
+          final candidate = args['bootstrap'];
+          return {
+            'same_vault': ['0102', '0506'].contains(candidate),
+            'previous': candidate == '0102',
+          };
         }
         return {
           'vault': '0123456789abcdef0123456789abcdef',
@@ -163,19 +166,42 @@ void main() {
     version = '"old-strong-etag"';
     conflicting = true;
     await expectLater(
-      client().sync('fixture', 'fixture'),
+      client().sync('fixture', 'fixture', remoteFolder: 'shared'),
       throwsA(
-        isA<DavFailure>().having(
-          (e) => e.reason,
-          'reason',
-          'cloud_password_changed',
-        ),
+        isA<CloudPasswordChanged>()
+            .having((e) => e.bootstrap, 'bootstrap', '0506')
+            .having((e) => e.folder, 'folder', 'shared'),
       ),
     );
     expect(remote, [5, 6]);
-    remote = [1, 2];
+    calls.clear();
+    await expectLater(
+      client().sync('fixture', 'fixture'),
+      throwsA(isA<CloudPasswordChanged>()),
+    );
+    expect(calls, isNot(contains('PUT')));
     conflicting = false;
-    expect((await client().sync('fixture', 'fixture')).complete, isTrue);
+    remote = [7, 8];
+    await expectLater(
+      client().sync('fixture', 'fixture', recoveringPassword: true),
+      throwsA(
+        isA<DavFailure>().having(
+          (failure) => failure.reason,
+          'reason',
+          'vault_identity_mismatch',
+        ),
+      ),
+    );
+    expect(calls, isNot(contains('PUT')));
+    remote = [5, 6];
+    expect(
+      (await client().sync(
+        'fixture',
+        'fixture',
+        recoveringPassword: true,
+      )).complete,
+      isTrue,
+    );
     expect(remote, [3, 4]);
   });
 
@@ -185,10 +211,15 @@ void main() {
       final uri = Uri.parse('https://dav.jianguoyun.com/dav/wc-123/');
       expect(
         parseDavListing(
-          utf8.encode(listing(uri.path, ['bootstrap.wenc'], slash: false)),
+          utf8.encode(
+            listing(uri.path, [
+              'bootstrap.wenc',
+              recoveryFileName,
+            ], slash: false),
+          ),
           uri,
         ),
-        {'bootstrap.wenc'},
+        {'bootstrap.wenc', recoveryFileName},
       );
       expect(
         () => parseDavListing(
