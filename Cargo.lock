@@ -735,6 +735,7 @@ dependencies = [
  "hex",
  "hkdf",
  "jni",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
