@@ -112,6 +112,72 @@ void main() {
     expect(find.text('从加密备份恢复'), findsOneWidget);
     expect(find.text('主密码（至少 12 个字符）'), findsNothing);
   });
+
+  testWidgets(
+    'join keeps pasted values when switching apps and shows errors in place',
+    (tester) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: wencryptTheme(Brightness.light),
+          home: const VaultPage(preview: VaultPreview(exists: false)),
+        ),
+      );
+      await tester.tap(find.text('加入已有库'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('从坚果云加入'));
+      await tester.pumpAndSettle();
+      final fields = find.byType(TextFormField);
+      await tester.enterText(fields.at(0), 'fixture@example.com');
+      await tester.enterText(fields.at(1), 'fixture-app-password');
+      await tester.enterText(
+        fields.at(2),
+        'https://example.com/invalid-folder',
+      );
+      await tester.enterText(fields.at(3), 'fixture master password');
+      await tester.tap(find.byTooltip('显示WebDAV 应用密码'));
+      await tester.pumpAndSettle();
+      final inputs = find.byType(EditableText);
+      expect(tester.widget<EditableText>(inputs.at(1)).obscureText, isFalse);
+      expect(tester.widget<EditableText>(inputs.at(3)).obscureText, isTrue);
+      await tester.tap(find.byTooltip('显示已有库的主密码'));
+      await tester.pumpAndSettle();
+
+      for (final state in [
+        AppLifecycleState.inactive,
+        AppLifecycleState.hidden,
+        AppLifecycleState.paused,
+      ]) {
+        tester.binding.handleAppLifecycleStateChanged(state);
+      }
+      await tester.pump();
+      for (final state in [
+        AppLifecycleState.hidden,
+        AppLifecycleState.inactive,
+        AppLifecycleState.resumed,
+      ]) {
+        tester.binding.handleAppLifecycleStateChanged(state);
+      }
+      await tester.pumpAndSettle();
+      expect(
+        tester.widget<EditableText>(inputs.at(1)).controller.text,
+        'fixture-app-password',
+      );
+      expect(
+        tester.widget<EditableText>(inputs.at(3)).controller.text,
+        'fixture master password',
+      );
+      expect(tester.widget<EditableText>(inputs.at(3)).obscureText, isFalse);
+
+      await tester.tap(find.widgetWithText(FilledButton, '加入密码库'));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('读取云端密码库失败。请填写有效的'), findsOneWidget);
+      expect(
+        tester.widget<EditableText>(inputs.at(3)).controller.text,
+        'fixture master password',
+      );
+    },
+  );
+
   test('budget survives restarts and refuses excess requests', () async {
     final dir = await Directory.systemTemp.createTemp('wencrypt-budget-test');
     try {

@@ -151,7 +151,12 @@ fn install(
         std::fs::File::open(&temporary)
             .and_then(|f| f.sync_all())
             .map_err(|_| "storage_failed")?;
-        std::fs::hard_link(&temporary, path).map_err(|_| "install_failed_or_exists")?;
+        std::fs::hard_link(&temporary, path).map_err(|error| match error.kind() {
+            std::io::ErrorKind::AlreadyExists => "vault_already_exists",
+            std::io::ErrorKind::PermissionDenied => "install_permission_denied",
+            std::io::ErrorKind::Unsupported => "install_filesystem_unsupported",
+            _ => "install_failed",
+        })?;
         Ok(())
     })();
     let _ = std::fs::remove_file(&temporary);
@@ -863,14 +868,22 @@ impl Vault {
             }
             let joined_key = if op == "join" {
                 let b = hex::decode(field(v, "bootstrap")?).map_err(|_| "invalid_bootstrap")?;
-                let key = crypto(envelope::unlock_bootstrap(password, &b))?;
-                let id = crypto(envelope::parse(&b))?.0.vault_id;
+                let header = envelope::parse(&b).map_err(|_| "invalid_bootstrap")?.0;
+                if header.kind != Kind::Bootstrap {
+                    return Err("invalid_bootstrap");
+                }
+                let id = header.vault_id;
                 if v["expected_vault"]
                     .as_str()
                     .is_some_and(|expected| expected != hex::encode(id))
                 {
                     return Err("invitation_vault_mismatch");
                 }
+                let key =
+                    envelope::unlock_bootstrap(password, &b).map_err(|error| match error {
+                        envelope::Error::Authentication => "join_master_password_invalid",
+                        _ => "invalid_bootstrap",
+                    })?;
                 let settings = v
                     .get("settings")
                     .map(|settings| sealed_sync_settings(&key, &id, settings))
@@ -1905,7 +1918,7 @@ mod tests {
             "bootstrap":inventory["bootstrap"],
             "settings":{"username":"fixture@example.com","password":"fixture-app-password","joinPending":true}
         });
-        assert!(second.command(&join).is_err());
+        assert_eq!(second.command(&join), Err("join_master_password_invalid"));
         assert!(!path.exists());
         join["password"] = json!(password);
         let second_opened = second.command(&join).unwrap();

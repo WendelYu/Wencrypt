@@ -29,7 +29,7 @@
   <li>前往<a href="x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension">系统设置 → 隐私与安全性</a>，在「安全性」下点「仍要打开」，按提示确认。</li>
 </ol>
 <h2>提示「已损坏」或仍然无法打开</h2>
-<p>请从本仓库的 GitHub Release 重新下载 Apple 芯片版 DMG，并核对 <code>SHA256SUMS.txt</code>。可在终端运行 <code>shasum -a 256 "$HOME/Downloads/wencrypt-macos-arm64.dmg"</code> 查看摘要。</p>
+<p>请从本仓库的 GitHub Release 重新下载 Apple 芯片版 DMG，并核对 <code>SHA256SUMS.txt</code>。在终端输入 <code>shasum -a 256</code> 和一个空格，再将下载的 DMG 拖进终端，按回车即可查看摘要。</p>
 <p>确认摘要一致、应用已拖入「应用程序」，且系统未提示恶意软件时，可在终端执行下面的命令清除该应用的下载隔离标记，然后重新打开 Wencrypt。</p>
 <div class="command">
   <pre><code id="open-command">xattr -dr com.apple.quarantine "/Applications/wencrypt.app"</code></pre>

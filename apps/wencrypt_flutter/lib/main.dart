@@ -78,6 +78,7 @@ class VaultPage extends StatefulWidget {
 /// constructs this, and it never reaches the encryption or sync layers.
 class VaultPreview {
   const VaultPreview({
+    this.exists = true,
     this.unlocked = false,
     this.trash = false,
     this.showSyncHistory = false,
@@ -89,7 +90,7 @@ class VaultPreview {
     this.message = '本地加密 · 离线可用',
   });
 
-  final bool unlocked;
+  final bool exists, unlocked;
   final bool trash;
   final bool showSyncHistory;
   final List<Map<String, dynamic>> entries;
@@ -155,7 +156,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     if (widget.preview case final VaultPreview preview) {
       token = preview.unlocked ? 'preview' : null;
       path = '/preview/wencrypt.db';
-      exists = true;
+      exists = preview.exists;
       trash = preview.trash;
       showSyncHistory = preview.showSyncHistory;
       entries = preview.entries;
@@ -228,6 +229,8 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     foreground = state == AppLifecycleState.resumed;
+    // There is no vault session to lock while filling out first-run forms.
+    if (!exists && token == null) return;
     if (state == AppLifecycleState.inactive && authenticating) return;
     final isDesktop =
         Platform.isMacOS || Platform.isWindows || Platform.isLinux;
@@ -316,6 +319,10 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
         'vault_identity_mismatch' => '所选目录属于另一个密码库。请核对原设备的同步目录。',
         'free_budget_reached' => '已达到本机同步额度，已传输内容会保留，请稍后继续。',
         'directory_limit' => '坚果云单个目录达到列举上限，同步已暂停。',
+        'timeout' => '连接坚果云超时，请检查网络后重试。',
+        'network_failed' => '无法连接坚果云，请检查网络后重试。',
+        'tls_failed' => '无法验证坚果云的安全连接，请检查网络或系统时间。',
+        'local_budget_storage_failed' => '无法保存本机同步记录，请检查磁盘空间和应用数据目录权限。',
         _ when e.status == 401 || e.status == 403 =>
           '坚果云验证失败。请核对账号、WebDAV 应用密码和目录权限。',
         _ => e.toString(),
@@ -330,6 +337,30 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       return '无法确认恢复文件属于这台设备的密码库。';
     }
     if (text.contains('invitation_vault_mismatch')) return '邀请链接和云端密码库不匹配。';
+    if (text.contains('join_master_password_invalid')) {
+      return '无法用该主密码打开云端密码库。若刚修改主密码，请确认原设备已成功同步。';
+    }
+    if (text.contains('invalid_bootstrap')) {
+      return '云端引导文件无法识别或已损坏。请核对原设备使用的同步目录。';
+    }
+    if (text.contains('install_permission_denied')) {
+      return '系统拒绝写入本机密码库。请检查应用的数据目录权限。';
+    }
+    if (text.contains('install_filesystem_unsupported')) {
+      return '应用的数据目录所在磁盘不支持当前的密码库安装方式。';
+    }
+    if (text.contains('install_failed') || text.contains('storage_failed')) {
+      return '无法保存或打开本机密码库。请检查应用数据目录的权限和磁盘空间。';
+    }
+    if (text.contains('core_library_unavailable')) {
+      return '加密组件无法加载。请使用对应系统的完整安装包，Windows 版需完整解压。';
+    }
+    if (text.contains('core_platform_unsupported')) {
+      return '此系统不支持当前 Wencrypt 安装包。';
+    }
+    if (text.contains('invalid_settings')) {
+      return '本机无法保存坚果云设置，请核对账号和 WebDAV 应用密码。';
+    }
     if (text.contains('vault_identity_mismatch')) return '所选目录属于另一个密码库。';
     if (text.contains('sync_credentials_required')) {
       return '请先保存同步使用的坚果云账号和 WebDAV 应用密码。';
@@ -2234,11 +2265,117 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     };
     final form = GlobalKey<FormState>();
     var automatic = true;
+    var submitting = false;
+    final revealed = <String>{};
+    String? joinError;
+    ({
+      String session,
+      String username,
+      String appPassword,
+      List<Map<String, dynamic>> targets,
+    })?
+    joined;
     final dialog = DialogRoute<bool>(
       context: context,
+      barrierDismissible: false,
       builder: (context) => StatefulBuilder(
         builder: (context, setLocal) {
           final c = WColors.of(context);
+          bool canRespond() =>
+              mounted && context.mounted && epoch == generation;
+
+          Future<void> submit() async {
+            if (submitting || !foreground || !form.currentState!.validate()) {
+              return;
+            }
+            final navigator = Navigator.of(context);
+            final username = fields['坚果云账号']!.text.trim();
+            final appPassword = fields['WebDAV 应用密码']!.text;
+            final folder = invitation?.folder ?? fields['同步目录名']!.text.trim();
+            final masterPassword = fields['已有库的主密码']!.text;
+            setLocal(() {
+              submitting = true;
+              joinError = null;
+            });
+            var readingCloud = true;
+            try {
+              final reader = NutstoreSync(File(path!).parent, request);
+              activeSync = reader;
+              final String bootstrap;
+              try {
+                bootstrap = await reader.readExistingBootstrap(
+                  username,
+                  appPassword,
+                  folder,
+                );
+              } finally {
+                if (identical(activeSync, reader)) activeSync = null;
+              }
+              if (!canRespond()) return;
+              if (!foreground) {
+                setLocal(() => joinError = '已读取云端密码库，请返回 Wencrypt 后再点加入。');
+                return;
+              }
+              readingCloud = false;
+              final targets = <Map<String, dynamic>>[
+                {
+                  'id': 'joined',
+                  'name': '主同步目录',
+                  'folder': folder,
+                  'enabled': true,
+                  'existingOnly': true,
+                },
+              ];
+              final opened = await core({
+                'op': 'join',
+                if (invitation != null) 'expected_vault': invitation.vault,
+                'path': path,
+                'password': masterPassword,
+                'bootstrap': bootstrap,
+                'settings': {
+                  'username': username,
+                  'password': appPassword,
+                  'auto': automatic,
+                  'targets': targets,
+                  'joinPending': true,
+                },
+              });
+              if (!canRespond()) {
+                if (mounted) await initialize();
+                return;
+              }
+              if (!foreground) {
+                exists = true;
+                lock();
+                setState(() => message = '已加入密码库，请输入主密码解锁后继续同步。');
+                return;
+              }
+              joined = (
+                session: opened['session'] as String,
+                username: username,
+                appPassword: appPassword,
+                targets: targets,
+              );
+              navigator.pop(true);
+            } catch (error) {
+              if (!canRespond()) return;
+              final detail = friendly(error);
+              final step = readingCloud ? '读取云端密码库' : '验证主密码或保存本机密码库';
+              if (!readingCloud && await File(path!).exists()) {
+                if (!canRespond()) return;
+                exists = true;
+                lock();
+                setState(() => message = '$step失败。$detail');
+                return;
+              }
+              if (canRespond()) setLocal(() => joinError = '$step失败。$detail');
+            } finally {
+              if (canRespond() && joined == null) {
+                setLocal(() => submitting = false);
+              }
+            }
+          }
+
           Widget field(
             String label,
             IconData icon, {
@@ -2251,7 +2388,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                 label: label,
                 child: TextFormField(
                   controller: fields[label],
-                  obscureText: obscure,
+                  enabled: !submitting,
+                  readOnly: invitation != null && label == '同步目录名',
+                  obscureText: obscure && !revealed.contains(label),
                   autocorrect: false,
                   enableSuggestions: !obscure,
                   style: TextStyle(fontSize: 12.8, color: c.textPrimary),
@@ -2263,6 +2402,26 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                       minWidth: 36,
                       minHeight: 36,
                     ),
+                    suffixIcon: obscure
+                        ? IconButton(
+                            tooltip: revealed.contains(label)
+                                ? '隐藏$label'
+                                : '显示$label',
+                            icon: Icon(
+                              revealed.contains(label)
+                                  ? Icons.visibility_off_outlined
+                                  : Icons.visibility_outlined,
+                              size: 17,
+                            ),
+                            onPressed: submitting
+                                ? null
+                                : () => setLocal(() {
+                                    if (!revealed.remove(label)) {
+                                      revealed.add(label);
+                                    }
+                                  }),
+                          )
+                        : null,
                   ),
                   validator: (value) => (value == null || value.trim().isEmpty)
                       ? '请填写$label'
@@ -2272,100 +2431,111 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
             );
           }
 
-          return WDialog(
-            width: 470,
-            icon: Icons.cloud_download_outlined,
-            title: '加入已有密码库',
-            subtitle: invitation == null
-                ? '输入坚果云 WebDAV 凭据与备份目录，使用原密码库的主密码完成加入。'
-                : '邀请指向目录 /${invitation.folder}/，输入凭据与原库主密码即可加入。',
-            scrollable: false,
-            bodyPadding: const EdgeInsets.fromLTRB(20, 10, 20, 16),
-            footer: WDialogFooter(
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(context, false),
-                  child: const Text('取消'),
-                ),
-                FilledButton(
-                  onPressed: () {
-                    if (form.currentState!.validate()) {
-                      Navigator.pop(context, true);
-                    }
-                  },
-                  child: const Text('加入密码库'),
-                ),
-              ],
-            ),
-            child: Form(
-              key: form,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  field(
-                    '坚果云账号',
-                    Icons.alternate_email_rounded,
-                    hint: 'name@example.com',
+          return PopScope(
+            canPop: !submitting,
+            child: WDialog(
+              width: 470,
+              icon: Icons.cloud_download_outlined,
+              title: '加入已有密码库',
+              subtitle: invitation == null
+                  ? '输入坚果云 WebDAV 凭据与备份目录，使用原密码库的主密码完成加入。'
+                  : '邀请指向目录 /${invitation.folder}/，输入凭据与原库主密码即可加入。',
+              bodyPadding: const EdgeInsets.fromLTRB(20, 10, 20, 16),
+              footer: WDialogFooter(
+                actions: [
+                  TextButton(
+                    onPressed: submitting
+                        ? null
+                        : () => Navigator.pop(context, false),
+                    child: const Text('取消'),
                   ),
-                  field(
-                    'WebDAV 应用密码',
-                    Icons.key_outlined,
-                    obscure: true,
-                    hint: '坚果云「安全选项」中生成',
-                  ),
-                  field('同步目录名', Icons.folder_outlined, hint: '坚果云中的备份目录'),
-                  field(
-                    '已有库的主密码',
-                    Icons.lock_outline_rounded,
-                    obscure: true,
-                    hint: '原密码库的主密码',
-                  ),
-                  const SizedBox(height: 2),
-                  Container(
-                    padding: const EdgeInsets.fromLTRB(10, 4, 6, 4),
-                    decoration: BoxDecoration(
-                      color: c.surfaceMuted,
-                      borderRadius: BorderRadius.circular(WRadius.sm),
-                    ),
-                    child: Row(
-                      children: [
-                        Icon(
-                          Icons.schedule_rounded,
-                          size: 15,
-                          color: c.textSecondary,
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                '自动同步',
-                                style: TextStyle(
-                                  fontSize: 12.2,
-                                  fontWeight: FontWeight.w600,
-                                  color: c.textPrimary,
-                                ),
-                              ),
-                              Text(
-                                '仅在前台解锁时运行',
-                                style: TextStyle(
-                                  fontSize: 10.8,
-                                  color: c.textTertiary,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        Switch.adaptive(
-                          value: automatic,
-                          onChanged: (v) => setLocal(() => automatic = v),
-                        ),
-                      ],
-                    ),
+                  FilledButton(
+                    onPressed: submitting ? null : submit,
+                    child: Text(submitting ? '正在加入…' : '加入密码库'),
                   ),
                 ],
+              ),
+              child: Form(
+                key: form,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    field(
+                      '坚果云账号',
+                      Icons.alternate_email_rounded,
+                      hint: 'name@example.com',
+                    ),
+                    field(
+                      'WebDAV 应用密码',
+                      Icons.key_outlined,
+                      obscure: true,
+                      hint: '坚果云「安全选项」中生成',
+                    ),
+                    field(
+                      '同步目录名',
+                      Icons.folder_outlined,
+                      hint: '仅填写目录名或粘贴复制的目录名',
+                    ),
+                    field(
+                      '已有库的主密码',
+                      Icons.lock_outline_rounded,
+                      obscure: true,
+                      hint: '原密码库的主密码',
+                    ),
+                    const SizedBox(height: 2),
+                    Container(
+                      padding: const EdgeInsets.fromLTRB(10, 4, 6, 4),
+                      decoration: BoxDecoration(
+                        color: c.surfaceMuted,
+                        borderRadius: BorderRadius.circular(WRadius.sm),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.schedule_rounded,
+                            size: 15,
+                            color: c.textSecondary,
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  '自动同步',
+                                  style: TextStyle(
+                                    fontSize: 12.2,
+                                    fontWeight: FontWeight.w600,
+                                    color: c.textPrimary,
+                                  ),
+                                ),
+                                Text(
+                                  '仅在前台解锁时运行',
+                                  style: TextStyle(
+                                    fontSize: 10.8,
+                                    color: c.textTertiary,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          Switch.adaptive(
+                            value: automatic,
+                            onChanged: submitting
+                                ? null
+                                : (v) => setLocal(() => automatic = v),
+                          ),
+                        ],
+                      ),
+                    ),
+                    if (joinError case final error?)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 12),
+                        child: WNote(tone: WTone.danger, child: Text(error)),
+                      ),
+                  ],
+                ),
               ),
             ),
           );
@@ -2374,57 +2544,26 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     );
     final accepted = await Navigator.of(context).push(dialog);
     await dialog.completed;
-    final username = fields['坚果云账号']!.text.trim();
-    final appPassword = fields['WebDAV 应用密码']!.text;
-    final folder = fields['同步目录名']!.text.trim();
-    final masterPassword = fields['已有库的主密码']!.text;
     for (final field in fields.values) {
       field.clear();
       field.dispose();
     }
-    if (accepted != true || !mounted || epoch != generation || exists) return;
+    final result = joined;
+    if (accepted != true ||
+        result == null ||
+        !mounted ||
+        epoch != generation ||
+        exists) {
+      return;
+    }
+    if (!foreground) {
+      exists = true;
+      lock();
+      setState(() => message = '已加入密码库，请输入主密码解锁后继续同步。');
+      return;
+    }
     await action(() async {
-      final reader = NutstoreSync(File(path!).parent, request);
-      activeSync = reader;
-      final String bootstrap;
-      try {
-        bootstrap = await reader.readExistingBootstrap(
-          username,
-          appPassword,
-          folder,
-        );
-      } finally {
-        if (identical(activeSync, reader)) activeSync = null;
-      }
-      if (!mounted || epoch != generation) return;
-      final targets = [
-        {
-          'id': 'joined',
-          'name': '主同步目录',
-          'folder': folder,
-          'enabled': true,
-          'existingOnly': true,
-        },
-      ];
-      final opened = await core({
-        'op': 'join',
-        if (invitation != null) 'expected_vault': invitation.vault,
-        'path': path,
-        'password': masterPassword,
-        'bootstrap': bootstrap,
-        'settings': {
-          'username': username,
-          'password': appPassword,
-          'auto': automatic,
-          'targets': targets,
-          'joinPending': true,
-        },
-      });
-      if (!mounted || epoch != generation) {
-        if (mounted) await initialize();
-        return;
-      }
-      token = opened['session'] as String;
+      token = result.session;
       exists = true;
       pendingInvite = null;
       touch();
@@ -2432,9 +2571,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       await loadAuto();
       await runSync(
         automatic: false,
-        username: username,
-        password: appPassword,
-        targetsOverride: targets,
+        username: result.username,
+        password: result.appPassword,
+        targetsOverride: result.targets,
       );
     });
   }
