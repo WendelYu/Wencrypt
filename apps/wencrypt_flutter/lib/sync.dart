@@ -127,6 +127,7 @@ final _revisionFile = RegExp(r'^[0-9a-f]{64}\.wenc$');
 final _packFile = RegExp(r'^[0-9a-f]{64}\.pack$');
 final _bucketName = RegExp(r'^[01][0-9a-f]$');
 const recoveryFileName = 'wencrypt-recovery.wenrecover';
+const _bootstrapLockName = 'bootstrap-update-lock';
 
 Set<String> parseDavListing(
   List<int> bytes,
@@ -182,6 +183,7 @@ Set<String> parseDavListing(
       DavContents.vault =>
         name == 'bootstrap.wenc' ||
             name == 'packs-v1' ||
+            name == _bootstrapLockName ||
             name == recoveryFileName ||
             _revisionFile.hasMatch(name),
       DavContents.packBuckets => _bucketName.hasMatch(name),
@@ -224,13 +226,15 @@ class NutstoreSync {
   late SyncBudget budget;
   DateTime? last;
   bool cancelled = false;
+  bool _updatingBootstrap = false;
   static final root = Uri.parse('https://dav.jianguoyun.com/dav/');
   static final prop = utf8.encode(
     '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>',
   );
   void cancel() {
     cancelled = true;
-    client.close(force: true);
+    // Let an in-flight password update finish and release its cloud directory.
+    if (!_updatingBootstrap) client.close(force: true);
   }
 
   Future<DavReply> _http(
@@ -289,6 +293,9 @@ class NutstoreSync {
     Set<int> accepted = const {200},
     bool createOnly = false,
     String? ifMatch,
+    bool finishingBootstrap = false,
+    bool prepaid = false,
+    void Function()? onDispatch,
   }) async {
     try {
       if (uri.scheme != 'https' ||
@@ -300,11 +307,14 @@ class NutstoreSync {
         final remaining = pace - DateTime.now().difference(last!);
         if (remaining > Duration.zero) await Future<void>.delayed(remaining);
       }
-      if (cancelled) throw DavFailure(stage, 'cancelled');
+      if (cancelled && !finishingBootstrap) {
+        throw DavFailure(stage, 'cancelled');
+      }
       final now = DateTime.now().toUtc();
       final month = '${now.year}-${now.month.toString().padLeft(2, '0')}';
-      await budget.reserve(body.length + 2048, limit + 8192);
+      if (!prepaid) await budget.reserve(body.length + 2048, limit + 8192);
       last = DateTime.now();
+      onDispatch?.call();
       final response =
           await (wire?.call(method, uri, body, depth, limit) ??
               _http(
@@ -319,7 +329,9 @@ class NutstoreSync {
       if (response.body.length > limit) {
         throw DavFailure(stage, 'response_limit', response.status);
       }
-      await budget.settleDownload(limit - response.body.length, month);
+      if (!prepaid) {
+        await budget.settleDownload(limit - response.body.length, month);
+      }
       if (!accepted.contains(response.status)) {
         throw DavFailure(
           stage,
@@ -457,6 +469,133 @@ class NutstoreSync {
     );
   }
 
+  Future<Never> _reportBootstrapConflict(
+    String folderName,
+    List<int> body,
+  ) async {
+    final latest = hex(body);
+    final relation = await request('sync_bootstrap_relation', {
+      'bootstrap': latest,
+    });
+    if (relation['same_vault'] != true) {
+      throw const DavFailure('update_bootstrap', 'vault_identity_mismatch');
+    }
+    if (relation['previous'] == true) {
+      throw const DavFailure(
+        'update_bootstrap',
+        'bootstrap_update_unconfirmed',
+      );
+    }
+    throw CloudPasswordChanged('update_bootstrap', latest, folderName);
+  }
+
+  Future<void> _updateBootstrap(
+    Uri folder,
+    String folderName,
+    String observed,
+    List<int> replacement,
+  ) async {
+    const limit = 8192;
+    final file = folder.resolve('bootstrap.wenc');
+    final lock = folder.resolve('$_bootstrapLockName/');
+    final intended = hex(replacement);
+    var releaseLock = false;
+    var completed = false;
+    _updatingBootstrap = true;
+    try {
+      // Reserve cleanup before creating the directory, even near the quota.
+      try {
+        await budget.reserve(2048, limit + 8192);
+      } on FileSystemException {
+        throw const DavFailure('lock_bootstrap', 'local_budget_storage_failed');
+      } on StateError catch (error) {
+        throw DavFailure(
+          'lock_bootstrap',
+          error.message == 'free_budget_reached'
+              ? 'free_budget_reached'
+              : 'local_state_failed',
+        );
+      }
+      final claim = await send(
+        'lock_bootstrap',
+        'MKCOL',
+        lock,
+        limit: limit,
+        accepted: {201, 405},
+      );
+      if (claim.status != 201) {
+        throw const DavFailure('lock_bootstrap', 'bootstrap_update_busy');
+      }
+      releaseLock = true;
+      final fresh = await send('verify_bootstrap', 'GET', file, limit: limit);
+      final current = hex(fresh.body);
+      if (current != intended) {
+        if (current != observed) {
+          await _reportBootstrapConflict(folderName, fresh.body);
+        }
+        final etag = fresh.etag;
+        try {
+          await send(
+            'update_bootstrap',
+            'PUT',
+            file,
+            body: replacement,
+            ifMatch: etag != null && RegExp(r'^"[!#-~]+"$').hasMatch(etag)
+                ? etag
+                : null,
+            limit: limit,
+            accepted: {200, 201, 204, 412},
+            // An unacknowledged PUT could still commit. Keep the lock then.
+            onDispatch: () => releaseLock = false,
+          );
+          releaseLock = true;
+        } on DavFailure catch (error) {
+          if (releaseLock) rethrow;
+          throw DavFailure(
+            'update_bootstrap',
+            'bootstrap_write_uncertain',
+            error.status,
+          );
+        }
+        final verified = await send(
+          'verify_bootstrap',
+          'GET',
+          file,
+          limit: limit,
+          finishingBootstrap: true,
+        );
+        if (hex(verified.body) != intended) {
+          await _reportBootstrapConflict(folderName, verified.body);
+        }
+      }
+      completed = true;
+    } finally {
+      try {
+        if (releaseLock) {
+          await send(
+            'unlock_bootstrap',
+            'DELETE',
+            lock,
+            limit: limit,
+            accepted: {200, 204, 404},
+            finishingBootstrap: true,
+            prepaid: true,
+          );
+        }
+      } on DavFailure {
+        if (completed) {
+          throw const DavFailure(
+            'unlock_bootstrap',
+            'bootstrap_lock_cleanup_failed',
+          );
+        }
+      } finally {
+        _updatingBootstrap = false;
+        if (cancelled) client.close(force: true);
+      }
+    }
+  }
+
   Iterable<List<String>> _packGroups(Map<String, int> objects) sync* {
     var size = 4;
     var group = <String>[];
@@ -577,44 +716,7 @@ class NutstoreSync {
           }
           throw const DavFailure('verify_bootstrap', 'vault_identity_mismatch');
         }
-        final etag = remote.etag;
-        if (etag == null || !RegExp(r'^"[!#-~]+"$').hasMatch(etag)) {
-          throw const DavFailure('update_bootstrap', 'strong_etag_required');
-        }
-        await send(
-          'update_bootstrap',
-          'PUT',
-          folder.resolve('bootstrap.wenc'),
-          body: bootstrap,
-          ifMatch: etag,
-          limit: 8192,
-          accepted: {200, 201, 204, 412},
-        );
-        final verified = await send(
-          'verify_bootstrap',
-          'GET',
-          folder.resolve('bootstrap.wenc'),
-          limit: 8192,
-        );
-        if (hex(verified.body) != hex(bootstrap)) {
-          final latest = hex(verified.body);
-          final relation = await request('sync_bootstrap_relation', {
-            'bootstrap': latest,
-          });
-          if (relation['same_vault'] != true) {
-            throw const DavFailure(
-              'update_bootstrap',
-              'vault_identity_mismatch',
-            );
-          }
-          if (relation['previous'] == true) {
-            throw const DavFailure(
-              'update_bootstrap',
-              'bootstrap_update_unconfirmed',
-            );
-          }
-          throw CloudPasswordChanged('update_bootstrap', latest, folderName);
-        }
+        await _updateBootstrap(folder, folderName, remoteBootstrap, bootstrap);
       }
       await remembered.writeAsString('bound', flush: true);
       final names = await _list(folder, DavContents.vault);

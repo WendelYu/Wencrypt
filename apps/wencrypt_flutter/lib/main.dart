@@ -310,6 +310,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
         'cloud_password_changed' => '云端主密码已有更新，请输入新主密码后继续同步。',
         'bootstrap_update_unconfirmed' => '未能确认云端主密码更新，请重新同步。',
         'strong_etag_required' => '本机主密码已更新，云端未提供可用于安全更新的文件版本标识。',
+        'bootstrap_update_busy' => '云端主密码正在更新，或上次更新中断。请稍后再同步。',
+        'bootstrap_write_uncertain' => '未收到云端主密码写入确认，已保留更新锁。请查看使用说明。',
+        'bootstrap_lock_cleanup_failed' => '云端主密码已更新，更新锁暂未清除。请查看使用说明。',
         'vault_identity_mismatch' => '所选目录属于另一个密码库。请核对原设备的同步目录。',
         'free_budget_reached' => '已达到本机同步额度，已传输内容会保留，请稍后继续。',
         'directory_limit' => '坚果云单个目录达到列举上限，同步已暂停。',
@@ -2066,6 +2069,35 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     }
   }
 
+  Widget _masterPasswordField({
+    required TextEditingController controller,
+    required String label,
+    required String? Function(String?) validator,
+  }) {
+    var revealed = false;
+    return StatefulBuilder(
+      builder: (context, setFieldState) => TextFormField(
+        controller: controller,
+        obscureText: !revealed,
+        enableSuggestions: false,
+        autocorrect: false,
+        decoration: InputDecoration(
+          labelText: label,
+          suffixIcon: IconButton(
+            tooltip: revealed ? '隐藏$label' : '显示$label',
+            icon: Icon(
+              revealed
+                  ? Icons.visibility_off_outlined
+                  : Icons.visibility_outlined,
+            ),
+            onPressed: () => setFieldState(() => revealed = !revealed),
+          ),
+        ),
+        validator: validator,
+      ),
+    );
+  }
+
   Future<void> _changeMasterPassword({bool adopt = false}) async {
     if (token == null || busy || syncing) return;
     touch();
@@ -2096,25 +2128,17 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                   ),
                   const SizedBox(height: 14),
                   if (!adopt) ...[
-                    TextFormField(
+                    _masterPasswordField(
                       controller: old,
-                      obscureText: true,
-                      enableSuggestions: false,
-                      autocorrect: false,
-                      decoration: const InputDecoration(labelText: '当前主密码'),
+                      label: '当前主密码',
                       validator: (value) =>
                           value?.isNotEmpty == true ? null : '请输入当前主密码',
                     ),
                     const SizedBox(height: 10),
                   ],
-                  TextFormField(
+                  _masterPasswordField(
                     controller: password,
-                    obscureText: true,
-                    enableSuggestions: false,
-                    autocorrect: false,
-                    decoration: InputDecoration(
-                      labelText: adopt ? '云端主密码' : '新主密码',
-                    ),
+                    label: adopt ? '云端主密码' : '新主密码',
                     validator: (value) =>
                         (value ?? '').runes.length >= (adopt ? 1 : 12)
                         ? null
@@ -2124,12 +2148,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                   ),
                   if (!adopt) ...[
                     const SizedBox(height: 10),
-                    TextFormField(
+                    _masterPasswordField(
                       controller: confirmation,
-                      obscureText: true,
-                      enableSuggestions: false,
-                      autocorrect: false,
-                      decoration: const InputDecoration(labelText: '确认新主密码'),
+                      label: '确认新主密码',
                       validator: (value) =>
                           value == password.text ? null : '两次输入不一致',
                     ),
@@ -2830,6 +2851,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
 
   Future<void> sync({bool configure = false}) => action(() async {
     if (token == null || syncing) return;
+    touch();
     final epoch = generation;
     final existing =
         (await request('sync_settings_get'))['settings']
@@ -2837,11 +2859,38 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     if (!mounted || epoch != generation) return;
     final savedCredentials = _hasSyncCredentials(existing);
     if (!configure && savedCredentials) {
+      final targets = _normalizeTargets(existing!['targets']);
+      final enabled = targets.where((target) => target['enabled'] == true);
+      if (enabled.isEmpty) {
+        setState(() => message = '请先在「坚果云设置」启用一个同步目录。');
+        return;
+      }
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('同步到坚果云？'),
+          scrollable: true,
+          content: Text(
+            '将与以下目录双向同步加密数据：\n${enabled.map(_targetFolder).join('\n')}',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('确认同步'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true || !mounted || epoch != generation) return;
       await runSync(
         automatic: false,
-        username: existing!['username'] as String,
+        username: existing['username'] as String,
         password: existing['password'] as String,
-        targetsOverride: _normalizeTargets(existing['targets']),
+        targetsOverride: targets,
       );
       return;
     }

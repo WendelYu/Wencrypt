@@ -2,10 +2,95 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:wencrypt/design/wencrypt_theme.dart';
 import 'package:wencrypt/main.dart';
 import 'package:wencrypt/sync.dart';
 
 void main() {
+  testWidgets('manual sync lists enabled folders and can be cancelled', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: wencryptTheme(Brightness.light),
+        home: const VaultPage(
+          preview: VaultPreview(
+            unlocked: true,
+            syncConfigured: true,
+            syncTargets: [
+              {'folder': 'fixture-active', 'enabled': true},
+              {'folder': 'fixture-disabled', 'enabled': false},
+            ],
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('立即同步'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    final dialog = find.byType(AlertDialog);
+    expect(find.text('同步到坚果云？'), findsOneWidget);
+    expect(
+      find.descendant(
+        of: dialog,
+        matching: find.textContaining('fixture-active'),
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: dialog,
+        matching: find.textContaining('fixture-disabled'),
+      ),
+      findsNothing,
+    );
+    await tester.tap(find.widgetWithText(TextButton, '取消'));
+    await tester.pumpAndSettle();
+    expect(dialog, findsNothing);
+    expect(find.byTooltip('正在同步…'), findsNothing);
+  });
+
+  testWidgets('each change-password field can reveal and hide its own value', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: wencryptTheme(Brightness.light),
+        home: const VaultPage(preview: VaultPreview(unlocked: true)),
+      ),
+    );
+    await tester.tap(find.byTooltip('设置'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('修改主密码'));
+    await tester.pumpAndSettle();
+    final fields = find.descendant(
+      of: find.byType(AlertDialog),
+      matching: find.byType(EditableText),
+    );
+    expect(tester.widgetList<EditableText>(fields).map((e) => e.obscureText), [
+      true,
+      true,
+      true,
+    ]);
+    await tester.enterText(fields.at(1), 'fixture-only password');
+    await tester.tap(find.byTooltip('显示新主密码'));
+    await tester.pumpAndSettle();
+    expect(tester.widgetList<EditableText>(fields).map((e) => e.obscureText), [
+      true,
+      false,
+      true,
+    ]);
+    await tester.tap(find.byTooltip('隐藏新主密码'));
+    await tester.pumpAndSettle();
+    final field = tester.widget<EditableText>(fields.at(1));
+    expect(field.obscureText, isTrue);
+    expect(field.controller.text, 'fixture-only password');
+    await tester.tap(find.widgetWithText(TextButton, '取消'));
+    await tester.pumpAndSettle();
+  });
+
   testWidgets('first launch separates creation and joining', (tester) async {
     await tester.pumpWidget(const WencryptApp());
     await tester.pumpAndSettle();

@@ -110,100 +110,168 @@ class _FakeVault {
 String _hash(int value) => value.toRadixString(16).padLeft(64, '0');
 
 void main() {
-  test('password rotation requires a version tag and refuses to overwrite a competing change', () async {
-    final dir = await Directory.systemTemp.createTemp('wencrypt-rewrap-test');
-    addTearDown(() => dir.delete(recursive: true));
-    final calls = <String>[];
-    String? version;
-    var conflicting = false;
-    var remote = <int>[1, 2];
-    NutstoreSync client() => NutstoreSync(
-      dir,
-      (op, [args = const {}]) async {
-        if (op == 'sync_bootstrap_relation') {
-          final candidate = args['bootstrap'];
-          return {
-            'same_vault': ['0102', '0506'].contains(candidate),
-            'previous': candidate == '0102',
-          };
-        }
-        return {
-          'vault': '0123456789abcdef0123456789abcdef',
-          'bootstrap': '0304',
-          'objects': <String, int>{},
-        };
-      },
-      pace: Duration.zero,
-      wire: (method, uri, body, depth, limit) async {
-        calls.add(method);
-        if (method == 'GET') return DavReply(200, remote, etag: version);
-        if (method == 'PUT') {
-          expect(body, [3, 4]);
-          if (conflicting) {
-            remote = [5, 6];
-            return DavReply(412, []);
+  test(
+    'password rotation with no strong ETag locks and verifies the cloud update',
+    () async {
+      final dir = await Directory.systemTemp.createTemp('wencrypt-rewrap-test');
+      addTearDown(() => dir.delete(recursive: true));
+      final calls = <String>[];
+      String? version;
+      var changeBeforeReread = false;
+      var conflictDuringPut = false;
+      var uncertainWrite = false;
+      var lockHeld = false;
+      var remote = <int>[1, 2];
+      NutstoreSync client() => NutstoreSync(
+        dir,
+        (op, [args = const {}]) async {
+          if (op == 'sync_bootstrap_relation') {
+            final candidate = args['bootstrap'];
+            return {
+              'same_vault': ['0102', '0506'].contains(candidate),
+              'previous': candidate == '0102',
+            };
           }
-          remote = body;
-          return DavReply(204, []);
-        }
-        return DavReply(
-          207,
-          utf8.encode(listing(uri.path, ['bootstrap.wenc'])),
-        );
-      },
-    );
-    await expectLater(
-      client().sync('fixture', 'fixture'),
-      throwsA(
-        isA<DavFailure>().having(
-          (e) => e.reason,
-          'reason',
-          'strong_etag_required',
+          return {
+            'vault': '0123456789abcdef0123456789abcdef',
+            'bootstrap': '0304',
+            'objects': <String, int>{},
+          };
+        },
+        pace: Duration.zero,
+        wire: (method, uri, body, depth, limit) async {
+          calls.add(method);
+          if (method == 'GET') return DavReply(200, remote, etag: version);
+          if (method == 'MKCOL' || method == 'DELETE') {
+            expect(uri.path, endsWith('/bootstrap-update-lock/'));
+            if (method == 'DELETE') {
+              expect(lockHeld, isTrue);
+              lockHeld = false;
+              return DavReply(204, []);
+            }
+            if (lockHeld) return DavReply(405, []);
+            lockHeld = true;
+            if (changeBeforeReread) remote = [5, 6];
+            return DavReply(201, []);
+          }
+          if (method == 'PUT') {
+            expect(lockHeld, isTrue);
+            expect(body, [3, 4]);
+            if (uncertainWrite) {
+              throw const SocketException('fixture disconnect');
+            }
+            if (conflictDuringPut) {
+              remote = [5, 6];
+              return DavReply(412, []);
+            }
+            remote = body;
+            return DavReply(204, []);
+          }
+          return DavReply(
+            207,
+            utf8.encode(listing(uri.path, ['bootstrap.wenc'])),
+          );
+        },
+      );
+      expect((await client().sync('fixture', 'fixture')).complete, isTrue);
+      expect(remote, [3, 4]);
+      expect(lockHeld, isFalse);
+      expect(
+        calls,
+        containsAllInOrder(['MKCOL', 'GET', 'PUT', 'GET', 'DELETE']),
+      );
+
+      calls.clear();
+      remote = [1, 2];
+      changeBeforeReread = true;
+      await expectLater(
+        client().sync('fixture', 'fixture', remoteFolder: 'shared'),
+        throwsA(
+          isA<CloudPasswordChanged>()
+              .having((e) => e.bootstrap, 'bootstrap', '0506')
+              .having((e) => e.folder, 'folder', 'shared'),
         ),
-      ),
-    );
-    expect(calls, isNot(contains('PUT')));
-    version = '"old-strong-etag"';
-    conflicting = true;
-    await expectLater(
-      client().sync('fixture', 'fixture', remoteFolder: 'shared'),
-      throwsA(
-        isA<CloudPasswordChanged>()
-            .having((e) => e.bootstrap, 'bootstrap', '0506')
-            .having((e) => e.folder, 'folder', 'shared'),
-      ),
-    );
-    expect(remote, [5, 6]);
-    calls.clear();
-    await expectLater(
-      client().sync('fixture', 'fixture'),
-      throwsA(isA<CloudPasswordChanged>()),
-    );
-    expect(calls, isNot(contains('PUT')));
-    conflicting = false;
-    remote = [7, 8];
-    await expectLater(
-      client().sync('fixture', 'fixture', recoveringPassword: true),
-      throwsA(
-        isA<DavFailure>().having(
-          (failure) => failure.reason,
-          'reason',
-          'vault_identity_mismatch',
+      );
+      expect(lockHeld, isFalse);
+      expect(calls, isNot(contains('PUT')));
+
+      remote = [1, 2];
+      changeBeforeReread = false;
+      version = '"old-strong-etag"';
+      conflictDuringPut = true;
+      await expectLater(
+        client().sync('fixture', 'fixture', remoteFolder: 'shared'),
+        throwsA(
+          isA<CloudPasswordChanged>()
+              .having((e) => e.bootstrap, 'bootstrap', '0506')
+              .having((e) => e.folder, 'folder', 'shared'),
         ),
-      ),
-    );
-    expect(calls, isNot(contains('PUT')));
-    remote = [5, 6];
-    expect(
-      (await client().sync(
-        'fixture',
-        'fixture',
-        recoveringPassword: true,
-      )).complete,
-      isTrue,
-    );
-    expect(remote, [3, 4]);
-  });
+      );
+      expect(remote, [5, 6]);
+      expect(lockHeld, isFalse);
+      calls.clear();
+      await expectLater(
+        client().sync('fixture', 'fixture'),
+        throwsA(isA<CloudPasswordChanged>()),
+      );
+      expect(calls, isNot(contains('PUT')));
+      conflictDuringPut = false;
+      remote = [7, 8];
+      await expectLater(
+        client().sync('fixture', 'fixture', recoveringPassword: true),
+        throwsA(
+          isA<DavFailure>().having(
+            (failure) => failure.reason,
+            'reason',
+            'vault_identity_mismatch',
+          ),
+        ),
+      );
+      expect(calls, isNot(contains('PUT')));
+      remote = [5, 6];
+      version = 'W/"weak-etag"';
+      expect(
+        (await client().sync(
+          'fixture',
+          'fixture',
+          recoveringPassword: true,
+        )).complete,
+        isTrue,
+      );
+      expect(remote, [3, 4]);
+
+      calls.clear();
+      remote = [1, 2];
+      uncertainWrite = true;
+      await expectLater(
+        client().sync('fixture', 'fixture'),
+        throwsA(
+          isA<DavFailure>().having(
+            (e) => e.reason,
+            'reason',
+            'bootstrap_write_uncertain',
+          ),
+        ),
+      );
+      expect(lockHeld, isTrue);
+      expect(calls, isNot(contains('DELETE')));
+
+      calls.clear();
+      uncertainWrite = false;
+      await expectLater(
+        client().sync('fixture', 'fixture'),
+        throwsA(
+          isA<DavFailure>().having(
+            (e) => e.reason,
+            'reason',
+            'bootstrap_update_busy',
+          ),
+        ),
+      );
+      expect(calls, isNot(contains('PUT')));
+      expect(calls, isNot(contains('DELETE')));
+    },
+  );
 
   test(
     'DAV accepts collection without final slash and rejects partial responses',
