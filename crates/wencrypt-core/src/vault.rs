@@ -148,7 +148,10 @@ fn install(
         sql(tx.commit())?;
         sql(db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);"))?;
         db.close().map_err(|_| "storage_failed")?;
-        std::fs::File::open(&temporary)
+        // FlushFileBuffers on Windows requires a handle with write access.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&temporary)
             .and_then(|f| f.sync_all())
             .map_err(|_| "storage_failed")?;
         std::fs::hard_link(&temporary, path).map_err(|error| match error.kind() {

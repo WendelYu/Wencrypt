@@ -76,6 +76,9 @@ jobs:
         working-directory: apps/wencrypt_flutter
       - run: flutter test --no-pub
         working-directory: apps/wencrypt_flutter
+      - name: Verify native vault creation and joining on Windows
+        if: matrix.target == 'windows'
+        run: cargo test -p wencrypt-core --release --locked --target ${{ matrix.rust-target }} vault::tests::rotates_password_without_changing_vault_and_peers_must_authenticate -- --exact
       - name: Check macOS probe failure paths
         if: matrix.target == 'macos'
         run: |
