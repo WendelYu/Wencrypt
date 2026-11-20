@@ -196,11 +196,40 @@ Set<String> parseDavListing(
   return names;
 }
 
+enum SyncMode {
+  manual,
+  notify,
+  automatic;
+
+  static SyncMode fromSettings(Map<String, dynamic>? settings) =>
+      switch (settings?['syncMode']) {
+        'manual' => manual,
+        'notify' => notify,
+        'automatic' => automatic,
+        _ => settings?['auto'] == true ? automatic : manual,
+      };
+}
+
+Duration syncPollInterval({required int failures, required int idleRounds}) {
+  final minutes = failures > 0
+      ? 30 * (1 << (failures.clamp(1, 4) - 1))
+      : 15 * (1 << idleRounds.clamp(0, 2));
+  return Duration(minutes: minutes);
+}
+
 class SyncReport {
-  const SyncReport(this.uploaded, this.downloaded, {this.complete = true});
+  const SyncReport(
+    this.uploaded,
+    this.downloaded, {
+    this.complete = true,
+    this.remoteChanges = false,
+    this.localChanges = false,
+  });
 
   final int uploaded, downloaded;
-  final bool complete;
+  final bool complete, remoteChanges, localChanges;
+  bool get hasChanges =>
+      uploaded != 0 || downloaded != 0 || remoteChanges || localChanges;
 
   String get message =>
       '本轮上传 $uploaded、下载 $downloaded。'
@@ -621,6 +650,7 @@ class NutstoreSync {
     String? remoteFolder,
     bool existingOnly = false,
     bool recoveringPassword = false,
+    bool checkOnly = false,
     Future<void> Function(SyncReport report)? onProgress,
   }) async {
     _configure(username, password);
@@ -653,6 +683,7 @@ class NutstoreSync {
         if (existingOnly || await remembered.exists()) {
           throw DavFailure('read_bootstrap', 'remote_missing', remote.status);
         }
+        if (checkOnly) return const SyncReport(0, 0, localChanges: true);
         // Nutstore can return 409 for a file inside a missing collection.
         // Confirm the directory is new or empty before writing the bootstrap.
         final made = await send(
@@ -700,6 +731,7 @@ class NutstoreSync {
           );
         }
       }
+      var bootstrapChanged = false;
       if (hex(remote.body) != hex(bootstrap)) {
         final remoteBootstrap = hex(remote.body);
         final relation = await request('sync_bootstrap_relation', {
@@ -716,9 +748,19 @@ class NutstoreSync {
           }
           throw const DavFailure('verify_bootstrap', 'vault_identity_mismatch');
         }
-        await _updateBootstrap(folder, folderName, remoteBootstrap, bootstrap);
+        bootstrapChanged = true;
+        if (!checkOnly) {
+          await _updateBootstrap(
+            folder,
+            folderName,
+            remoteBootstrap,
+            bootstrap,
+          );
+        }
       }
-      await remembered.writeAsString('bound', flush: true);
+      if (!await remembered.exists()) {
+        await remembered.writeAsString('bound', flush: true);
+      }
       final names = await _list(folder, DavContents.vault);
       if (!names.contains('bootstrap.wenc')) {
         throw const DavFailure('list', 'bootstrap_missing');
@@ -745,6 +787,9 @@ class NutstoreSync {
         }
       }
 
+      var remoteChanges = names
+          .where(_revisionFile.hasMatch)
+          .any((file) => !known.contains(file.substring(0, 64)));
       if (remotePacks.isNotEmpty) {
         final receipts =
             (await request('sync_receipts', {
@@ -755,6 +800,10 @@ class NutstoreSync {
           final receipt = receipts[pack.key];
           if (receipt is List && receipt.every(known.contains)) {
             packed.addAll(receipt.cast<String>());
+            continue;
+          }
+          if (checkOnly) {
+            remoteChanges = true;
             continue;
           }
           final response = await send(
@@ -774,6 +823,15 @@ class NutstoreSync {
           packed.addAll(hashes);
           await progress();
         }
+      }
+      if (checkOnly) {
+        return SyncReport(
+          0,
+          0,
+          remoteChanges: remoteChanges,
+          localChanges:
+              bootstrapChanged || local.keys.any((id) => !packed.contains(id)),
+        );
       }
 
       // Existing flat objects remain readable. Publish them in packs too so
@@ -831,7 +889,7 @@ class NutstoreSync {
         uploaded += group.length;
         await progress();
       }
-      return SyncReport(uploaded, downloaded);
+      return SyncReport(uploaded, downloaded, localChanges: bootstrapChanged);
     } catch (e) {
       if (e is DavFailure &&
           e.reason == 'free_budget_reached' &&

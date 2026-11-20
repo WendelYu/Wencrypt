@@ -110,6 +110,99 @@ class _FakeVault {
 String _hash(int value) => value.toRadixString(16).padLeft(64, '0');
 
 void main() {
+  test('sync mode keeps existing settings and backs off when idle', () {
+    expect(SyncMode.fromSettings(null), SyncMode.manual);
+    expect(SyncMode.fromSettings({'auto': false}), SyncMode.manual);
+    expect(SyncMode.fromSettings({'auto': true}), SyncMode.automatic);
+    expect(
+      SyncMode.fromSettings({'auto': true, 'syncMode': 'notify'}),
+      SyncMode.notify,
+    );
+    expect(
+      [
+        for (final rounds in [0, 1, 2, 3])
+          syncPollInterval(failures: 0, idleRounds: rounds).inMinutes,
+      ],
+      [15, 30, 60, 60],
+    );
+    expect(syncPollInterval(failures: 4, idleRounds: 0).inMinutes, 240);
+  });
+
+  test('read-only checks detect new packs inside an existing bucket', () async {
+    final fixture = await Directory.systemTemp.createTemp('wencrypt-dav-check');
+    addTearDown(() => fixture.delete(recursive: true));
+    final dav = _MemoryDav();
+    final source = _FakeVault()..objects.add(_hash(1));
+    final peer = _FakeVault();
+    final first = await fixture.createTemp('source');
+    final second = await fixture.createTemp('peer');
+    final bucket = '/dav/shared/packs-v1/01/';
+
+    Future<SyncReport> run(
+      Directory directory,
+      _FakeVault vault, {
+      bool checkOnly = false,
+      String folder = 'shared',
+    }) => NutstoreSync(
+      directory,
+      vault.request,
+      wire: dav.wire,
+      pace: Duration.zero,
+    ).sync('fixture', 'fixture', remoteFolder: folder, checkOnly: checkOnly);
+
+    expect((await run(first, source)).uploaded, 1);
+    expect((await run(second, peer)).downloaded, 1);
+    dav.calls.clear();
+    expect((await run(second, peer, checkOnly: true)).hasChanges, isFalse);
+    expect(dav.calls, [
+      ('PROPFIND', '/dav/'),
+      ('GET', '/dav/shared/bootstrap.wenc'),
+      ('PROPFIND', '/dav/shared/'),
+      ('PROPFIND', '/dav/shared/packs-v1/'),
+      ('PROPFIND', bucket),
+    ]);
+
+    // A peer using the current pack format adds a file to the same bucket.
+    source.objects.add(_hash(33));
+    expect((await run(first, source)).uploaded, 1);
+    peer.objects.add(_hash(2));
+    dav.calls.clear();
+    final noticed = await run(second, peer, checkOnly: true);
+    expect(noticed.remoteChanges, isTrue);
+    expect(noticed.localChanges, isTrue);
+    expect(noticed.uploaded + noticed.downloaded, 0);
+    expect(peer.objects, {_hash(1), _hash(2)});
+    expect(dav.calls.where((call) => call.$1 != 'PROPFIND'), [
+      ('GET', '/dav/shared/bootstrap.wenc'),
+    ]);
+
+    final applied = await run(second, peer);
+    expect(applied.downloaded, 1);
+    expect(applied.uploaded, 1);
+    expect((await run(first, source)).downloaded, 1);
+    expect(source.objects, {_hash(1), _hash(2), _hash(33)});
+    expect(peer.objects, source.objects);
+
+    final legacy = '/dav/shared/${_hash(4)}.wenc';
+    dav.files[legacy] = [42];
+    dav.calls.clear();
+    expect((await run(second, peer, checkOnly: true)).remoteChanges, isTrue);
+    expect(dav.calls, isNot(contains(('GET', legacy))));
+
+    dav.calls.clear();
+    expect(
+      (await run(
+        second,
+        peer,
+        checkOnly: true,
+        folder: 'uninitialized',
+      )).localChanges,
+      isTrue,
+    );
+    expect(dav.calls.map((call) => call.$1), ['PROPFIND', 'GET']);
+    expect(dav.directories, isNot(contains('/dav/uninitialized/')));
+  });
+
   test(
     'password rotation with no strong ETag locks and verifies the cloud update',
     () async {
@@ -173,6 +266,15 @@ void main() {
           );
         },
       );
+      final pending = await client().sync(
+        'fixture',
+        'fixture',
+        checkOnly: true,
+      );
+      expect(pending.localChanges, isTrue);
+      expect(remote, [1, 2]);
+      expect(calls, isNot(contains(anyOf('MKCOL', 'PUT', 'DELETE'))));
+      calls.clear();
       expect((await client().sync('fixture', 'fixture')).complete, isTrue);
       expect(remote, [3, 4]);
       expect(lockHeld, isFalse);

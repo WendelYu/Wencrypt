@@ -148,15 +148,55 @@ fn install(
         sql(tx.commit())?;
         sql(db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);"))?;
         db.close().map_err(|_| "storage_failed")?;
-        std::fs::File::open(&temporary)
+        // FlushFileBuffers on Windows requires a handle with write access.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&temporary)
             .and_then(|f| f.sync_all())
             .map_err(|_| "storage_failed")?;
-        std::fs::hard_link(&temporary, path).map_err(|_| "install_failed_or_exists")?;
+        publish_database(&temporary, path).map_err(|error| match error.kind() {
+            std::io::ErrorKind::AlreadyExists => "vault_already_exists",
+            std::io::ErrorKind::PermissionDenied => "install_permission_denied",
+            std::io::ErrorKind::Unsupported => "install_filesystem_unsupported",
+            _ => "install_failed",
+        })?;
         Ok(())
     })();
     let _ = std::fs::remove_file(&temporary);
     result
 }
+
+#[cfg(not(target_os = "android"))]
+fn publish_database(temporary: &str, path: &str) -> std::io::Result<()> {
+    std::fs::hard_link(temporary, path)
+}
+
+#[cfg(target_os = "android")]
+fn publish_database(temporary: &str, path: &str) -> std::io::Result<()> {
+    use std::{ffi::CString, io};
+
+    let temporary = CString::new(temporary).map_err(io::Error::from)?;
+    let path = CString::new(path).map_err(io::Error::from)?;
+    // Android's app sandbox disallows hard links. The kernel can atomically
+    // rename a staged file without replacing the destination, including on
+    // API 29, where bionic does not yet export the renameat2 wrapper.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            temporary.as_ptr(),
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::RENAME_NOREPLACE as libc::c_uint,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 fn bootstrap(db: &Connection) -> Result<Vec<u8>> {
     sql(db.query_row(
         "SELECT value FROM metadata WHERE key='bootstrap'",
@@ -863,14 +903,22 @@ impl Vault {
             }
             let joined_key = if op == "join" {
                 let b = hex::decode(field(v, "bootstrap")?).map_err(|_| "invalid_bootstrap")?;
-                let key = crypto(envelope::unlock_bootstrap(password, &b))?;
-                let id = crypto(envelope::parse(&b))?.0.vault_id;
+                let header = envelope::parse(&b).map_err(|_| "invalid_bootstrap")?.0;
+                if header.kind != Kind::Bootstrap {
+                    return Err("invalid_bootstrap");
+                }
+                let id = header.vault_id;
                 if v["expected_vault"]
                     .as_str()
                     .is_some_and(|expected| expected != hex::encode(id))
                 {
                     return Err("invitation_vault_mismatch");
                 }
+                let key =
+                    envelope::unlock_bootstrap(password, &b).map_err(|error| match error {
+                        envelope::Error::Authentication => "join_master_password_invalid",
+                        _ => "invalid_bootstrap",
+                    })?;
                 let settings = v
                     .get("settings")
                     .map(|settings| sealed_sync_settings(&key, &id, settings))
@@ -1905,7 +1953,7 @@ mod tests {
             "bootstrap":inventory["bootstrap"],
             "settings":{"username":"fixture@example.com","password":"fixture-app-password","joinPending":true}
         });
-        assert!(second.command(&join).is_err());
+        assert_eq!(second.command(&join), Err("join_master_password_invalid"));
         assert!(!path.exists());
         join["password"] = json!(password);
         let second_opened = second.command(&join).unwrap();

@@ -4,11 +4,11 @@ Wencrypt 是一款离线优先的个人密码管理器，支持 macOS、Windows 
 
 ## 下载与安装
 
-从 [GitHub Releases](https://github.com/WendelYu/Wencrypt/releases/latest) 下载对应安装包。每次发布附带 `SHA256SUMS.txt`，可用于核对下载完整性。
+从 [GitHub Releases](https://github.com/WendelYu/Wencrypt/releases/latest) 下载对应安装包。从 0.3.6 起，安装包文件名含版本号。每次发布附带 `SHA256SUMS.txt`，可用于核对下载完整性。
 
-- **macOS（Apple 芯片）**使用 `wencrypt-macos-arm64.dmg`。将 Wencrypt 拖到「应用程序」后打开。当前版本尚未经过 Apple 公证。遇到「已损坏」或无法打开时，请查看 DMG 内的「首次打开帮助.html」。[Apple 官方首次打开说明](https://support.apple.com/zh-cn/102445)
-- **Windows（x64）**使用 `wencrypt-windows-x64.zip`。完整解压后运行 `wencrypt.exe`。
-- **Android（ARM64）**使用 `wencrypt-android-arm64-debug.apk`。APK 使用开发签名。如果系统提示签名不匹配，请先确认可恢复的加密备份或已同步的云端副本，再处理旧版安装。
+- **macOS（Apple 芯片）**下载以 `-macos-arm64.dmg` 结尾的文件。将 Wencrypt 拖到「应用程序」后打开。当前版本尚未经过 Apple 公证。遇到「已损坏」或无法打开时，请查看 DMG 内的「首次打开帮助.html」。[Apple 官方首次打开说明](https://support.apple.com/zh-cn/102445)
+- **Windows（x64）**下载以 `-windows-x64.zip` 结尾的文件。完整解压后运行 `wencrypt.exe`。密码库保存在当前 Windows 用户的 `%APPDATA%\org.wencrypt\wencrypt`，同一用户解压并打开新版即可继续使用。
+- **Android（ARM64）**下载以 `-android-arm64-debug.apk` 结尾的文件。APK 使用开发签名。如果系统提示签名不匹配，请先确认可恢复的加密备份或已同步的云端副本，再处理旧版安装。
 
 ## 首次使用与跨设备同步
 
@@ -25,8 +25,9 @@ Wencrypt 是一款离线优先的个人密码管理器，支持 macOS、Windows 
 ## 功能与状态
 
 - 本地新增、搜索和分组，支持置顶、回收站批量清除及查看历史版本。
-- 导入浏览器 CSV，相同凭据会合并，手动添加的监听目录会在本机保留。单条账号可导出为图片，电脑复制到剪贴板，Android 保存到相册。
+- 导入浏览器 CSV，相同凭据会合并，手动添加的监听目录会在本机保留。单条账号可导出为图片或文字。文字在三端都复制到剪贴板，图片在电脑端复制到剪贴板、在 Android 保存到相册。
 - 坚果云同步支持分批传输与后续轮次续传。同步记录在本机加密保存，可查看时间、目录、上传和下载修订数、失败原因，并复制目录名。
+- 同一密码库的每台设备可单独选择手动、仅提醒或自动同步。前台检查发现云端更新后可手动确认，自动模式空闲时会降低检查频率。同一条账号发生并发修改时保留两份版本供处理。
 - 桌面可用 `⌘K` 或 `Ctrl+K` 打开命令面板，用 `⌘F` 或 `Ctrl+F` 搜索密码库。
 - 本机密码库使用 Argon2id 和 AES-256-GCM。支持独立加密备份，macOS 和 Android 支持本机指纹解锁及授权导出备份。
 - 0.3.0 已通过模拟 WebDAV 的三库大批量同步测试。真实坚果云与三端实机验收仍在进行，项目尚未完成独立安全审计。

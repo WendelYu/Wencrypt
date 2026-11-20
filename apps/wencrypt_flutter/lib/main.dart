@@ -12,7 +12,7 @@ import 'browser_import.dart';
 import 'core.dart';
 import 'design/wencrypt_theme.dart';
 import 'design/wencrypt_widgets.dart';
-import 'entry_image.dart';
+import 'entry_export.dart';
 import 'probe_page.dart' show WencryptProbeApp;
 import 'sync.dart';
 import 'sync_history.dart';
@@ -78,6 +78,7 @@ class VaultPage extends StatefulWidget {
 /// constructs this, and it never reaches the encryption or sync layers.
 class VaultPreview {
   const VaultPreview({
+    this.exists = true,
     this.unlocked = false,
     this.trash = false,
     this.showSyncHistory = false,
@@ -89,7 +90,7 @@ class VaultPreview {
     this.message = '本地加密 · 离线可用',
   });
 
-  final bool unlocked;
+  final bool exists, unlocked;
   final bool trash;
   final bool showSyncHistory;
   final List<Map<String, dynamic>> entries;
@@ -118,6 +119,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   bool showSyncHistory = false;
   int syncHistoryRevision = 0;
   String? runningSyncRecord;
+  bool remoteUpdateAvailable = false;
   bool cloudUpdatePending = false;
   bool _cloudPasswordPromptOpen = false;
   VaultInvite? pendingInvite;
@@ -138,9 +140,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   List<Map<String, dynamic>> entries = [];
   List<Map<String, dynamic>> syncTargets = [];
   Timer? idle, clipboard, autoTimer;
+  SyncMode syncMode = SyncMode.manual;
   bool biometricEnabled = false,
       authenticating = false,
-      autoEnabled = false,
       syncConfigured = false,
       syncing = false;
   bool foreground = true;
@@ -155,7 +157,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     if (widget.preview case final VaultPreview preview) {
       token = preview.unlocked ? 'preview' : null;
       path = '/preview/wencrypt.db';
-      exists = true;
+      exists = preview.exists;
       trash = preview.trash;
       showSyncHistory = preview.showSyncHistory;
       entries = preview.entries;
@@ -228,6 +230,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     foreground = state == AppLifecycleState.resumed;
+    if (!foreground) autoTimer?.cancel();
+    // There is no vault session to lock while filling out first-run forms.
+    if (!exists && token == null) return;
     if (state == AppLifecycleState.inactive && authenticating) return;
     final isDesktop =
         Platform.isMacOS || Platform.isWindows || Platform.isLinux;
@@ -316,6 +321,10 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
         'vault_identity_mismatch' => '所选目录属于另一个密码库。请核对原设备的同步目录。',
         'free_budget_reached' => '已达到本机同步额度，已传输内容会保留，请稍后继续。',
         'directory_limit' => '坚果云单个目录达到列举上限，同步已暂停。',
+        'timeout' => '连接坚果云超时，请检查网络后重试。',
+        'network_failed' => '无法连接坚果云，请检查网络后重试。',
+        'tls_failed' => '无法验证坚果云的安全连接，请检查网络或系统时间。',
+        'local_budget_storage_failed' => '无法保存本机同步记录，请检查磁盘空间和应用数据目录权限。',
         _ when e.status == 401 || e.status == 403 =>
           '坚果云验证失败。请核对账号、WebDAV 应用密码和目录权限。',
         _ => e.toString(),
@@ -330,6 +339,30 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       return '无法确认恢复文件属于这台设备的密码库。';
     }
     if (text.contains('invitation_vault_mismatch')) return '邀请链接和云端密码库不匹配。';
+    if (text.contains('join_master_password_invalid')) {
+      return '无法用该主密码打开云端密码库。若刚修改主密码，请确认原设备已成功同步。';
+    }
+    if (text.contains('invalid_bootstrap')) {
+      return '云端引导文件无法识别或已损坏。请核对原设备使用的同步目录。';
+    }
+    if (text.contains('install_permission_denied')) {
+      return '系统拒绝写入本机密码库。请检查应用的数据目录权限。';
+    }
+    if (text.contains('install_filesystem_unsupported')) {
+      return '应用的数据目录所在磁盘不支持当前的密码库安装方式。';
+    }
+    if (text.contains('install_failed') || text.contains('storage_failed')) {
+      return '无法保存或打开本机密码库。请检查应用数据目录的权限和磁盘空间。';
+    }
+    if (text.contains('core_library_unavailable')) {
+      return '加密组件无法加载。请使用对应系统的完整安装包，Windows 版需完整解压。';
+    }
+    if (text.contains('core_platform_unsupported')) {
+      return '此系统不支持当前 Wencrypt 安装包。';
+    }
+    if (text.contains('invalid_settings')) {
+      return '本机无法保存坚果云设置，请核对账号和 WebDAV 应用密码。';
+    }
     if (text.contains('vault_identity_mismatch')) return '所选目录属于另一个密码库。';
     if (text.contains('sync_credentials_required')) {
       return '请先保存同步使用的坚果云账号和 WebDAV 应用密码。';
@@ -550,14 +583,15 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   }
 
   Future<void> loadAuto() async {
+    final current = generation;
     final settings =
         (await request('sync_settings_get'))['settings']
             as Map<String, dynamic>?;
-    if (!mounted) return;
+    if (!mounted || current != generation) return;
     setState(() {
       syncConfigured = _hasSyncCredentials(settings);
       syncUsername = settings?['username'] as String?;
-      autoEnabled = syncConfigured && settings?['auto'] == true;
+      syncMode = SyncMode.fromSettings(settings);
       initialSyncPending = settings?['joinPending'] == true;
       if (initialSyncPending) message = '本机已加入已有库，首次同步尚未完成';
       syncTargets = settings == null
@@ -567,13 +601,17 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     scheduleAuto();
   }
 
-  void scheduleAuto() {
+  void scheduleAuto([Duration delay = const Duration(seconds: 30)]) {
     autoTimer?.cancel();
-    if (!autoEnabled || token == null || !foreground) return;
-    autoTimer = Timer(
-      const Duration(seconds: 30),
-      () => runSync(automatic: true),
-    );
+    if (!mounted ||
+        !syncConfigured ||
+        syncMode == SyncMode.manual ||
+        !syncTargets.any((target) => target['enabled'] == true) ||
+        token == null ||
+        !foreground) {
+      return;
+    }
+    autoTimer = Timer(delay, () => runSync(automatic: true));
   }
 
   String _targetFolder(Map<String, dynamic> target) {
@@ -623,34 +661,55 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     String? password,
     List<Map<String, dynamic>>? targetsOverride,
   }) async {
-    if (syncing ||
+    if (!mounted ||
+        syncing ||
         token == null ||
         !foreground ||
-        (automatic && !autoEnabled)) {
+        (automatic && (!syncConfigured || syncMode == SyncMode.manual))) {
       return;
     }
-    setState(() {
-      syncing = true;
-      message = '正在连接坚果云…';
-    });
+    final checkOnly = automatic && syncMode == SyncMode.notify;
+    autoTimer?.cancel();
+    setState(() => syncing = true);
     final current = generation;
     final stateFile = File('${File(path!).parent.path}/auto-sync-state.json');
     var failures = 0;
+    var idleRounds = 0;
     bool attempted = false;
     DateTime? next;
     CloudPasswordChanged? passwordUpdate;
+    Future<void> persistCooldown(Duration delay) async {
+      final temporary = File('${stateFile.path}.$pid.tmp');
+      await temporary.writeAsString(
+        jsonEncode({
+          'next': DateTime.now().toUtc().add(delay).toIso8601String(),
+          'failures': failures,
+          'idleRounds': idleRounds,
+        }),
+        flush: true,
+      );
+      await temporary.rename(stateFile.path);
+    }
+
     try {
       if (await stateFile.exists()) {
-        final state =
-            jsonDecode(await stateFile.readAsString()) as Map<String, dynamic>;
-        failures = state['failures'] as int? ?? 0;
-        next = DateTime.tryParse(state['next'] as String? ?? '');
+        try {
+          final state = jsonDecode(await stateFile.readAsString());
+          if (state is Map) {
+            if (state['failures'] case final int saved) failures = saved;
+            if (state['idleRounds'] case final int saved) idleRounds = saved;
+            if (state['next'] case final String saved) {
+              next = DateTime.tryParse(saved);
+            }
+          }
+        } on FormatException {
+          // Recover incomplete cooldown files left by older versions. The
+          // separate per-request budget still applies.
+        }
       }
-      if (automatic && next != null && next.isAfter(DateTime.now().toUtc())) {
-        autoTimer = Timer(
-          next.difference(DateTime.now().toUtc()),
-          () => runSync(automatic: true),
-        );
+      final now = DateTime.now().toUtc();
+      if (automatic && next != null && next.isAfter(now)) {
+        scheduleAuto(next.difference(now));
         return;
       }
       if (busy && automatic) {
@@ -684,27 +743,34 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
         return;
       }
       if (current != generation) return;
+      setState(() => message = checkOnly ? '正在检查云端更新…' : '正在连接坚果云…');
       attempted = true;
       // Persist cooldown before network I/O so relaunching does not bypass pacing.
-      await stateFile.writeAsString(
-        jsonEncode({
-          'next': DateTime.now()
-              .toUtc()
-              .add(const Duration(minutes: 15))
-              .toIso8601String(),
-          'failures': failures,
-        }),
-        flush: true,
-      );
+      await persistCooldown(const Duration(minutes: 15));
       if (current != generation || !foreground) return;
 
       final summaries = <String>[];
       var complete = true;
+      var changed = false;
+      var foundRemoteUpdates = false;
+      var foundLocalUpdates = false;
       for (final target in enabledTargets) {
         if (current != generation || !foreground) return;
         final syncClient = NutstoreSync(File(path!).parent, request);
         activeSync = syncClient;
         final folder = (target['folder'] as String? ?? '').trim();
+        if (checkOnly) {
+          final result = await syncClient.sync(
+            username,
+            password,
+            remoteFolder: folder.isEmpty ? null : folder,
+            existingOnly: target['existingOnly'] == true,
+            checkOnly: true,
+          );
+          foundRemoteUpdates |= result.remoteChanges;
+          foundLocalUpdates |= result.localChanges;
+          continue;
+        }
         String? recordId;
         try {
           final started = await request('sync_history_start', {
@@ -745,6 +811,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
             current,
           );
           summaries.add('${target['name']} · ${res.message}');
+          changed |= res.hasChanges;
           complete &= res.complete;
         } catch (error) {
           final issue = error is DavFailure
@@ -767,8 +834,23 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
           }
         }
       }
-      if (current != generation) return;
+      if (!mounted || current != generation) return;
+      failures = 0;
+      if (checkOnly) {
+        // Repeated checks of the same pending changes stay at the idle cadence.
+        idleRounds = (idleRounds + 1).clamp(0, 2);
+        setState(() {
+          remoteUpdateAvailable = foundRemoteUpdates;
+          message = foundRemoteUpdates
+              ? '云端有更新，点击「立即同步」更新本机。'
+              : foundLocalUpdates
+              ? '本机有待上传的改动，点击「立即同步」更新云端。'
+              : '云端暂无待同步的更新。';
+        });
+        return;
+      }
       await refresh();
+      if (!mounted || current != generation) return;
       if (initialSyncPending &&
           complete &&
           pendingRevisions == 0 &&
@@ -782,18 +864,22 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
           initialSyncPending = false;
         }
       }
-      failures = 0;
+      idleRounds = automatic && complete && !changed
+          ? (idleRounds + 1).clamp(0, 2)
+          : 0;
       if (mounted && current == generation) {
-        setState(
-          () => message = [
+        setState(() {
+          if (complete && pendingRevisions == 0) remoteUpdateAvailable = false;
+          message = [
             ...summaries,
             if (initialSyncPending) '首次同步尚未完成',
             if (pendingRevisions > 0) '存在缺失的历史版本',
-          ].join('\n'),
-        );
+          ].join('\n');
+        });
       }
     } catch (e) {
       failures = (failures + 1).clamp(1, 4);
+      idleRounds = 0;
       if (current == generation && mounted) {
         if (e is CloudPasswordChanged) {
           passwordUpdate = e;
@@ -815,33 +901,22 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       username = null;
       password = null;
       activeSync = null;
+      if (attempted && current == generation) {
+        final delay = syncPollInterval(
+          failures: failures,
+          idleRounds: idleRounds,
+        );
+        try {
+          await persistCooldown(delay);
+          if (current == generation) scheduleAuto(delay);
+        } catch (_) {
+          if (current == generation) autoTimer?.cancel();
+        }
+      }
       if (mounted) {
         setState(() => syncing = false);
       } else {
         syncing = false;
-      }
-      if (attempted && current == generation) {
-        final minutes = failures == 0 ? 15 : 30 * (1 << (failures - 1));
-        try {
-          await stateFile.writeAsString(
-            jsonEncode({
-              'next': DateTime.now()
-                  .toUtc()
-                  .add(Duration(minutes: minutes))
-                  .toIso8601String(),
-              'failures': failures,
-            }),
-            flush: true,
-          );
-        } catch (_) {
-          autoEnabled = false;
-        }
-        if (autoEnabled && token != null && foreground) {
-          autoTimer = Timer(
-            Duration(minutes: minutes),
-            () => runSync(automatic: true),
-          );
-        }
       }
     }
     if (promptForPasswordUpdate &&
@@ -858,7 +933,8 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     await request('sync_settings_clear');
     autoTimer?.cancel();
     setState(() {
-      autoEnabled = false;
+      syncMode = SyncMode.manual;
+      remoteUpdateAvailable = false;
       syncConfigured = false;
       syncUsername = null;
       syncTargets = [];
@@ -1775,33 +1851,52 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _exportEntryImage(Map<String, dynamic> data) async {
+  Future<void> _exportEntry(Map<String, dynamic> data) async {
     final epoch = generation;
     final toAlbum = Platform.isAndroid;
     touch();
-    final png = await showDialog<Uint8List>(
+    final format = await showDialog<EntryExportFormat>(
       context: context,
-      builder: (_) => EntryImageDialog(entry: data, toAlbum: toAlbum),
+      barrierDismissible: false,
+      builder: (_) => EntryExportDialog(
+        entry: data,
+        toAlbum: toAlbum,
+        onCopyText: (text) async {
+          if (!mounted || epoch != generation) {
+            throw PlatformException(code: 'locked');
+          }
+          await copy(text, label: '账号文字');
+        },
+        onExportImage: (png) async {
+          for (var attempt = 0; ; attempt++) {
+            if (!mounted || epoch != generation) {
+              throw PlatformException(code: 'locked');
+            }
+            try {
+              final copied = await entryImage.invokeMethod<bool>(
+                toAlbum ? 'savePng' : 'copyPng',
+                png,
+              );
+              if (copied != true) {
+                throw PlatformException(code: 'image_export_failed');
+              }
+              return;
+            } on PlatformException catch (error) {
+              if (error.code != 'clipboard_busy' || attempt == 4) rethrow;
+              await Future<void>.delayed(const Duration(milliseconds: 60));
+            }
+          }
+        },
+      ),
     );
-    if (png == null) return;
-    try {
-      if (!mounted || epoch != generation || busy) return;
-      await action(() async {
-        final saved = await entryImage.invokeMethod<bool>(
-          toAlbum ? 'savePng' : 'copyPng',
-          png,
-        );
-        if (saved != true) throw StateError('image_export_failed');
-        if (mounted && epoch == generation) {
-          final result = toAlbum ? '图片已保存到 Wencrypt 相册' : '图片已复制到剪贴板';
-          setState(() => message = result);
-          ScaffoldMessenger.of(context)
-              .showSnackBar(SnackBar(content: Text(result)));
-        }
-      });
-    } finally {
-      png.fillRange(0, png.length, 0);
+    if (format == null || !mounted || epoch != generation) return;
+    if (format == EntryExportFormat.text) {
+      setState(() => message = '账号文字已复制到剪贴板');
+      return;
     }
+    final result = toAlbum ? '图片已保存到 Wencrypt 相册' : '图片已复制到剪贴板';
+    setState(() => message = result);
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(result)));
   }
 
   Future<void> restore() async {
@@ -2233,12 +2328,119 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       '已有库的主密码': TextEditingController(),
     };
     final form = GlobalKey<FormState>();
-    var automatic = true;
+    var mode = SyncMode.notify;
+    var submitting = false;
+    final revealed = <String>{};
+    String? joinError;
+    ({
+      String session,
+      String username,
+      String appPassword,
+      List<Map<String, dynamic>> targets,
+    })?
+    joined;
     final dialog = DialogRoute<bool>(
       context: context,
+      barrierDismissible: false,
       builder: (context) => StatefulBuilder(
         builder: (context, setLocal) {
           final c = WColors.of(context);
+          bool canRespond() =>
+              mounted && context.mounted && epoch == generation;
+
+          Future<void> submit() async {
+            if (submitting || !foreground || !form.currentState!.validate()) {
+              return;
+            }
+            final navigator = Navigator.of(context);
+            final username = fields['坚果云账号']!.text.trim();
+            final appPassword = fields['WebDAV 应用密码']!.text;
+            final folder = invitation?.folder ?? fields['同步目录名']!.text.trim();
+            final masterPassword = fields['已有库的主密码']!.text;
+            setLocal(() {
+              submitting = true;
+              joinError = null;
+            });
+            var readingCloud = true;
+            try {
+              final reader = NutstoreSync(File(path!).parent, request);
+              activeSync = reader;
+              final String bootstrap;
+              try {
+                bootstrap = await reader.readExistingBootstrap(
+                  username,
+                  appPassword,
+                  folder,
+                );
+              } finally {
+                if (identical(activeSync, reader)) activeSync = null;
+              }
+              if (!canRespond()) return;
+              if (!foreground) {
+                setLocal(() => joinError = '已读取云端密码库，请返回 Wencrypt 后再点加入。');
+                return;
+              }
+              readingCloud = false;
+              final targets = <Map<String, dynamic>>[
+                {
+                  'id': 'joined',
+                  'name': '主同步目录',
+                  'folder': folder,
+                  'enabled': true,
+                  'existingOnly': true,
+                },
+              ];
+              final opened = await core({
+                'op': 'join',
+                if (invitation != null) 'expected_vault': invitation.vault,
+                'path': path,
+                'password': masterPassword,
+                'bootstrap': bootstrap,
+                'settings': {
+                  'username': username,
+                  'password': appPassword,
+                  'syncMode': mode.name,
+                  'auto': mode == SyncMode.automatic,
+                  'targets': targets,
+                  'joinPending': true,
+                },
+              });
+              if (!canRespond()) {
+                if (mounted) await initialize();
+                return;
+              }
+              if (!foreground) {
+                exists = true;
+                lock();
+                setState(() => message = '已加入密码库，请输入主密码解锁后继续同步。');
+                return;
+              }
+              joined = (
+                session: opened['session'] as String,
+                username: username,
+                appPassword: appPassword,
+                targets: targets,
+              );
+              navigator.pop(true);
+            } catch (error) {
+              if (!canRespond()) return;
+              final detail = friendly(error);
+              final step = readingCloud ? '读取云端密码库' : '验证主密码或保存本机密码库';
+              if (!readingCloud && await File(path!).exists()) {
+                if (!canRespond()) return;
+                exists = true;
+                lock();
+                setState(() => message = '$step失败。$detail');
+                return;
+              }
+              if (canRespond()) setLocal(() => joinError = '$step失败。$detail');
+            } finally {
+              if (canRespond() && joined == null) {
+                setLocal(() => submitting = false);
+              }
+            }
+          }
+
           Widget field(
             String label,
             IconData icon, {
@@ -2251,7 +2453,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                 label: label,
                 child: TextFormField(
                   controller: fields[label],
-                  obscureText: obscure,
+                  enabled: !submitting,
+                  readOnly: invitation != null && label == '同步目录名',
+                  obscureText: obscure && !revealed.contains(label),
                   autocorrect: false,
                   enableSuggestions: !obscure,
                   style: TextStyle(fontSize: 12.8, color: c.textPrimary),
@@ -2263,6 +2467,26 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                       minWidth: 36,
                       minHeight: 36,
                     ),
+                    suffixIcon: obscure
+                        ? IconButton(
+                            tooltip: revealed.contains(label)
+                                ? '隐藏$label'
+                                : '显示$label',
+                            icon: Icon(
+                              revealed.contains(label)
+                                  ? Icons.visibility_off_outlined
+                                  : Icons.visibility_outlined,
+                              size: 17,
+                            ),
+                            onPressed: submitting
+                                ? null
+                                : () => setLocal(() {
+                                    if (!revealed.remove(label)) {
+                                      revealed.add(label);
+                                    }
+                                  }),
+                          )
+                        : null,
                   ),
                   validator: (value) => (value == null || value.trim().isEmpty)
                       ? '请填写$label'
@@ -2272,100 +2496,70 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
             );
           }
 
-          return WDialog(
-            width: 470,
-            icon: Icons.cloud_download_outlined,
-            title: '加入已有密码库',
-            subtitle: invitation == null
-                ? '输入坚果云 WebDAV 凭据与备份目录，使用原密码库的主密码完成加入。'
-                : '邀请指向目录 /${invitation.folder}/，输入凭据与原库主密码即可加入。',
-            scrollable: false,
-            bodyPadding: const EdgeInsets.fromLTRB(20, 10, 20, 16),
-            footer: WDialogFooter(
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(context, false),
-                  child: const Text('取消'),
-                ),
-                FilledButton(
-                  onPressed: () {
-                    if (form.currentState!.validate()) {
-                      Navigator.pop(context, true);
-                    }
-                  },
-                  child: const Text('加入密码库'),
-                ),
-              ],
-            ),
-            child: Form(
-              key: form,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  field(
-                    '坚果云账号',
-                    Icons.alternate_email_rounded,
-                    hint: 'name@example.com',
+          return PopScope(
+            canPop: !submitting,
+            child: WDialog(
+              width: 470,
+              icon: Icons.cloud_download_outlined,
+              title: '加入已有密码库',
+              subtitle: invitation == null
+                  ? '输入坚果云 WebDAV 凭据与备份目录，使用原密码库的主密码完成加入。'
+                  : '邀请指向目录 /${invitation.folder}/，输入凭据与原库主密码即可加入。',
+              bodyPadding: const EdgeInsets.fromLTRB(20, 10, 20, 16),
+              footer: WDialogFooter(
+                actions: [
+                  TextButton(
+                    onPressed: submitting
+                        ? null
+                        : () => Navigator.pop(context, false),
+                    child: const Text('取消'),
                   ),
-                  field(
-                    'WebDAV 应用密码',
-                    Icons.key_outlined,
-                    obscure: true,
-                    hint: '坚果云「安全选项」中生成',
-                  ),
-                  field('同步目录名', Icons.folder_outlined, hint: '坚果云中的备份目录'),
-                  field(
-                    '已有库的主密码',
-                    Icons.lock_outline_rounded,
-                    obscure: true,
-                    hint: '原密码库的主密码',
-                  ),
-                  const SizedBox(height: 2),
-                  Container(
-                    padding: const EdgeInsets.fromLTRB(10, 4, 6, 4),
-                    decoration: BoxDecoration(
-                      color: c.surfaceMuted,
-                      borderRadius: BorderRadius.circular(WRadius.sm),
-                    ),
-                    child: Row(
-                      children: [
-                        Icon(
-                          Icons.schedule_rounded,
-                          size: 15,
-                          color: c.textSecondary,
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                '自动同步',
-                                style: TextStyle(
-                                  fontSize: 12.2,
-                                  fontWeight: FontWeight.w600,
-                                  color: c.textPrimary,
-                                ),
-                              ),
-                              Text(
-                                '仅在前台解锁时运行',
-                                style: TextStyle(
-                                  fontSize: 10.8,
-                                  color: c.textTertiary,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        Switch.adaptive(
-                          value: automatic,
-                          onChanged: (v) => setLocal(() => automatic = v),
-                        ),
-                      ],
-                    ),
+                  FilledButton(
+                    onPressed: submitting ? null : submit,
+                    child: Text(submitting ? '正在加入…' : '加入密码库'),
                   ),
                 ],
+              ),
+              child: Form(
+                key: form,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    field(
+                      '坚果云账号',
+                      Icons.alternate_email_rounded,
+                      hint: 'name@example.com',
+                    ),
+                    field(
+                      'WebDAV 应用密码',
+                      Icons.key_outlined,
+                      obscure: true,
+                      hint: '坚果云「安全选项」中生成',
+                    ),
+                    field(
+                      '同步目录名',
+                      Icons.folder_outlined,
+                      hint: '仅填写目录名或粘贴复制的目录名',
+                    ),
+                    field(
+                      '已有库的主密码',
+                      Icons.lock_outline_rounded,
+                      obscure: true,
+                      hint: '原密码库的主密码',
+                    ),
+                    const SizedBox(height: 2),
+                    _syncModePicker(
+                      mode,
+                      submitting ? null : (v) => setLocal(() => mode = v),
+                    ),
+                    if (joinError case final error?)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 12),
+                        child: WNote(tone: WTone.danger, child: Text(error)),
+                      ),
+                  ],
+                ),
               ),
             ),
           );
@@ -2374,57 +2568,26 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     );
     final accepted = await Navigator.of(context).push(dialog);
     await dialog.completed;
-    final username = fields['坚果云账号']!.text.trim();
-    final appPassword = fields['WebDAV 应用密码']!.text;
-    final folder = fields['同步目录名']!.text.trim();
-    final masterPassword = fields['已有库的主密码']!.text;
     for (final field in fields.values) {
       field.clear();
       field.dispose();
     }
-    if (accepted != true || !mounted || epoch != generation || exists) return;
+    final result = joined;
+    if (accepted != true ||
+        result == null ||
+        !mounted ||
+        epoch != generation ||
+        exists) {
+      return;
+    }
+    if (!foreground) {
+      exists = true;
+      lock();
+      setState(() => message = '已加入密码库，请输入主密码解锁后继续同步。');
+      return;
+    }
     await action(() async {
-      final reader = NutstoreSync(File(path!).parent, request);
-      activeSync = reader;
-      final String bootstrap;
-      try {
-        bootstrap = await reader.readExistingBootstrap(
-          username,
-          appPassword,
-          folder,
-        );
-      } finally {
-        if (identical(activeSync, reader)) activeSync = null;
-      }
-      if (!mounted || epoch != generation) return;
-      final targets = [
-        {
-          'id': 'joined',
-          'name': '主同步目录',
-          'folder': folder,
-          'enabled': true,
-          'existingOnly': true,
-        },
-      ];
-      final opened = await core({
-        'op': 'join',
-        if (invitation != null) 'expected_vault': invitation.vault,
-        'path': path,
-        'password': masterPassword,
-        'bootstrap': bootstrap,
-        'settings': {
-          'username': username,
-          'password': appPassword,
-          'auto': automatic,
-          'targets': targets,
-          'joinPending': true,
-        },
-      });
-      if (!mounted || epoch != generation) {
-        if (mounted) await initialize();
-        return;
-      }
-      token = opened['session'] as String;
+      token = result.session;
       exists = true;
       pendingInvite = null;
       touch();
@@ -2432,9 +2595,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       await loadAuto();
       await runSync(
         automatic: false,
-        username: username,
-        password: appPassword,
-        targetsOverride: targets,
+        username: result.username,
+        password: result.appPassword,
+        targetsOverride: result.targets,
       );
     });
   }
@@ -2849,6 +3012,53 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       '新增 ${result['added']} 个账号，合并重复 ${result['duplicates']} 条'
       '（更新 ${result['updated']} 个现有账号）';
 
+  String _syncModeLabel(SyncMode mode) => switch (mode) {
+    SyncMode.manual => '手动',
+    SyncMode.notify => '仅提醒',
+    SyncMode.automatic => '自动同步',
+  };
+
+  Widget _syncModePicker(SyncMode mode, ValueChanged<SyncMode>? onChanged) {
+    final colors = WColors.of(context);
+    final description = switch (mode) {
+      SyncMode.manual => '平时只在你确认同步时连接坚果云。',
+      SyncMode.notify => '前台解锁时检查云端，确认后传输账号修订。',
+      SyncMode.automatic => '前台解锁时双向同步，空闲时减少检查频率。',
+    };
+    return WLabeledField(
+      label: '本机同步方式',
+      helper: description,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: colors.surfaceMuted,
+          borderRadius: BorderRadius.circular(WRadius.sm),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10),
+          child: DropdownButtonHideUnderline(
+            child: DropdownButton<SyncMode>(
+              value: mode,
+              isExpanded: true,
+              icon: const Icon(Icons.keyboard_arrow_down_rounded, size: 16),
+              items: [
+                for (final option in SyncMode.values)
+                  DropdownMenuItem(
+                    value: option,
+                    child: Text(_syncModeLabel(option)),
+                  ),
+              ],
+              onChanged: onChanged == null
+                  ? null
+                  : (value) {
+                      if (value != null) onChanged(value);
+                    },
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Future<void> sync({bool configure = false}) => action(() async {
     if (token == null || syncing) return;
     touch();
@@ -2899,7 +3109,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       text: existing?['password'] as String?,
     );
     var editCredentials = !savedCredentials;
-    var automatic = existing?['auto'] == true;
+    var mode = existing == null
+        ? SyncMode.notify
+        : SyncMode.fromSettings(existing);
     final targets = _normalizeTargets(existing?['targets'])
         .map((t) => Map<String, dynamic>.from(t))
         .toList();
@@ -2923,7 +3135,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                 ),
                 FilledButton(
                   onPressed: () => Navigator.pop(context, true),
-                  child: const Text('保存并同步'),
+                  child: Text(savedCredentials ? '保存设置' : '保存并同步'),
                 ),
               ],
             ),
@@ -3217,49 +3429,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                     ),
                   ),
                 const SizedBox(height: 6),
-                Container(
-                  padding: const EdgeInsets.fromLTRB(10, 4, 6, 4),
-                  decoration: BoxDecoration(
-                    color: c.surfaceMuted,
-                    borderRadius: BorderRadius.circular(WRadius.sm),
-                  ),
-                  child: Row(
-                    children: [
-                      Icon(
-                        Icons.schedule_rounded,
-                        size: 15,
-                        color: c.textSecondary,
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              '自动同步',
-                              style: TextStyle(
-                                fontSize: 12.2,
-                                fontWeight: FontWeight.w600,
-                                color: c.textPrimary,
-                              ),
-                            ),
-                            Text(
-                              '仅在前台解锁时运行',
-                              style: TextStyle(
-                                fontSize: 10.8,
-                                color: c.textTertiary,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      Switch.adaptive(
-                        value: automatic,
-                        onChanged: (v) => setLocal(() => automatic = v),
-                      ),
-                    ],
-                  ),
-                ),
+                _syncModePicker(mode, (v) => setLocal(() => mode = v)),
               ],
             ),
           );
@@ -3282,7 +3452,8 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       'settings': {
         'username': username,
         'password': appPassword,
-        'auto': automatic,
+        'syncMode': mode.name,
+        'auto': mode == SyncMode.automatic,
         'targets': targets,
         if (initialSyncPending) 'joinPending': true,
       },
@@ -3291,10 +3462,16 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     setState(() {
       syncConfigured = true;
       syncUsername = username;
-      autoEnabled = automatic;
+      syncMode = mode;
+      remoteUpdateAvailable = false;
       syncTargets = targets;
+      if (savedCredentials) message = '已保存本机同步设置';
     });
     autoTimer?.cancel();
+    if (savedCredentials) {
+      scheduleAuto();
+      return;
+    }
     await runSync(
       automatic: false,
       username: username,
@@ -3423,6 +3600,10 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                 color: pending ? c.warning : c.textTertiary,
               ),
             ),
+            if (remoteUpdateAvailable) ...[
+              const SizedBox(width: 6),
+              Text('云端有更新', style: TextStyle(fontSize: 11.5, color: c.brand)),
+            ],
             const SizedBox(width: 6),
             TextButton(
               onPressed: busy || syncing ? null : () => sync(),
@@ -4096,9 +4277,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                                       Platform.isMacOS ||
                                       Platform.isWindows))
                                 WMenuEntry(
-                                  label: '导出账号图片',
+                                  label: '导出账号',
                                   icon: Icons.image_outlined,
-                                  onTap: () => _exportEntryImage(data),
+                                  onTap: () => _exportEntry(data),
                                 ),
                             ],
                           ),

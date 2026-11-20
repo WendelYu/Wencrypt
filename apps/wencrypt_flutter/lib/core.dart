@@ -5,7 +5,7 @@ import 'dart:isolate';
 
 import 'package:ffi/ffi.dart';
 
-String _request(String request) {
+String _requestWithLibrary(String request) {
   final exe = File(Platform.resolvedExecutable);
   final path = switch (Platform.operatingSystem) {
     'macos' => '${exe.parent.parent.path}/Frameworks/libwencrypt_core.dylib',
@@ -48,6 +48,16 @@ String _request(String request) {
   } finally {
     bytes.fillRange(0, bytes.length, 0);
     free(p, bytes.length);
+  }
+}
+
+String _request(String request) {
+  try {
+    return _requestWithLibrary(request);
+  } on ArgumentError {
+    throw StateError('core_library_unavailable');
+  } on UnsupportedError {
+    throw StateError('core_platform_unsupported');
   }
 }
 

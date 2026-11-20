@@ -76,6 +76,27 @@ jobs:
         working-directory: apps/wencrypt_flutter
       - run: flutter test --no-pub
         working-directory: apps/wencrypt_flutter
+      - name: Verify native vault creation and joining on Windows
+        if: matrix.target == 'windows'
+        run: cargo test -p wencrypt-core --release --locked --target ${{ matrix.rust-target }} vault::tests::rotates_password_without_changing_vault_and_peers_must_authenticate -- --exact
+      - name: Verify native Windows image clipboard
+        if: matrix.target == 'windows'
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $studio = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$studio) { throw 'Visual Studio C++ tools not found' }
+          $command = Join-Path $env:RUNNER_TEMP 'wencrypt-clipboard-test.cmd'
+          @"
+          @call "$studio\Common7\Tools\VsDevCmd.bat" -arch=x64
+          @if errorlevel 1 exit /b %errorlevel%
+          @cd /d "$env:RUNNER_TEMP"
+          @cl /nologo /EHsc /W4 /WX /std:c++17 "$env:GITHUB_WORKSPACE\tools\windows_image_clipboard_test.cpp" "$env:GITHUB_WORKSPACE\apps\wencrypt_flutter\windows\runner\image_clipboard.cpp" /Fe:wencrypt-clipboard-test.exe ole32.lib user32.lib uuid.lib windowscodecs.lib
+          @if errorlevel 1 exit /b %errorlevel%
+          @wencrypt-clipboard-test.exe
+          "@ | Set-Content -Path $command -Encoding ascii
+          cmd /d /c $command
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Check macOS probe failure paths
         if: matrix.target == 'macos'
         run: |
@@ -129,17 +150,22 @@ jobs:
           TAG: ${{ steps.version.outputs.tag }}
         working-directory: release-assets
         run: |
-          assets=(wencrypt-macos-arm64.dmg wencrypt-windows-x64.zip wencrypt-android-arm64-debug.apk)
+          assets=()
+          for package in wencrypt-macos-arm64.dmg wencrypt-windows-x64.zip wencrypt-android-arm64-debug.apk; do
+            name="wencrypt-$TAG-${package#wencrypt-}"
+            mv -- "$package" "$name"
+            assets+=("$name")
+          done
           sha256sum "${assets[@]}" > SHA256SUMS.txt
           notes="$RUNNER_TEMP/wencrypt-release-notes.md"
           version_notes="../.github/releases/$TAG.md"
           if [ -f "$version_notes" ]; then
             cat "$version_notes" > "$notes"
             printf '\n\n' >> "$notes"
-            cat ../.github/release-notes.md >> "$notes"
           else
-            cp ../.github/release-notes.md "$notes"
+            : > "$notes"
           fi
+          sed "s/@TAG@/$TAG/g" ../.github/release-notes.md >> "$notes"
           if gh release view "$TAG" --json isDraft --jq '.isDraft' | grep -qx true; then
             previous=$(gh release view "$TAG" --json targetCommitish --jq '.targetCommitish')
             if [ "$previous" != "$GITHUB_SHA" ]; then
