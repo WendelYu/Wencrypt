@@ -1,4 +1,4 @@
-name: Windows clipboard verification package
+name: Cross-platform account export test packages
 on:
   push:
   pull_request:
@@ -19,6 +19,16 @@ jobs:
             target: windows
             rust-target: x86_64-pc-windows-msvc
             artifact: build/p0/wencrypt-windows-x64.zip
+          - os: macos-15
+            target: macos
+            rust-target: aarch64-apple-darwin
+            artifact: |
+              build/p0/wencrypt-macos-arm64.zip
+              build/p0/wencrypt-macos-arm64.dmg
+          - os: ubuntu-latest
+            target: android
+            rust-target: aarch64-linux-android
+            artifact: build/p0/wencrypt-android-arm64-debug.apk
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
