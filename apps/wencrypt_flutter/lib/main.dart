@@ -12,7 +12,7 @@ import 'browser_import.dart';
 import 'core.dart';
 import 'design/wencrypt_theme.dart';
 import 'design/wencrypt_widgets.dart';
-import 'entry_image.dart';
+import 'entry_export.dart';
 import 'probe_page.dart' show WencryptProbeApp;
 import 'sync.dart';
 import 'sync_history.dart';
@@ -1806,16 +1806,23 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _exportEntryImage(Map<String, dynamic> data) async {
+  Future<void> _exportEntry(Map<String, dynamic> data) async {
     final epoch = generation;
     final toAlbum = Platform.isAndroid;
     touch();
-    final saved = await showDialog<bool>(
+    final format = await showDialog<EntryExportFormat>(
       context: context,
-      builder: (_) => EntryImageDialog(
+      barrierDismissible: false,
+      builder: (_) => EntryExportDialog(
         entry: data,
         toAlbum: toAlbum,
-        onExport: (png) async {
+        onCopyText: (text) async {
+          if (!mounted || epoch != generation) {
+            throw PlatformException(code: 'locked');
+          }
+          await copy(text, label: '账号文字');
+        },
+        onExportImage: (png) async {
           for (var attempt = 0; ; attempt++) {
             if (!mounted || epoch != generation) {
               throw PlatformException(code: 'locked');
@@ -1837,7 +1844,11 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
         },
       ),
     );
-    if (saved != true || !mounted || epoch != generation) return;
+    if (format == null || !mounted || epoch != generation) return;
+    if (format == EntryExportFormat.text) {
+      setState(() => message = '账号文字已复制到剪贴板');
+      return;
+    }
     final result = toAlbum ? '图片已保存到 Wencrypt 相册' : '图片已复制到剪贴板';
     setState(() => message = result);
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(result)));
@@ -4243,9 +4254,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                                       Platform.isMacOS ||
                                       Platform.isWindows))
                                 WMenuEntry(
-                                  label: '导出账号图片',
+                                  label: '导出账号',
                                   icon: Icons.image_outlined,
-                                  onTap: () => _exportEntryImage(data),
+                                  onTap: () => _exportEntry(data),
                                 ),
                             ],
                           ),
