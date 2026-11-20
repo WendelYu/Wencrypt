@@ -1810,29 +1810,37 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     final epoch = generation;
     final toAlbum = Platform.isAndroid;
     touch();
-    final png = await showDialog<Uint8List>(
+    final saved = await showDialog<bool>(
       context: context,
-      builder: (_) => EntryImageDialog(entry: data, toAlbum: toAlbum),
+      builder: (_) => EntryImageDialog(
+        entry: data,
+        toAlbum: toAlbum,
+        onExport: (png) async {
+          for (var attempt = 0; ; attempt++) {
+            if (!mounted || epoch != generation) {
+              throw PlatformException(code: 'locked');
+            }
+            try {
+              final copied = await entryImage.invokeMethod<bool>(
+                toAlbum ? 'savePng' : 'copyPng',
+                png,
+              );
+              if (copied != true) {
+                throw PlatformException(code: 'image_export_failed');
+              }
+              return;
+            } on PlatformException catch (error) {
+              if (error.code != 'clipboard_busy' || attempt == 4) rethrow;
+              await Future<void>.delayed(const Duration(milliseconds: 60));
+            }
+          }
+        },
+      ),
     );
-    if (png == null) return;
-    try {
-      if (!mounted || epoch != generation || busy) return;
-      await action(() async {
-        final saved = await entryImage.invokeMethod<bool>(
-          toAlbum ? 'savePng' : 'copyPng',
-          png,
-        );
-        if (saved != true) throw StateError('image_export_failed');
-        if (mounted && epoch == generation) {
-          final result = toAlbum ? '图片已保存到 Wencrypt 相册' : '图片已复制到剪贴板';
-          setState(() => message = result);
-          ScaffoldMessenger.of(context)
-              .showSnackBar(SnackBar(content: Text(result)));
-        }
-      });
-    } finally {
-      png.fillRange(0, png.length, 0);
-    }
+    if (saved != true || !mounted || epoch != generation) return;
+    final result = toAlbum ? '图片已保存到 Wencrypt 相册' : '图片已复制到剪贴板';
+    setState(() => message = result);
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(result)));
   }
 
   Future<void> restore() async {

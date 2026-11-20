@@ -154,7 +154,7 @@ fn install(
             .open(&temporary)
             .and_then(|f| f.sync_all())
             .map_err(|_| "storage_failed")?;
-        std::fs::hard_link(&temporary, path).map_err(|error| match error.kind() {
+        publish_database(&temporary, path).map_err(|error| match error.kind() {
             std::io::ErrorKind::AlreadyExists => "vault_already_exists",
             std::io::ErrorKind::PermissionDenied => "install_permission_denied",
             std::io::ErrorKind::Unsupported => "install_filesystem_unsupported",
@@ -165,6 +165,38 @@ fn install(
     let _ = std::fs::remove_file(&temporary);
     result
 }
+
+#[cfg(not(target_os = "android"))]
+fn publish_database(temporary: &str, path: &str) -> std::io::Result<()> {
+    std::fs::hard_link(temporary, path)
+}
+
+#[cfg(target_os = "android")]
+fn publish_database(temporary: &str, path: &str) -> std::io::Result<()> {
+    use std::{ffi::CString, io};
+
+    let temporary = CString::new(temporary).map_err(io::Error::from)?;
+    let path = CString::new(path).map_err(io::Error::from)?;
+    // Android's app sandbox disallows hard links. The kernel can atomically
+    // rename a staged file without replacing the destination, including on
+    // API 29, where bionic does not yet export the renameat2 wrapper.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            temporary.as_ptr(),
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::RENAME_NOREPLACE as libc::c_uint,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 fn bootstrap(db: &Connection) -> Result<Vec<u8>> {
     sql(db.query_row(
         "SELECT value FROM metadata WHERE key='bootstrap'",

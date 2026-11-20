@@ -79,6 +79,24 @@ jobs:
       - name: Verify native vault creation and joining on Windows
         if: matrix.target == 'windows'
         run: cargo test -p wencrypt-core --release --locked --target ${{ matrix.rust-target }} vault::tests::rotates_password_without_changing_vault_and_peers_must_authenticate -- --exact
+      - name: Verify native Windows image clipboard
+        if: matrix.target == 'windows'
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $studio = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$studio) { throw 'Visual Studio C++ tools not found' }
+          $command = Join-Path $env:RUNNER_TEMP 'wencrypt-clipboard-test.cmd'
+          @"
+          @call "$studio\Common7\Tools\VsDevCmd.bat" -arch=x64
+          @if errorlevel 1 exit /b %errorlevel%
+          @cd /d "$env:RUNNER_TEMP"
+          @cl /nologo /EHsc /W4 /WX /std:c++17 "$env:GITHUB_WORKSPACE\tools\windows_image_clipboard_test.cpp" "$env:GITHUB_WORKSPACE\apps\wencrypt_flutter\windows\runner\image_clipboard.cpp" /Fe:wencrypt-clipboard-test.exe ole32.lib user32.lib uuid.lib windowscodecs.lib
+          @if errorlevel 1 exit /b %errorlevel%
+          @wencrypt-clipboard-test.exe
+          "@ | Set-Content -Path $command -Encoding ascii
+          cmd /d /c $command
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Check macOS probe failure paths
         if: matrix.target == 'macos'
         run: |

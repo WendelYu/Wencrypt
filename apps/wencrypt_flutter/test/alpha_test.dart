@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:wencrypt/design/wencrypt_theme.dart';
@@ -8,6 +9,27 @@ import 'package:wencrypt/main.dart';
 import 'package:wencrypt/sync.dart';
 
 void main() {
+  test('Windows theme keeps Chinese and Latin text in the same UI family', () {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    for (final brightness in Brightness.values) {
+      final theme = wencryptTheme(brightness);
+      expect(theme.textTheme.bodyMedium?.fontFamily, 'Microsoft YaHei UI');
+      expect(theme.textTheme.titleSmall?.fontFamily, 'Microsoft YaHei UI');
+      expect(
+        theme.textTheme.bodySmall?.fontFamilyFallback,
+        contains('Microsoft YaHei'),
+      );
+      final colors = theme.extension<WColors>()!;
+      final fg = colors.textTertiary.computeLuminance();
+      final bg = colors.surfaceMuted.computeLuminance();
+      final contrast = fg > bg
+          ? (fg + 0.05) / (bg + 0.05)
+          : (bg + 0.05) / (fg + 0.05);
+      expect(contrast, greaterThanOrEqualTo(4.5));
+    }
+  });
+
   testWidgets('manual sync lists enabled folders and can be cancelled', (
     tester,
   ) async {

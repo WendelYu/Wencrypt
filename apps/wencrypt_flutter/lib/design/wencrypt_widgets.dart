@@ -905,8 +905,10 @@ class _WCommandMenuState extends State<WCommandMenu> {
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: theme.textTheme.bodyMedium?.copyWith(
-                fontSize: 12.5,
-                fontWeight: FontWeight.w500,
+                fontSize: theme.platform == TargetPlatform.windows ? 13 : 12.5,
+                fontWeight: theme.platform == TargetPlatform.windows
+                    ? FontWeight.w400
+                    : FontWeight.w500,
                 color: fg,
               ),
             ),
@@ -1031,8 +1033,14 @@ class _WAccountRowState extends State<WAccountRow> {
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                               style: theme.textTheme.titleSmall?.copyWith(
-                                fontSize: 12.8,
-                                fontWeight: FontWeight.w600,
+                                fontSize:
+                                    theme.platform == TargetPlatform.windows
+                                    ? 13.5
+                                    : 12.8,
+                                fontWeight:
+                                    theme.platform == TargetPlatform.windows
+                                    ? FontWeight.w400
+                                    : FontWeight.w600,
                               ),
                             ),
                           ),
@@ -1049,7 +1057,9 @@ class _WAccountRowState extends State<WAccountRow> {
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: theme.textTheme.bodySmall?.copyWith(
-                          fontSize: 11.5,
+                          fontSize: theme.platform == TargetPlatform.windows
+                              ? 12
+                              : 11.5,
                           height: 1.3,
                           color: c.textTertiary,
                         ),

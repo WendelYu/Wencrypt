@@ -1,6 +1,7 @@
 import 'dart:ui' as ui;
 
 import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 
 class EntryImageDialog extends StatefulWidget {
@@ -8,10 +9,12 @@ class EntryImageDialog extends StatefulWidget {
     super.key,
     required this.entry,
     required this.toAlbum,
+    required this.onExport,
   });
 
   final Map<String, dynamic> entry;
   final bool toAlbum;
+  final Future<void> Function(Uint8List png) onExport;
 
   @override
   State<EntryImageDialog> createState() => _EntryImageDialogState();
@@ -24,10 +27,12 @@ class _EntryImageDialogState extends State<EntryImageDialog> {
   String? _error;
 
   Future<void> _capture() async {
+    if (_rendering) return;
     setState(() {
       _rendering = true;
       _error = null;
     });
+    Uint8List? bytes;
     try {
       await WidgetsBinding.instance.endOfFrame;
       if (!mounted) return;
@@ -41,18 +46,27 @@ class _EntryImageDialogState extends State<EntryImageDialog> {
       try {
         final png = await image.toByteData(format: ui.ImageByteFormat.png);
         if (png == null) throw StateError('image_export_failed');
-        if (mounted) {
-          Navigator.pop(
-            context,
-            png.buffer.asUint8List(png.offsetInBytes, png.lengthInBytes),
-          );
-        }
+        bytes = png.buffer.asUint8List(png.offsetInBytes, png.lengthInBytes);
       } finally {
         image.dispose();
+      }
+      if (!mounted) return;
+      await widget.onExport(bytes);
+      if (mounted) Navigator.pop(context, true);
+    } on PlatformException catch (error) {
+      if (mounted) {
+        setState(() {
+          _error = switch (error.code) {
+            'clipboard_busy' => '剪贴板正被其他应用占用，请稍后点「复制图片」重试。',
+            _ when widget.toAlbum => '无法保存图片到相册，请重试。',
+            _ => '无法复制图片到剪贴板，请重试。',
+          };
+        });
       }
     } catch (_) {
       if (mounted) setState(() => _error = '无法生成图片，请重试');
     } finally {
+      bytes?.fillRange(0, bytes.length, 0);
       if (mounted) setState(() => _rendering = false);
     }
   }

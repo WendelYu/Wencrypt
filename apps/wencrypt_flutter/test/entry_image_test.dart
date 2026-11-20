@@ -1,6 +1,4 @@
-import 'dart:async';
-import 'dart:typed_data';
-
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:wencrypt/entry_image.dart';
@@ -10,7 +8,7 @@ void main() {
     tester,
   ) async {
     await tester.pumpWidget(
-      const MaterialApp(
+      MaterialApp(
         home: Scaffold(
           body: EntryImageDialog(
             entry: {
@@ -21,6 +19,7 @@ void main() {
               'notes': 'private mock notes',
             },
             toAlbum: true,
+            onExport: (_) async {},
           ),
         ),
       ),
@@ -36,21 +35,28 @@ void main() {
     expect(find.text('private mock notes'), findsNothing);
   });
 
-  testWidgets('desktop export produces a valid PNG', (tester) async {
-    final result = Completer<Uint8List?>();
+  testWidgets('desktop export stays open after clipboard failure and retries', (
+    tester,
+  ) async {
+    Uint8List? savedPng;
+    var attempts = 0;
     await tester.pumpWidget(
       MaterialApp(
         home: Scaffold(
           body: Builder(
             builder: (context) => TextButton(
               onPressed: () async {
-                result.complete(
-                  await showDialog<Uint8List>(
-                    context: context,
-                    builder: (_) => const EntryImageDialog(
-                      entry: {'title': '测试账号', 'username': 'sample'},
-                      toAlbum: false,
-                    ),
+                await showDialog<bool>(
+                  context: context,
+                  builder: (_) => EntryImageDialog(
+                    entry: const {'title': '测试账号', 'username': 'sample'},
+                    toAlbum: false,
+                    onExport: (png) async {
+                      if (++attempts == 1) {
+                        throw PlatformException(code: 'clipboard_busy');
+                      }
+                      savedPng = Uint8List.fromList(png);
+                    },
                   ),
                 );
               },
@@ -63,19 +69,25 @@ void main() {
     await tester.tap(find.text('打开预览'));
     await tester.pumpAndSettle();
 
-    await tester.runAsync(() async {
-      await tester.tap(find.text('复制图片'));
-      await tester.pump();
-    });
-    for (var attempt = 0; attempt < 40 && !result.isCompleted; attempt++) {
-      await tester.runAsync(
-        () => Future<void>.delayed(const Duration(milliseconds: 25)),
-      );
-      await tester.pump();
+    Future<void> export(int expectedAttempts) async {
+      await tester.runAsync(() async {
+        await tester.tap(find.text('复制图片'));
+        await tester.pump();
+      });
+      for (var tick = 0; tick < 40 && attempts < expectedAttempts; tick++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 25)),
+        );
+        await tester.pump();
+      }
+      expect(attempts, expectedAttempts);
+      await tester.pumpAndSettle();
     }
-    expect(result.isCompleted, isTrue);
-    final png = await result.future;
-    expect(png?.sublist(0, 8), const [137, 80, 78, 71, 13, 10, 26, 10]);
-    await tester.pumpAndSettle();
+
+    await export(1);
+    expect(find.textContaining('剪贴板正被其他应用占用'), findsOneWidget);
+    await export(2);
+    expect(savedPng?.sublist(0, 8), const [137, 80, 78, 71, 13, 10, 26, 10]);
+    expect(find.text('导出账号图片'), findsNothing);
   });
 }

@@ -7,6 +7,7 @@
 
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:material_ui/material_ui.dart';
 
 /// Corner radii used across the product. Keep these values in sync with the
@@ -151,7 +152,12 @@ class WColors extends ThemeExtension<WColors> {
   bool get isDark => canvas.computeLuminance() < 0.2;
 
   @override
-  WColors copyWith({Color? brand, Color? brandSoft, Color? surface}) => WColors(
+  WColors copyWith({
+    Color? brand,
+    Color? brandSoft,
+    Color? surface,
+    Color? textTertiary,
+  }) => WColors(
     canvas: canvas,
     surface: surface ?? this.surface,
     surfaceMuted: surfaceMuted,
@@ -161,7 +167,7 @@ class WColors extends ThemeExtension<WColors> {
     borderStrong: borderStrong,
     textPrimary: textPrimary,
     textSecondary: textSecondary,
-    textTertiary: textTertiary,
+    textTertiary: textTertiary ?? this.textTertiary,
     brand: brand ?? this.brand,
     brandHover: brandHover,
     brandSoft: brandSoft ?? this.brandSoft,
@@ -256,17 +262,28 @@ abstract final class WShadows {
   ];
 }
 
-/// Builds the single source of truth for the app's Material theme.
-/// Builds the app theme. [fontFamily] / [fontFamilyFallback] exist so design
-/// previews and golden tests can render with the host platform font; the app
-/// itself calls this without arguments and inherits the platform default.
+/// Builds the app theme. Font overrides are used by previews and golden tests.
 ThemeData wencryptTheme(
   Brightness brightness, {
   String? fontFamily,
   List<String>? fontFamilyFallback,
 }) {
   final dark = brightness == Brightness.dark;
-  final c = dark ? WColors.dark : WColors.light;
+  final windows = defaultTargetPlatform == TargetPlatform.windows;
+  final base = dark ? WColors.dark : WColors.light;
+  final c = windows
+      ? base.copyWith(
+          textTertiary: dark
+              ? const Color(0xFF9AA4B3)
+              : const Color(0xFF606B7A),
+        )
+      : base;
+  final family = fontFamily ?? (windows ? 'Microsoft YaHei UI' : null);
+  final fallback =
+      fontFamilyFallback ??
+      (windows && fontFamily == null
+          ? const ['Microsoft YaHei', 'Microsoft JhengHei UI', 'Segoe UI']
+          : null);
   final scheme = ColorScheme(
     brightness: brightness,
     primary: c.brand,
@@ -317,13 +334,15 @@ ThemeData wencryptTheme(
   final textTheme = _textTheme(
     scheme,
     c,
-  ).apply(fontFamily: fontFamily, fontFamilyFallback: fontFamilyFallback);
+  ).apply(fontFamily: family, fontFamilyFallback: fallback);
 
   return ThemeData(
     useMaterial3: true,
     brightness: brightness,
     colorScheme: scheme,
     extensions: <ThemeExtension<dynamic>>[c],
+    fontFamily: family,
+    fontFamilyFallback: fallback,
     textTheme: textTheme,
     primaryColor: c.brand,
     scaffoldBackgroundColor: c.canvas,

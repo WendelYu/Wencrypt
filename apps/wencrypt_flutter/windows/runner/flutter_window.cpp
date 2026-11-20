@@ -1,6 +1,5 @@
 #include "flutter_window.h"
 
-#include <cstring>
 #include <optional>
 #include <flutter/method_channel.h>
 #include <flutter/standard_method_codec.h>
@@ -8,39 +7,7 @@
 #include "../../../../platform_probes/windows/device_probe.h"
 
 #include "flutter/generated_plugin_registrant.h"
-
-namespace {
-bool CopyPng(HWND owner, const std::vector<uint8_t>& png) {
-  if (png.empty()) {
-    return false;
-  }
-  const UINT format = RegisterClipboardFormatW(L"PNG");
-  if (format == 0) {
-    return false;
-  }
-  HGLOBAL buffer = GlobalAlloc(GMEM_MOVEABLE, png.size());
-  if (!buffer) {
-    return false;
-  }
-  void* destination = GlobalLock(buffer);
-  if (!destination) {
-    GlobalFree(buffer);
-    return false;
-  }
-  std::memcpy(destination, png.data(), png.size());
-  GlobalUnlock(buffer);
-  if (!OpenClipboard(owner)) {
-    GlobalFree(buffer);
-    return false;
-  }
-  const bool copied = EmptyClipboard() && SetClipboardData(format, buffer);
-  CloseClipboard();
-  if (!copied) {
-    GlobalFree(buffer);
-  }
-  return copied;
-}
-}  // namespace
+#include "image_clipboard.h"
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
@@ -80,7 +47,14 @@ bool FlutterWindow::OnCreate() {
     const auto* bytes = call.arguments()
         ? std::get_if<std::vector<uint8_t>>(call.arguments())
         : nullptr;
-    result->Success(flutter::EncodableValue(bytes && CopyPng(GetHandle(), *bytes)));
+    const auto copied = bytes ? CopyPngToClipboard(GetHandle(), *bytes)
+                              : ImageClipboardResult::kFailed;
+    if (copied == ImageClipboardResult::kBusy) {
+      result->Error("clipboard_busy");
+    } else {
+      result->Success(flutter::EncodableValue(
+          copied == ImageClipboardResult::kCopied));
+    }
   });
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
