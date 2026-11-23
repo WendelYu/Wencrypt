@@ -339,6 +339,26 @@ void main() {
     },
   );
 
+  testWidgets('narrow desktop sidebar renders without overflow', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(860, 700);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: wencryptTheme(Brightness.light),
+        home: const VaultPage(preview: VaultPreview(unlocked: true)),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Wencrypt'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
   test('parseJoinInvite handles legacy v1, encrypted v2, and LAN tickets', () {
     const vaultId = '0123456789abcdef0123456789abcdef';
     final legacy = parseJoinInvite('wencrypt://join?folder=work&vault=$vaultId');

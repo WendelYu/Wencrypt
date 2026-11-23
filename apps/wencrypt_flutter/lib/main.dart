@@ -5340,7 +5340,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     final cmdShortcut = Platform.isMacOS ? '⌘K' : 'Ctrl+K';
 
     return Container(
-      width: narrow ? 186 : 210,
+      width: narrow ? 192 : 216,
       decoration: BoxDecoration(
         color: c.sidebar,
         border: Border(right: BorderSide(color: c.border)),
@@ -5354,16 +5354,20 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
               children: [
                 const WBrandMark(size: 22, radius: 6),
                 const SizedBox(width: 8),
-                Text(
-                  'Wencrypt',
-                  style: TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: -0.25,
-                    color: c.textPrimary,
+                Expanded(
+                  child: Text(
+                    'Wencrypt',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: -0.25,
+                      color: c.textPrimary,
+                    ),
                   ),
                 ),
-                const Spacer(),
+                const SizedBox(width: 6),
                 Tooltip(
                   message: '打开命令面板 ($cmdShortcut)',
                   child: InkWell(
