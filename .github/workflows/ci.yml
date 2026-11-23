@@ -57,7 +57,7 @@ jobs:
         if: matrix.target == 'android'
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
       - uses: android-actions/setup-android@v3
         if: matrix.target == 'android'
         with:
@@ -151,7 +151,7 @@ jobs:
         if: steps.version.outputs.tag != ''
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
       - uses: android-actions/setup-android@v3
         if: steps.version.outputs.tag != ''
         with:
