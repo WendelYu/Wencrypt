@@ -2,7 +2,7 @@
 
 - **macOS（Apple 芯片）**：`wencrypt-@TAG@-macos-arm64.dmg`
 - **Windows（x64）**：`wencrypt-@TAG@-windows-x64.zip`，解压后运行 `wencrypt.exe`
-- **Android（ARM64）**：`wencrypt-@TAG@-android-arm64-debug.apk`，使用开发签名。若旧版签名不同，先导出并验证加密备份，再考虑卸载旧版。
+- **Android（ARM64）**：`wencrypt-@TAG@-android-arm64.apk`。已安装同一固定证书签名的版本时可直接覆盖安装。使用开发签名的旧版需要先导出并验证可恢复的加密备份，再卸载迁移。
 - **SHA-256**：`SHA256SUMS.txt`
 
 ## 多设备首次使用与升级

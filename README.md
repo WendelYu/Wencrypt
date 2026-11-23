@@ -8,7 +8,7 @@ Wencrypt 是一款离线优先的个人密码管理器，支持 macOS、Windows 
 
 - **macOS（Apple 芯片）**下载以 `-macos-arm64.dmg` 结尾的文件。将 Wencrypt 拖到「应用程序」后打开。当前版本尚未经过 Apple 公证。遇到「已损坏」或无法打开时，请查看 DMG 内的「首次打开帮助.html」。[Apple 官方首次打开说明](https://support.apple.com/zh-cn/102445)
 - **Windows（x64）**下载以 `-windows-x64.zip` 结尾的文件。完整解压后运行 `wencrypt.exe`。密码库保存在当前 Windows 用户的 `%APPDATA%\org.wencrypt\wencrypt`，同一用户解压并打开新版即可继续使用。
-- **Android（ARM64）**下载以 `-android-arm64-debug.apk` 结尾的文件。APK 使用开发签名。如果系统提示签名不匹配，请先确认可恢复的加密备份或已同步的云端副本，再处理旧版安装。
+- **Android（ARM64）**下载 Release 中的 APK。使用固定签名的正式包文件名以 `-android-arm64.apk` 结尾，早期的开发签名包以 `-android-arm64-debug.apk` 结尾。从开发签名包迁移前，请先导出并验证加密备份。[Android 迁移步骤](docs/08-alpha-guide.md#android-从旧开发签名迁移)
 
 ## 首次使用与跨设备同步
 

@@ -30,9 +30,23 @@ WEN-002 改为坚果云应用密码认证、MKCOL/PUT/GET/PROPFIND、限流和�
 
 `.github/workflows/ci.yml` 在 push、PR 和手动触发时运行 Rust 测试、Clippy、格式检查和 Python 探针测试，再构建三端开发产物，上传 Actions artifacts，保留14天。
 
-Windows 提供 x64 ZIP。macOS 提供 Apple 芯片版 DMG，包含拖拽安装和首次打开帮助，Actions 另保留 ZIP。macOS 应用使用临时签名，尚未经 Apple 公证。Android 提供 ARM64 调试签名 APK，不同 CI 运行的调试密钥可能不同，更新前请先导出并验证加密备份。
+Windows 提供 x64 ZIP。macOS 提供 Apple 芯片版 DMG，包含拖拽安装和首次打开帮助，Actions 另保留 ZIP。macOS 应用使用临时签名，尚未经 Apple 公证。Android 在开发构建中提供 ARM64 调试签名 APK，在正式构建中生成非调试 APK，由发布任务使用固定密钥签名。
 
 把 `apps/wencrypt_flutter/pubspec.yaml` 的 `version` 提升到新的 `主版本.次版本.修订号+构建号` 并推送到 `main`。三端测试和打包成功后，CI 根据版本创建对应的 GitHub Release，上传安装包和 SHA-256 清单。已发布的版本会跳过，仅提升构建号会继续使用同一个版本号。可在仓库 Actions 页面查看构建结果。
+
+### Android 固定签名
+
+启用前，由仓库维护者在自己控制的环境中创建或选定专用 PKCS#12 发布密钥库。用强密码保护它，在独立位置备份密钥库和恢复所需凭据。所有后续正式 APK 使用同一把密钥和应用 ID `org.wencrypt.wencrypt`，并递增构建号。
+
+在 GitHub 仓库的 Actions Secrets 中配置这三项。
+
+- `ANDROID_SIGNING_KEYSTORE_BASE64` 保存 PKCS#12 密钥库文件的 Base64 内容。
+- `ANDROID_SIGNING_STORE_PASSWORD` 保存密钥库和私钥共用的保护密码。
+- `ANDROID_SIGNING_KEY_ALIAS` 保存发布密钥的别名。
+
+用 `keytool -list -v -storetype PKCS12 -keystore <密钥库路径> -alias <别名>` 查看公开证书的 SHA-256 指纹。将去掉冒号和空格后的 64 个十六进制字符保存到 Actions 仓库变量 `ANDROID_SIGNING_CERT_SHA256`。正式发布任务签名后会用 `apksigner` 核对该指纹。凭据缺失、证书不匹配或 APK 可调试时，发布会停止。密钥库、密码和 Base64 文件必须留在版本控制和构建附件之外。
+
+v0.3.6 及更早的 GitHub APK 使用开发签名。从这些 APK 迁移到第一版固定签名的正式包前，请按[旧版迁移步骤](08-alpha-guide.md#android-从旧开发签名迁移)准备可恢复的加密备份。
 
 开源前仍需明确项目LICENSE、固定第三方Action提交SHA和依赖许可证检查。SDK、缓存、构建产物和凭据排除在版本控制外；示例向量中的密码/密钥是明确标注的公开测试数据。
 

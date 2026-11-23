@@ -35,7 +35,7 @@ def rust_build(target, env=None):
     return ROOT / "target" / target / "release"
 
 
-def android():
+def android(*, release=False):
     sdk = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
     if not sdk:
         raise SystemExit("Set ANDROID_HOME to the Android SDK directory")
@@ -54,12 +54,14 @@ def android():
     jni = APP / "android/rust-jni/arm64-v8a"
     jni.mkdir(parents=True, exist_ok=True)
     shutil.copy2(library, jni)
-    flutter("build", "apk", "--debug", "--target-platform", "android-arm64")
-    apk = APP / "build/app/outputs/flutter-apk/app-debug.apk"
+    mode = "release" if release else "debug"
+    flutter("build", "apk", f"--{mode}", "--target-platform", "android-arm64")
+    apk = APP / f"build/app/outputs/flutter-apk/app-{mode}.apk"
     import zipfile
     with zipfile.ZipFile(apk) as bundle:
         bundle.getinfo("lib/arm64-v8a/libwencrypt_core.so")
-    shutil.copy2(apk, OUTPUT / "wencrypt-android-arm64-debug.apk")
+    variant = "unsigned" if release else "debug"
+    shutil.copy2(apk, OUTPUT / f"wencrypt-android-arm64-{variant}.apk")
 
 
 def windows():
@@ -115,6 +117,13 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("target", choices=("android", "windows", "macos"))
-    target = parser.parse_args().target
+    parser.add_argument("--android-release", action="store_true",
+                        help="build an unsigned Android APK for the release signing job")
+    args = parser.parse_args()
+    if args.android_release and args.target != "android":
+        parser.error("--android-release requires the Android target")
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    {"android": android, "windows": windows, "macos": macos}[target]()
+    if args.target == "android":
+        android(release=args.android_release)
+    else:
+        {"windows": windows, "macos": macos}[args.target]()

@@ -43,7 +43,7 @@ jobs:
           - os: ubuntu-latest
             target: android
             rust-target: aarch64-linux-android
-            artifact: build/p0/wencrypt-android-arm64-debug.apk
+            artifact: build/p0/wencrypt-android-arm64-*.apk
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -102,8 +102,12 @@ jobs:
         run: |
           swiftc platform_probes/macos/DeviceProbe.swift platform_probes/macos/main.swift -o "$RUNNER_TEMP/wencrypt-device-probe"
           WENCRYPT_MACOS_PROBE="$RUNNER_TEMP/wencrypt-device-probe" python3 -m unittest discover -s tools -p test_macos_probe.py -v
-      - name: Build development package
+      - name: Build package
+        if: matrix.target != 'android' || github.event_name != 'push' || github.ref != 'refs/heads/main' || github.repository != 'WendelYu/Wencrypt'
         run: python tools/package_p0.py ${{ matrix.target }}
+      - name: Build unsigned Android release
+        if: matrix.target == 'android' && github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'WendelYu/Wencrypt'
+        run: python tools/package_p0.py android --android-release
       - uses: actions/upload-artifact@v4
         with:
           name: wencrypt-p0-${{ matrix.target }}-${{ github.sha }}
@@ -143,6 +147,26 @@ jobs:
           pattern: wencrypt-p0-*-${{ github.sha }}
           path: release-assets
           merge-multiple: true
+      - uses: actions/setup-java@v4
+        if: steps.version.outputs.tag != ''
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        if: steps.version.outputs.tag != ''
+        with:
+          packages: build-tools;36.0.0
+      - name: Sign Android release and verify its certificate
+        if: steps.version.outputs.tag != ''
+        env:
+          ANDROID_SIGNING_KEYSTORE_BASE64: ${{ secrets.ANDROID_SIGNING_KEYSTORE_BASE64 }}
+          ANDROID_SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}
+          ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
+          ANDROID_SIGNING_CERT_SHA256: ${{ vars.ANDROID_SIGNING_CERT_SHA256 }}
+        run: |
+          bash tools/sign_android_release.sh "$ANDROID_HOME/build-tools/36.0.0" \
+            release-assets/wencrypt-android-arm64-unsigned.apk \
+            release-assets/wencrypt-android-arm64.apk
       - name: Publish release
         if: steps.version.outputs.tag != ''
         env:
@@ -151,7 +175,7 @@ jobs:
         working-directory: release-assets
         run: |
           assets=()
-          for package in wencrypt-macos-arm64.dmg wencrypt-windows-x64.zip wencrypt-android-arm64-debug.apk; do
+          for package in wencrypt-macos-arm64.dmg wencrypt-windows-x64.zip wencrypt-android-arm64.apk; do
             name="wencrypt-$TAG-${package#wencrypt-}"
             mv -- "$package" "$name"
             assets+=("$name")
