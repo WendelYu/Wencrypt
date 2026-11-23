@@ -13,7 +13,9 @@ import 'core.dart';
 import 'design/wencrypt_theme.dart';
 import 'design/wencrypt_widgets.dart';
 import 'entry_export.dart';
+import 'lan_transfer.dart';
 import 'probe_page.dart' show WencryptProbeApp;
+import 'qr_code.dart';
 import 'sync.dart';
 import 'sync_history.dart';
 import 'vault_invite.dart';
@@ -122,12 +124,16 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   bool remoteUpdateAvailable = false;
   bool cloudUpdatePending = false;
   bool _cloudPasswordPromptOpen = false;
-  VaultInvite? pendingInvite;
+  bool _inviteFlowOpen = false;
+  JoinInvite? pendingInvite;
+  LanTransferSender? _activeLanSender;
   Timer? _searchUpdate;
 
   String? path, token, binding, vaultId, syncUsername;
   String message = '正在加载…', query = '';
   Object selectedGroup = EntryFilter.all;
+  String? selectedEntryId;
+  bool detailRevealPassword = false;
   FirstRunStep firstRunStep = FirstRunStep.welcome;
   bool initialSyncPending = false;
   int pendingRevisions = 0;
@@ -203,6 +209,8 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     clipboard?.cancel();
     autoTimer?.cancel();
     activeSync?.cancel();
+    _activeLanSender?.dispose();
+    _activeLanSender = null;
     super.dispose();
   }
 
@@ -256,6 +264,8 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     _searchUpdate?.cancel();
     autoTimer?.cancel();
     activeSync?.cancel();
+    _activeLanSender?.dispose();
+    _activeLanSender = null;
     device.invokeMethod<Object?>('cancel').catchError((Object _) => null);
     token = null;
     initialSyncPending = false;
@@ -267,6 +277,8 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     syncUsername = null;
     vaultId = null;
     selectedGroup = EntryFilter.all;
+    selectedEntryId = null;
+    detailRevealPassword = false;
     deleteSelection = null;
     master.clear();
     confirm.clear();
@@ -366,6 +378,36 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     if (text.contains('vault_identity_mismatch')) return '所选目录属于另一个密码库。';
     if (text.contains('sync_credentials_required')) {
       return '请先保存同步使用的坚果云账号和 WebDAV 应用密码。';
+    }
+    if (text.contains('sync_not_configured')) {
+      return '请先完成坚果云同步配置并启用至少一个同步目录。';
+    }
+    if (text.contains('invalid_invite')) {
+      return '邀请码无效或已损坏，请向发送方重新获取。';
+    }
+    if (text.contains('invalid_lan_bundle')) {
+      return '局域网传输出错，传输数据未能通过安全校验。';
+    }
+    if (text.contains('lan_connect_failed')) {
+      return '无法连接到原设备。请确认两台设备连接在同一 WiFi，或改用「离线加密邀请」。';
+    }
+    if (text.contains('lan_no_network')) {
+      return '未检测到可用的局域网 IP 地址，请确认设备已连接到 WiFi。';
+    }
+    if (text.contains('lan_rejected')) {
+      return '原设备已拒绝此次加入请求。';
+    }
+    if (text.contains('lan_timeout')) {
+      return '局域网连接等待超时，请重试或改用「离线加密邀请」。';
+    }
+    if (text.contains('lan_auth_failed') || text.contains('lan_frame_invalid')) {
+      return '局域网安全校验失败，请重新生成配对码后再试。';
+    }
+    if (text.contains('lan_cancelled')) {
+      return '已取消局域网传输。';
+    }
+    if (text.contains('lan_connection_closed')) {
+      return '与原设备的连接已中断，请重新发起配对。';
     }
     if (text.contains('password_unchanged')) return '请输入不同于当前主密码的新密码。';
     if (text.contains('image_export_failed')) return '无法导出账号图片，请重试。';
@@ -1229,6 +1271,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                     ),
               actions: [
                 TextButton(
+                  style: TextButton.styleFrom(foregroundColor: c.textSecondary),
                   onPressed: () => Navigator.pop(context),
                   child: const Text('取消'),
                 ),
@@ -1298,56 +1341,96 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                   ),
                   gap(16),
                 ],
-                input(
-                  'title',
-                  '名称（必填）',
-                  Icons.label_outline_rounded,
-                  hint: '例如 GitHub、招商银行',
-                  error: titleError,
-                ),
-                input(
-                  'username',
-                  '用户名',
-                  Icons.person_outline_rounded,
-                  hint: '登录账号或邮箱',
-                ),
-                input(
-                  'password',
-                  '密码（必填）',
-                  Icons.key_outlined,
-                  hint: '输入或生成密码',
-                  error: passwordError,
-                  suffix: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      IconButton(
-                        tooltip: '生成 24 位随机密码',
-                        iconSize: 17,
-                        visualDensity: VisualDensity.compact,
-                        icon: const Icon(Icons.auto_fix_high_rounded),
-                        onPressed: () {
-                          const chars =
-                              'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#%&*+-_';
-                          final rng = Random.secure();
-                          controllers['password']!.text = List.generate(
-                            24,
-                            (_) => chars[rng.nextInt(chars.length)],
-                          ).join();
-                          setLocal(() {});
-                        },
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: input(
+                        'title',
+                        '名称（必填）',
+                        Icons.label_outline_rounded,
+                        hint: '例如 GitHub、招商银行',
+                        error: titleError,
                       ),
-                      IconButton(
-                        tooltip: reveal ? '隐藏密码' : '显示密码',
-                        iconSize: 17,
-                        visualDensity: VisualDensity.compact,
-                        icon: Icon(
-                          reveal
-                              ? Icons.visibility_off_outlined
-                              : Icons.visibility_outlined,
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: input(
+                        'username',
+                        '用户名',
+                        Icons.person_outline_rounded,
+                        hint: '登录账号或邮箱',
+                      ),
+                    ),
+                  ],
+                ),
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: WLabeledField(
+                    label: '密码（必填）',
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        TextField(
+                          controller: controllers['password'],
+                          obscureText: !reveal,
+                          autocorrect: false,
+                          enableSuggestions: false,
+                          onChanged: (_) => setLocal(() {}),
+                          style: TextStyle(
+                            fontSize: 12.8,
+                            fontFamily: reveal ? wMonoFamily : null,
+                            color: c.textPrimary,
+                          ),
+                          decoration: decoration(
+                            Icons.key_outlined,
+                            hint: '输入或生成密码',
+                            error: passwordError,
+                            suffix: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                IconButton(
+                                  tooltip: '生成 24 位随机密码',
+                                  iconSize: 17,
+                                  visualDensity: VisualDensity.compact,
+                                  icon: const Icon(Icons.auto_fix_high_rounded),
+                                  onPressed: () {
+                                    const chars =
+                                        'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#%&*+-_';
+                                    final rng = Random.secure();
+                                    controllers['password']!.text =
+                                        List.generate(
+                                          24,
+                                          (_) =>
+                                              chars[rng.nextInt(chars.length)],
+                                        ).join();
+                                    setLocal(() {});
+                                  },
+                                ),
+                                IconButton(
+                                  tooltip: reveal ? '隐藏密码' : '显示密码',
+                                  iconSize: 17,
+                                  visualDensity: VisualDensity.compact,
+                                  icon: Icon(
+                                    reveal
+                                        ? Icons.visibility_off_outlined
+                                        : Icons.visibility_outlined,
+                                  ),
+                                  onPressed: () =>
+                                      setLocal(() => reveal = !reveal),
+                                ),
+                              ],
+                            ),
+                          ),
                         ),
-                        onPressed: () => setLocal(() => reveal = !reveal),
-                      ),
-                    ],
+                        if (controllers['password']!.text.isNotEmpty) ...[
+                          const SizedBox(height: 6),
+                          WPasswordStrength(
+                            password: controllers['password']!.text,
+                          ),
+                        ],
+                      ],
+                    ),
                   ),
                 ),
                 input('url', '网址', Icons.link_rounded, hint: 'https://'),
@@ -1945,23 +2028,412 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   }
 
   void _useInvite(String raw) {
-    final invitation = VaultInvite.parse(raw);
-    setState(() {
-      if (exists || token != null) {
-        message = '邀请链接用于尚未建立密码库的设备。';
-      } else if (invitation == null) {
-        message = '邀请链接无效，请向发送方核对。';
-      } else {
-        pendingInvite = invitation;
-        firstRunStep = FirstRunStep.join;
-        message = '';
-      }
-    });
+    final invitation = parseJoinInvite(raw);
+    if (exists || token != null) {
+      setState(() => message = '邀请链接用于尚未建立密码库的设备。');
+      return;
+    }
+    if (invitation == null) {
+      setState(() => message = '邀请码无效，请向发送方核对。');
+      return;
+    }
+    switch (invitation) {
+      case LegacyVaultInvite():
+        setState(() {
+          pendingInvite = invitation;
+          firstRunStep = FirstRunStep.join;
+          message = '';
+        });
+      case EncryptedVaultInvite():
+        setState(() {
+          pendingInvite = invitation;
+          firstRunStep = FirstRunStep.join;
+          message = '';
+        });
+        unawaited(_joinEncryptedInvite(invitation));
+      case LanTransferTicket():
+        setState(() {
+          pendingInvite = invitation;
+          firstRunStep = FirstRunStep.join;
+          message = '';
+        });
+        unawaited(_joinOverLan(invitation));
+    }
   }
 
   Future<void> _pasteInvite() async {
-    final invitation = await Clipboard.getData(Clipboard.kTextPlain);
-    if (mounted) _useInvite(invitation?.text ?? '');
+    if (exists || token != null || busy || _inviteFlowOpen) return;
+    final clip = await Clipboard.getData(Clipboard.kTextPlain);
+    final clipText = (clip?.text ?? '').trim();
+    if (!mounted) return;
+    if (parseJoinInvite(clipText) != null) {
+      _useInvite(clipText);
+      return;
+    }
+    final ctrl = TextEditingController();
+    String? inputError;
+    final raw = await showDialog<String>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) {
+          final c = WColors.of(ctx);
+          return WDialog(
+            width: 480,
+            icon: Icons.qr_code_2_rounded,
+            title: '快捷加入已有密码库',
+            subtitle: '粘贴另一台设备生成的「加密邀请码」或「同 WiFi 配对码」（也可直接用手机扫码打开）。',
+            footer: WDialogFooter(
+              leading: TextButton.icon(
+                onPressed: () async {
+                  final data = await Clipboard.getData(Clipboard.kTextPlain);
+                  final text = (data?.text ?? '').trim();
+                  if (text.isNotEmpty) {
+                    ctrl.text = text;
+                    setLocal(() => inputError = null);
+                  }
+                },
+                icon: const Icon(Icons.content_paste_rounded, size: 15),
+                label: const Text('从剪贴板粘贴'),
+              ),
+              actions: [
+                TextButton(
+                  style: TextButton.styleFrom(foregroundColor: c.textSecondary),
+                  onPressed: () => Navigator.pop(ctx),
+                  child: const Text('取消'),
+                ),
+                FilledButton(
+                  onPressed: () {
+                    final val = ctrl.text.trim();
+                    if (parseJoinInvite(val) == null) {
+                      setLocal(() => inputError = '未能识别有效的邀请码或配对码，请完整粘贴后重试。');
+                      return;
+                    }
+                    Navigator.pop(ctx, val);
+                  },
+                  child: const Text('下一步'),
+                ),
+              ],
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                WLabeledField(
+                  label: '邀请码 / 配对码',
+                  child: TextField(
+                    controller: ctrl,
+                    autofocus: true,
+                    minLines: 3,
+                    maxLines: 5,
+                    onChanged: (_) {
+                      if (inputError != null) setLocal(() => inputError = null);
+                    },
+                    style: TextStyle(
+                      fontFamily: wMonoFamily,
+                      fontSize: 12,
+                      color: c.textPrimary,
+                    ),
+                    decoration: InputDecoration(
+                      hintText: 'wencrypt://join?v=2&...',
+                      errorText: inputError,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+    ctrl.dispose();
+    if (mounted && raw != null) _useInvite(raw);
+  }
+
+  String _deviceDisplayLabel() {
+    final host = Platform.localHostname.trim();
+    if (host.isNotEmpty &&
+        host.toLowerCase() != 'localhost' &&
+        host != '127.0.0.1') {
+      return host.replaceFirst(RegExp(r'\.local$'), '');
+    }
+    return switch (Platform.operatingSystem) {
+      'macos' => 'Mac 设备',
+      'windows' => 'Windows 设备',
+      'android' => 'Android 手机',
+      _ => '新设备',
+    };
+  }
+
+  Future<void> _joinEncryptedInvite(EncryptedVaultInvite invitation) async {
+    if (exists || busy || path == null || _inviteFlowOpen) return;
+    _inviteFlowOpen = true;
+    final epoch = generation;
+    final password = TextEditingController();
+    var mode = SyncMode.notify;
+    var submitting = false;
+    var reveal = false;
+    String? joinError;
+    ({
+      String session,
+      String username,
+      String appPassword,
+      List<Map<String, dynamic>> targets,
+    })?
+    joined;
+    try {
+      final dialog = DialogRoute<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => StatefulBuilder(
+          builder: (context, setLocal) {
+            final c = WColors.of(context);
+            bool canRespond() =>
+                mounted && context.mounted && epoch == generation;
+
+            Future<void> submit() async {
+              if (submitting || !foreground || password.text.isEmpty) {
+                if (password.text.isEmpty) {
+                  setLocal(() => joinError = '请输入已有密码库的主密码');
+                }
+                return;
+              }
+              final navigator = Navigator.of(context);
+              setLocal(() {
+                submitting = true;
+                joinError = null;
+              });
+              try {
+                final opened = await core({
+                  'op': 'join_encrypted_invite',
+                  'path': path,
+                  'password': password.text,
+                  'payload': invitation.payloadHex,
+                  'sync_mode': mode.name,
+                });
+                if (!canRespond()) {
+                  if (mounted) await initialize();
+                  return;
+                }
+                final targets = (opened['targets'] as List)
+                    .cast<Map<String, dynamic>>();
+                if (!foreground) {
+                  exists = true;
+                  lock();
+                  setState(() => message = '已加入密码库，请输入主密码解锁后继续同步。');
+                  return;
+                }
+                joined = (
+                  session: opened['session'] as String,
+                  username: opened['username'] as String,
+                  appPassword: opened['password'] as String,
+                  targets: targets,
+                );
+                navigator.pop(true);
+              } catch (error) {
+                if (!canRespond()) return;
+                final detail = friendly(error);
+                if (await File(path!).exists()) {
+                  if (!canRespond()) return;
+                  exists = true;
+                  lock();
+                  setState(() => message = '加入密码库失败。$detail');
+                  return;
+                }
+                setLocal(() => joinError = detail);
+              } finally {
+                if (canRespond() && joined == null) {
+                  setLocal(() => submitting = false);
+                }
+              }
+            }
+
+            return PopScope(
+              canPop: !submitting,
+              child: WDialog(
+                width: 450,
+                icon: Icons.verified_user_outlined,
+                title: '通过离线加密邀请加入',
+                subtitle: '只需输入 1 次原库主密码，坚果云账号、应用密码与同步目录会自动解密配置。',
+                footer: WDialogFooter(
+                  actions: [
+                    TextButton(
+                      style: TextButton.styleFrom(
+                        foregroundColor: c.textSecondary,
+                      ),
+                      onPressed: submitting
+                          ? null
+                          : () => Navigator.pop(context, false),
+                      child: const Text('取消'),
+                    ),
+                    FilledButton(
+                      onPressed: submitting ? null : submit,
+                      child: Text(submitting ? '正在解密并加入…' : '确认加入'),
+                    ),
+                  ],
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    WNote(
+                      tone: WTone.info,
+                      icon: Icons.fingerprint_rounded,
+                      child: Text(
+                        '密码库标识：${invitation.vaultId.substring(0, 8)}…（仅支持原库主密码解封）',
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    WLabeledField(
+                      label: '已有库的主密码',
+                      child: TextField(
+                        controller: password,
+                        enabled: !submitting,
+                        autofocus: true,
+                        obscureText: !reveal,
+                        autocorrect: false,
+                        enableSuggestions: false,
+                        onSubmitted: (_) => submit(),
+                        style: TextStyle(fontSize: 13, color: c.textPrimary),
+                        decoration: InputDecoration(
+                          hintText: '输入原密码库的主密码',
+                          prefixIcon: const Icon(
+                            Icons.lock_outline_rounded,
+                            size: 16,
+                          ),
+                          suffixIcon: IconButton(
+                            tooltip: reveal ? '隐藏主密码' : '显示主密码',
+                            icon: Icon(
+                              reveal
+                                  ? Icons.visibility_off_outlined
+                                  : Icons.visibility_outlined,
+                              size: 17,
+                            ),
+                            onPressed: submitting
+                                ? null
+                                : () => setLocal(() => reveal = !reveal),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    _syncModePicker(
+                      mode,
+                      submitting ? null : (v) => setLocal(() => mode = v),
+                    ),
+                    if (joinError case final err?)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 12),
+                        child: WNote(tone: WTone.danger, child: Text(err)),
+                      ),
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
+      );
+      final accepted = await Navigator.of(context).push(dialog);
+      await dialog.completed;
+      password.clear();
+      password.dispose();
+      final result = joined;
+      if (accepted != true ||
+          result == null ||
+          !mounted ||
+          epoch != generation ||
+          exists) {
+        return;
+      }
+      await action(() async {
+        token = result.session;
+        exists = true;
+        pendingInvite = null;
+        touch();
+        await refresh();
+        await loadAuto();
+        await runSync(
+          automatic: false,
+          username: result.username,
+          password: result.appPassword,
+          targetsOverride: result.targets,
+        );
+      });
+    } finally {
+      _inviteFlowOpen = false;
+    }
+  }
+
+  Future<void> _joinOverLan(LanTransferTicket ticket) async {
+    if (exists || busy || path == null || _inviteFlowOpen) return;
+    _inviteFlowOpen = true;
+    final epoch = generation;
+    try {
+      final result = await showDialog<LanJoinResult>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => _LanJoinDialog(
+          ticket: ticket,
+          vaultPath: path!,
+          deviceLabel: _deviceDisplayLabel(),
+          invoke: core,
+          describeError: friendly,
+        ),
+      );
+      if (result == null || !mounted || epoch != generation || exists) return;
+      if (!foreground) {
+        exists = true;
+        lock();
+        setState(() => message = '已通过同 WiFi 加入密码库，请解锁后使用。');
+        return;
+      }
+      await action(() async {
+        token = result.session;
+        exists = true;
+        pendingInvite = null;
+        touch();
+        await refresh();
+        await loadAuto();
+        if (mounted && epoch == generation) {
+          setState(() {
+            message = result.hasSync
+                ? '已通过同 WiFi 加入密码库并同步坚果云配置（共 ${result.objectCount} 条修订）'
+                : '已通过同 WiFi 加入密码库（共 ${result.objectCount} 条修订）';
+          });
+        }
+      });
+    } finally {
+      _inviteFlowOpen = false;
+    }
+  }
+
+  Future<void> _openInviteDialog() async {
+    if (token == null || busy) return;
+    touch();
+    final epoch = generation;
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => _InviteDeviceDialog(
+        vaultId: vaultId ?? '',
+        sessionToken: token!,
+        syncConfigured: syncConfigured,
+        hasSyncTargets: syncTargets.any((t) => t['enabled'] == true),
+        invoke: (req) {
+          final op = req['op'] as String;
+          final extra = Map<String, dynamic>.from(req)..remove('op');
+          return request(op, extra);
+        },
+        onSenderChanged: (sender) {
+          if (epoch == generation) _activeLanSender = sender;
+        },
+        onCopyCode: (value, label) => copy(value, label: label),
+        onCopyLegacyLink: syncConfigured ? _copyVaultInvite : null,
+        onActivity: touch,
+        describeError: friendly,
+      ),
+    );
+    _activeLanSender?.dispose();
+    _activeLanSender = null;
   }
 
   Future<Map<String, dynamic>?> _pickSyncTarget(String title) async {
@@ -2320,7 +2792,8 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   Future<void> joinCloudVault() async {
     if (exists || busy || path == null) return;
     final epoch = generation;
-    final invitation = pendingInvite;
+    final rawInvite = pendingInvite;
+    final invitation = rawInvite is LegacyVaultInvite ? rawInvite.invite : null;
     final fields = {
       '坚果云账号': TextEditingController(),
       'WebDAV 应用密码': TextEditingController(),
@@ -3130,6 +3603,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
             footer: WDialogFooter(
               actions: [
                 TextButton(
+                  style: TextButton.styleFrom(foregroundColor: c.textSecondary),
                   onPressed: () => Navigator.pop(context, false),
                   child: const Text('取消'),
                 ),
@@ -3428,7 +3902,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                       ),
                     ),
                   ),
-                const SizedBox(height: 6),
+                const SizedBox(height: 10),
+                Divider(height: 1, color: c.border),
+                const SizedBox(height: 14),
                 _syncModePicker(mode, (v) => setLocal(() => mode = v)),
               ],
             ),
@@ -3489,9 +3965,16 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     return uri != null && uri.host.isNotEmpty ? uri.host : trimmed;
   }
 
-  Widget _buildStatusPill(BuildContext context) {
+  bool get _hasActiveMessage {
+    if (busy && !syncing) return true;
+    final trimmed = message.trim();
+    return trimmed.isNotEmpty && trimmed != '本地加密 · 离线可用';
+  }
+
+  Widget _buildStatusPill(BuildContext context, {bool dismissible = false}) {
     final text = busy && !syncing ? '正在处理…' : message;
     if (text.isEmpty) return const SizedBox.shrink();
+    final c = WColors.of(context);
     final warning =
         text.contains('缺失') ||
         text.contains('不正确') ||
@@ -3500,24 +3983,41 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
         text.contains('超出') ||
         text.contains('上限') ||
         text.contains('未启用');
-    final ready =
-        text.contains('本地加密') ||
+    final success =
         text.contains('已保存') ||
         text.contains('已同步') ||
-        text.contains('已置顶');
-    return WStatusPill(
+        text.contains('已置顶') ||
+        text.contains('新增') ||
+        text.contains('已恢复');
+    final pill = WStatusPill(
       label: text,
       busy: busy || syncing,
       tone: warning
           ? WTone.danger
-          : ready
-          ? WTone.info
-          : WTone.neutral,
+          : success
+          ? WTone.success
+          : WTone.info,
       icon: warning
           ? Icons.error_outline_rounded
-          : ready
-          ? Icons.shield_outlined
+          : success
+          ? Icons.check_circle_outline_rounded
           : Icons.info_outline_rounded,
+    );
+    if (!dismissible || busy) return pill;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Flexible(child: pill),
+        const SizedBox(width: 4),
+        WIconButton(
+          icon: Icons.close_rounded,
+          tooltip: '关闭提示',
+          size: 20,
+          iconSize: 13,
+          color: c.textTertiary,
+          onPressed: () => setState(() => message = ''),
+        ),
+      ],
     );
   }
 
@@ -3558,51 +4058,80 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     );
   }
 
+  String _targetLabel(Map<String, dynamic> target) {
+    final name = (target['name'] as String? ?? '').trim();
+    return name.isNotEmpty ? name : _targetFolder(target);
+  }
+
   Widget _buildSyncBanner(BuildContext context) {
     if (!syncConfigured) return const SizedBox.shrink();
     final c = WColors.of(context);
-    final enabled = syncTargets.where((target) => target['enabled'] == true);
-    final folders = enabled.map(_targetFolder).join('   ·   ');
+    final enabled = syncTargets
+        .where((target) => target['enabled'] == true)
+        .toList();
+    final labels = enabled.map(_targetLabel).join(' · ');
+    final folders = enabled.map(_targetFolder).join(' · ');
     final pending = initialSyncPending;
-    final status = pending
+    final statusText = pending
         ? '首次同步尚未完成'
-        : folders.isEmpty
-        ? '未启用任何同步目录'
-        : folders;
+        : enabled.isEmpty
+        ? '未启用同步目录'
+        : labels;
+    final dotColor = pending
+        ? c.warning
+        : remoteUpdateAvailable
+        ? c.brand
+        : enabled.isEmpty
+        ? c.textTertiary
+        : c.success;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(18, 10, 18, 0),
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
       child: WSurface(
         radius: WRadius.md,
-        padding: const EdgeInsets.fromLTRB(10, 5, 6, 5),
-        color: pending ? c.warningSoft : c.surfaceMuted.withValues(alpha: 0.5),
-        border: !pending,
+        padding: const EdgeInsets.fromLTRB(12, 5, 6, 5),
+        color: pending ? c.warningSoft : c.surface,
+        border: true,
         child: Row(
           children: [
-            Icon(
-              pending ? Icons.cloud_off_outlined : Icons.cloud_done_outlined,
-              size: 15,
-              color: pending ? c.warning : c.textSecondary,
+            Container(
+              width: 7,
+              height: 7,
+              decoration: BoxDecoration(
+                color: dotColor,
+                shape: BoxShape.circle,
+              ),
             ),
             const SizedBox(width: 8),
             Text(
               '坚果云',
               style: TextStyle(
-                fontSize: 11.5,
+                fontSize: 11.8,
                 fontWeight: FontWeight.w600,
-                color: c.textSecondary,
+                color: c.textPrimary,
               ),
             ),
-            const SizedBox(width: 10),
+            const SizedBox(width: 8),
             Expanded(
-              child: WMono(
-                status,
-                size: 11.5,
-                color: pending ? c.warning : c.textTertiary,
+              child: Tooltip(
+                message: folders.isEmpty ? statusText : folders,
+                child: Text(
+                  statusText,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 11.5,
+                    color: pending ? c.warning : c.textSecondary,
+                  ),
+                ),
               ),
             ),
             if (remoteUpdateAvailable) ...[
               const SizedBox(width: 6),
-              Text('云端有更新', style: TextStyle(fontSize: 11.5, color: c.brand)),
+              const WStatusPill(
+                label: '云端有更新',
+                tone: WTone.info,
+                compact: true,
+              ),
             ],
             const SizedBox(width: 6),
             TextButton(
@@ -3610,8 +4139,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
               style: TextButton.styleFrom(
                 minimumSize: const Size(0, 24),
                 padding: const EdgeInsets.symmetric(horizontal: 8),
-                textStyle: Theme.of(context).textTheme.labelLarge
-                    ?.copyWith(fontSize: 11.5),
+                textStyle: Theme.of(
+                  context,
+                ).textTheme.labelLarge?.copyWith(fontSize: 11.5),
               ),
               child: syncing
                   ? const SizedBox(
@@ -3621,7 +4151,6 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                     )
                   : const Text('立即同步'),
             ),
-            const SizedBox(width: 2),
             _copyFolderAction(),
             WIconButton(
               icon: Icons.tune_rounded,
@@ -3642,15 +4171,14 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     final theme = Theme.of(context);
     return DecoratedBox(
       decoration: BoxDecoration(
-        gradient: LinearGradient(
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
+        color: c.canvas,
+        gradient: RadialGradient(
+          center: const Alignment(0, -0.55),
+          radius: 1.15,
           colors: [
-            c.brand.withValues(alpha: c.isDark ? 0.10 : 0.035),
-            c.canvas,
+            c.brand.withValues(alpha: c.isDark ? 0.12 : 0.055),
             c.canvas,
           ],
-          stops: const [0, 0.30, 1],
         ),
       ),
       child: SizedBox.expand(
@@ -3658,40 +4186,51 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
           child: SingleChildScrollView(
             padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 32),
             child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 396),
+              constraints: const BoxConstraints(maxWidth: 400),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   Row(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      const WBrandMark(size: 26, radius: 7),
-                      const SizedBox(width: 9),
+                      const WBrandMark(size: 30, radius: 8),
+                      const SizedBox(width: 10),
                       Text(
                         'Wencrypt',
                         style: TextStyle(
-                          fontSize: 15,
+                          fontSize: 17,
                           fontWeight: FontWeight.w700,
-                          letterSpacing: -0.2,
+                          letterSpacing: -0.3,
                           color: c.textPrimary,
                         ),
                       ),
                     ],
                   ),
-                  const SizedBox(height: 22),
+                  const SizedBox(height: 24),
                   WSurface(
                     shadow: true,
                     radius: WRadius.xl,
-                    padding: const EdgeInsets.fromLTRB(26, 26, 26, 22),
+                    padding: const EdgeInsets.fromLTRB(28, 28, 28, 24),
                     child: child,
                   ),
-                  const SizedBox(height: 16),
-                  Text(
-                    '主密码不会离开这台设备',
-                    textAlign: TextAlign.center,
-                    style: theme.textTheme.labelSmall?.copyWith(
-                      color: c.textTertiary,
-                    ),
+                  const SizedBox(height: 18),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        Icons.shield_outlined,
+                        size: 13,
+                        color: c.textTertiary,
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        '本地端到端加密 · 主密码不会离开这台设备',
+                        textAlign: TextAlign.center,
+                        style: theme.textTheme.labelSmall?.copyWith(
+                          color: c.textTertiary,
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               ),
@@ -3855,7 +4394,29 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
               icon: Icons.link_rounded,
               child: Row(
                 children: [
-                  Expanded(child: Text('收到邀请：${invitation.folder}')),
+                  Expanded(
+                    child: Text(switch (invitation) {
+                      LegacyVaultInvite(:final invite) =>
+                        '收到邀请：${invite.folder}',
+                      EncryptedVaultInvite() => '已读取离线加密邀请，输入主密码即可加入',
+                      LanTransferTicket(:final ips, :final port) =>
+                        '收到同 WiFi 直连配对：${ips.first}:$port',
+                    }),
+                  ),
+                  if (invitation is EncryptedVaultInvite ||
+                      invitation is LanTransferTicket)
+                    TextButton(
+                      onPressed: busy
+                          ? null
+                          : () {
+                              if (invitation is EncryptedVaultInvite) {
+                                _joinEncryptedInvite(invitation);
+                              } else if (invitation is LanTransferTicket) {
+                                _joinOverLan(invitation);
+                              }
+                            },
+                      child: const Text('立即加入'),
+                    ),
                   WIconButton(
                     icon: Icons.close_rounded,
                     tooltip: '移除邀请',
@@ -3868,23 +4429,23 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
             ),
           ),
         _authOption(
+          icon: Icons.qr_code_scanner_rounded,
+          title: '快捷加入（邀请码 / 同 WiFi 配对）',
+          description: '粘贴加密邀请码或局域网配对码，免输入坚果云账号密码快速加入。',
+          onTap: busy ? null : _pasteInvite,
+          primary: true,
+        ),
+        _authOption(
           icon: Icons.cloud_download_outlined,
           title: '从坚果云加入',
-          description: '使用坚果云 WebDAV 上已有的加密备份。',
+          description: '手动输入坚果云账号、应用密码与主密码加入。',
           onTap: busy || path == null ? null : joinCloudVault,
-          primary: true,
         ),
         _authOption(
           icon: Icons.restore_page_outlined,
           title: '从加密备份恢复',
           description: '选择此前导出的加密备份文件。',
           onTap: busy || path == null ? null : restore,
-        ),
-        _authOption(
-          icon: Icons.link_rounded,
-          title: '粘贴邀请链接',
-          description: '使用其他设备复制来的邀请链接加入。',
-          onTap: busy ? null : _pasteInvite,
         ),
       ],
     );
@@ -3998,22 +4559,28 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                 ),
               ),
             ],
-            if (exists)
-              TextButton(
-                onPressed: busy ? null : _recoverMasterPassword,
-                child: const Text('忘记主密码？'),
+            if (exists) ...[
+              const SizedBox(height: 4),
+              Center(
+                child: TextButton(
+                  style: TextButton.styleFrom(foregroundColor: c.textSecondary),
+                  onPressed: busy ? null : _recoverMasterPassword,
+                  child: const Text('忘记主密码？'),
+                ),
               ),
+            ],
           ],
           if (!exists && firstRunStep != FirstRunStep.welcome) ...[
             const SizedBox(height: 4),
             Center(
               child: TextButton(
+                style: TextButton.styleFrom(foregroundColor: c.textSecondary),
                 onPressed: busy ? null : _backToWelcome,
                 child: const Text('返回'),
               ),
             ),
           ],
-          if (message.isNotEmpty) ...[
+          if (_hasActiveMessage) ...[
             const SizedBox(height: 14),
             Center(child: _buildStatusPill(context)),
           ],
@@ -4139,207 +4706,291 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       ),
     );
 
-    final list = filtered.isEmpty
-        ? WEmptyState(
-            icon: trash
-                ? Icons.delete_sweep_outlined
-                : query.isNotEmpty || selectedGroup != EntryFilter.all
-                ? Icons.search_off_rounded
-                : Icons.shield_outlined,
-            title: trash
-                ? '回收站为空'
-                : query.isNotEmpty || selectedGroup != EntryFilter.all
-                ? '当前筛选条件下没有账号'
-                : '密码库还没有任何账号',
-            message: trash
-                ? '移入回收站的账号会显示在这里'
-                : query.isNotEmpty || selectedGroup != EntryFilter.all
-                ? '尝试切换分组或清空搜索条件'
-                : '你可以手动新增，或直接从 Edge / Chrome 自动导入密码',
-            action: !trash && query.isEmpty && selectedGroup == EntryFilter.all
-                ? Wrap(
-                    spacing: 8,
-                    alignment: WrapAlignment.center,
-                    children: [
-                      if (Platform.isMacOS || Platform.isWindows)
-                        OutlinedButton.icon(
-                          onPressed: busy ? null : importFromBrowser,
-                          icon: const Icon(Icons.download_outlined, size: 16),
-                          label: const Text('从 Edge / Chrome 导入'),
-                        ),
-                      FilledButton.icon(
-                        onPressed: busy ? null : () => edit(null),
-                        icon: const Icon(Icons.add_rounded, size: 16),
-                        label: const Text('新增第一个账号'),
-                      ),
-                    ],
-                  )
-                : null,
-          )
-        : Padding(
-            padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
-            child: WSurface(
-              radius: WRadius.lg,
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(WRadius.lg),
-                child: Scrollbar(
-                  child: ListView.builder(
-                    padding: EdgeInsets.only(bottom: desktop ? 12 : 84),
-                    itemCount: filtered.length,
-                    itemBuilder: (context, index) {
-                      final r = filtered[index];
-                      final data = r['data'] as Map<String, dynamic>;
-                      final title = (data['title'] as String? ?? '').trim();
-                      final username = (data['username'] as String? ?? '')
-                          .trim();
-                      final url = (data['url'] as String? ?? '').trim();
-                      final pinned = _isPinned(r);
-                      final groups = _entryGroups(r);
-                      final hasConflict = revisionCounts[r['entry']]! > 1;
-                      final revisionId = r['id'] as String;
-                      final selection = deleteSelection;
-                      final host = _hostLabel(url);
-                      final meta = [
-                        if (username.isNotEmpty) username,
-                        if (host.isNotEmpty) host,
-                        if (username.isEmpty && host.isEmpty) '未填写用户名',
-                      ].join('   ·   ');
-                      void toggleSelection() {
-                        setState(() {
-                          if (selection?.contains(revisionId) == true) {
-                            selection?.remove(revisionId);
-                          } else {
-                            selection?.add(revisionId);
-                          }
-                        });
-                      }
+    final splitView =
+        desktop &&
+        MediaQuery.sizeOf(context).width >= 1020 &&
+        deleteSelection == null;
 
-                      return WAccountRow(
-                        title: title.isEmpty ? '未命名账号' : title,
-                        meta: meta,
-                        group: groups.isEmpty ? null : groups.first,
-                        pinned: pinned,
-                        selected: selection?.contains(revisionId) == true,
-                        selectionMode: selection != null,
-                        showCheckbox: selection != null,
-                        showPin: !trash && selection == null,
-                        avatar: hasConflict ? _conflictAvatar(context) : null,
-                        onOpen: busy ? null : () => edit(r),
-                        onToggleSelect: selection == null || hasConflict || busy
-                            ? null
-                            : toggleSelection,
-                        onTogglePin: busy ? null : () => _togglePin(r),
-                        onCopyPassword: () => copy(
-                          data['password'] as String? ?? '',
-                          label: '密码',
-                        ),
-                        onCopyUsername: username.isEmpty
-                            ? null
-                            : () => copy(username, label: '用户名'),
-                        onEdit: busy ? null : () => edit(r),
-                        onPurge: trash && !hasConflict
-                            ? () => _setDeleted(
-                                [revisionId],
-                                deleted: true,
-                                discard: true,
-                              )
-                            : null,
-                        menuSections: [
-                          WMenuSection(
-                            entries: [
-                              WMenuEntry(
-                                label: '编辑详情',
-                                icon: Icons.edit_outlined,
-                                onTap: () => edit(r),
-                              ),
-                              WMenuEntry(
-                                label: '复制用户名',
-                                icon: Icons.person_outline_rounded,
-                                enabled: username.isNotEmpty,
-                                onTap: () => copy(username, label: '用户名'),
-                              ),
-                              WMenuEntry(
-                                label: '复制密码',
-                                icon: Icons.key_outlined,
-                                onTap: () => copy(
-                                  data['password'] as String? ?? '',
-                                  label: '密码',
-                                ),
-                              ),
-                              WMenuEntry(
-                                label: '历史版本',
-                                icon: Icons.history_rounded,
-                                onTap: () => history(r),
-                              ),
-                              if (!trash &&
-                                  !hasConflict &&
-                                  (Platform.isAndroid ||
-                                      Platform.isMacOS ||
-                                      Platform.isWindows))
-                                WMenuEntry(
-                                  label: '导出账号',
-                                  icon: Icons.image_outlined,
-                                  onTap: () => _exportEntry(data),
-                                ),
-                            ],
-                          ),
-                          if (!hasConflict)
-                            WMenuSection(
-                              entries: [
-                                WMenuEntry(
-                                  label: trash ? '恢复账号' : '移入回收站',
-                                  icon: trash
-                                      ? Icons.restore_rounded
-                                      : Icons.delete_outline_rounded,
-                                  danger: !trash,
-                                  onTap: () => _setDeleted([
-                                    revisionId,
-                                  ], deleted: !trash),
-                                ),
-                              ],
-                            ),
-                        ],
-                      );
-                    },
-                  ),
+    Map<String, dynamic>? activeRevision;
+    if (splitView && filtered.isNotEmpty) {
+      activeRevision = filtered.firstWhere(
+        (r) => r['id'] == selectedEntryId || r['entry'] == selectedEntryId,
+        orElse: () => filtered.first,
+      );
+    }
+
+    Widget buildRow(Map<String, dynamic> r) {
+      final data = r['data'] as Map<String, dynamic>;
+      final title = (data['title'] as String? ?? '').trim();
+      final username = (data['username'] as String? ?? '').trim();
+      final url = (data['url'] as String? ?? '').trim();
+      final pinned = _isPinned(r);
+      final groups = _entryGroups(r);
+      final hasConflict = revisionCounts[r['entry']]! > 1;
+      final revisionId = r['id'] as String;
+      final entryId = r['entry'] as String;
+      final selection = deleteSelection;
+      final host = _hostLabel(url);
+      final meta = [
+        if (username.isNotEmpty) username,
+        if (host.isNotEmpty) host,
+        if (username.isEmpty && host.isEmpty) '未填写用户名',
+      ].join(' · ');
+      final isActive =
+          splitView && activeRevision != null && activeRevision['id'] == revisionId;
+
+      void toggleSelection() {
+        setState(() {
+          if (selection?.contains(revisionId) == true) {
+            selection?.remove(revisionId);
+          } else {
+            selection?.add(revisionId);
+          }
+        });
+      }
+
+      return WAccountRow(
+        title: title.isEmpty ? '未命名账号' : title,
+        meta: meta,
+        group: groups.isEmpty ? null : groups.first,
+        pinned: pinned,
+        active: isActive,
+        selected: selection?.contains(revisionId) == true,
+        selectionMode: selection != null,
+        showCheckbox: selection != null,
+        showPin: !trash && selection == null,
+        compactActions: splitView,
+        avatar: hasConflict ? _conflictAvatar(context) : null,
+        onOpen: busy
+            ? null
+            : () {
+                if (splitView) {
+                  touch();
+                  setState(() {
+                    if (selectedEntryId != entryId) {
+                      detailRevealPassword = false;
+                    }
+                    selectedEntryId = entryId;
+                  });
+                } else {
+                  edit(r);
+                }
+              },
+        onToggleSelect: selection == null || hasConflict || busy
+            ? null
+            : toggleSelection,
+        onTogglePin: busy ? null : () => _togglePin(r),
+        onCopyPassword: () => copy(
+          data['password'] as String? ?? '',
+          label: '密码',
+        ),
+        onCopyUsername: username.isEmpty
+            ? null
+            : () => copy(username, label: '用户名'),
+        onEdit: busy ? null : () => edit(r),
+        onPurge: trash && !hasConflict
+            ? () => _setDeleted(
+                [revisionId],
+                deleted: true,
+                discard: true,
+              )
+            : null,
+        menuSections: [
+          WMenuSection(
+            entries: [
+              WMenuEntry(
+                label: '编辑详情',
+                icon: Icons.edit_outlined,
+                onTap: () => edit(r),
+              ),
+              WMenuEntry(
+                label: '复制用户名',
+                icon: Icons.person_outline_rounded,
+                enabled: username.isNotEmpty,
+                onTap: () => copy(username, label: '用户名'),
+              ),
+              WMenuEntry(
+                label: '复制密码',
+                icon: Icons.key_outlined,
+                onTap: () => copy(
+                  data['password'] as String? ?? '',
+                  label: '密码',
                 ),
               ),
+              WMenuEntry(
+                label: '历史版本',
+                icon: Icons.history_rounded,
+                onTap: () => history(r),
+              ),
+              if (!trash &&
+                  !hasConflict &&
+                  (Platform.isAndroid ||
+                      Platform.isMacOS ||
+                      Platform.isWindows))
+                WMenuEntry(
+                  label: '导出账号',
+                  icon: Icons.image_outlined,
+                  onTap: () => _exportEntry(data),
+                ),
+            ],
+          ),
+          if (!hasConflict)
+            WMenuSection(
+              entries: [
+                WMenuEntry(
+                  label: trash ? '恢复账号' : '移入回收站',
+                  icon: trash
+                      ? Icons.restore_rounded
+                      : Icons.delete_outline_rounded,
+                  danger: !trash,
+                  onTap: () => _setDeleted([revisionId], deleted: !trash),
+                ),
+              ],
             ),
-          );
+        ],
+      );
+    }
+
+    final emptyList = WEmptyState(
+      icon: trash
+          ? Icons.delete_sweep_outlined
+          : query.isNotEmpty || selectedGroup != EntryFilter.all
+          ? Icons.search_off_rounded
+          : Icons.shield_outlined,
+      title: trash
+          ? '回收站为空'
+          : query.isNotEmpty || selectedGroup != EntryFilter.all
+          ? '当前筛选条件下没有账号'
+          : '密码库还没有任何账号',
+      message: trash
+          ? '移入回收站的账号会显示在这里'
+          : query.isNotEmpty || selectedGroup != EntryFilter.all
+          ? '尝试切换分组或清空搜索条件'
+          : '你可以手动新增，或直接从 Edge / Chrome 自动导入密码',
+      action: !trash && query.isEmpty && selectedGroup == EntryFilter.all
+          ? Wrap(
+              spacing: 8,
+              alignment: WrapAlignment.center,
+              children: [
+                if (Platform.isMacOS || Platform.isWindows)
+                  OutlinedButton.icon(
+                    onPressed: busy ? null : importFromBrowser,
+                    icon: const Icon(Icons.download_outlined, size: 16),
+                    label: const Text('从 Edge / Chrome 导入'),
+                  ),
+                FilledButton.icon(
+                  onPressed: busy ? null : () => edit(null),
+                  icon: const Icon(Icons.add_rounded, size: 16),
+                  label: const Text('新增第一个账号'),
+                ),
+              ],
+            )
+          : null,
+    );
+
+    Widget listCard({EdgeInsets? padding}) => Padding(
+      padding: padding ?? const EdgeInsets.fromLTRB(16, 4, 16, 14),
+      child: Align(
+        alignment: Alignment.topCenter,
+        child: WSurface(
+          radius: WRadius.lg,
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(WRadius.lg),
+            child: Scrollbar(
+              child: ListView.builder(
+                shrinkWrap: !splitView,
+                padding: EdgeInsets.only(bottom: desktop ? 6 : 80),
+                itemCount: filtered.length,
+                itemBuilder: (context, index) => buildRow(filtered[index]),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    Widget detailPane() {
+      final r = activeRevision;
+      if (r == null) {
+        return WEmptyState(
+          icon: Icons.touch_app_outlined,
+          title: '选择一个账号查看详情',
+          message: '点击左侧任意账号即可快速复制用户名与密码',
+        );
+      }
+      final data = r['data'] as Map<String, dynamic>;
+      final title = (data['title'] as String? ?? '').trim();
+      final username = (data['username'] as String? ?? '').trim();
+      final password = data['password'] as String? ?? '';
+      final url = (data['url'] as String? ?? '').trim();
+      final notes = data['notes'] as String? ?? '';
+      final groups = _entryGroups(r);
+      final pinned = _isPinned(r);
+      final hasConflict = revisionCounts[r['entry']]! > 1;
+      final revisionId = r['id'] as String;
+      return WAccountDetailPanel(
+        title: title,
+        username: username,
+        password: password,
+        url: url,
+        notes: notes,
+        groups: groups,
+        pinned: pinned,
+        trash: trash,
+        hasConflict: hasConflict,
+        revealPassword: detailRevealPassword,
+        busy: busy,
+        avatar: hasConflict ? _conflictAvatar(context) : null,
+        onToggleReveal: () {
+          touch();
+          setState(() => detailRevealPassword = !detailRevealPassword);
+        },
+        onCopyUsername: username.isEmpty
+            ? null
+            : () => copy(username, label: '用户名'),
+        onCopyPassword: password.isEmpty
+            ? null
+            : () => copy(password, label: '密码'),
+        onCopyUrl: url.isEmpty ? null : () => copy(url, label: '网址'),
+        onCopyNotes: notes.trim().isEmpty
+            ? null
+            : () => copy(notes, label: '备注'),
+        onTogglePin: () => _togglePin(r),
+        onEdit: () => edit(r),
+        onHistory: () => history(r),
+        onExport: !trash &&
+                !hasConflict &&
+                (Platform.isAndroid || Platform.isMacOS || Platform.isWindows)
+            ? () => _exportEntry(data)
+            : null,
+        onTrashOrRestore: !hasConflict
+            ? () => _setDeleted([revisionId], deleted: !trash)
+            : null,
+        onPurge: trash && !hasConflict
+            ? () => _setDeleted([revisionId], deleted: true, discard: true)
+            : null,
+      );
+    }
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         if (!desktop) searchRow(),
         if (!desktop || trash) ...[const SizedBox(height: 8), chipRow()],
-        if (desktop) const SizedBox(height: 8),
         _buildSyncBanner(context),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(18, 8, 14, 6),
-          child: Row(
-            children: [
-              Expanded(child: _buildStatusPill(context)),
-              if (deleteSelection == null && visibleHeads.isNotEmpty)
-                TextButton.icon(
-                  onPressed: busy
-                      ? null
-                      : () => setState(() => deleteSelection = {}),
-                  icon: const Icon(Icons.checklist_rounded, size: 15),
-                  label: const Text('多选'),
-                  style: TextButton.styleFrom(
-                    foregroundColor: c.textSecondary,
-                    textStyle: Theme.of(context).textTheme.labelLarge
-                        ?.copyWith(fontSize: 12),
-                  ),
-                ),
-            ],
+        if (_hasActiveMessage)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: _buildStatusPill(context, dismissible: true),
+            ),
           ),
-        ),
         if (deleteSelection case final selection?)
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
             child: WSurface(
-              padding: const EdgeInsets.fromLTRB(10, 6, 6, 6),
+              padding: const EdgeInsets.fromLTRB(12, 6, 6, 6),
               radius: WRadius.sm,
               color: c.brandSoft,
               border: false,
@@ -4363,6 +5014,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                     child: const Text('全选当前列表'),
                   ),
                   TextButton(
+                    style: TextButton.styleFrom(
+                      foregroundColor: c.textSecondary,
+                    ),
                     onPressed: busy
                         ? null
                         : () => setState(() => deleteSelection = null),
@@ -4375,8 +5029,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                         backgroundColor: c.danger,
                         minimumSize: const Size(0, 28),
                         padding: const EdgeInsets.symmetric(horizontal: 10),
-                        textStyle: Theme.of(context).textTheme.labelLarge
-                            ?.copyWith(fontSize: 12),
+                        textStyle: Theme.of(
+                          context,
+                        ).textTheme.labelLarge?.copyWith(fontSize: 12),
                       ),
                       onPressed: busy || selection.isEmpty
                           ? null
@@ -4394,7 +5049,123 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
               ),
             ),
           ),
-        Expanded(child: list),
+        if (filtered.isEmpty)
+          Expanded(child: emptyList)
+        else if (splitView)
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 10, 0, 0),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  SizedBox(
+                    width: MediaQuery.sizeOf(context).width >= 1240 ? 360 : 316,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(4, 0, 2, 6),
+                          child: Row(
+                            children: [
+                              Text(
+                                '共 ${_countLabel(filtered.length)} 个账号',
+                                style: TextStyle(
+                                  fontSize: 11.5,
+                                  fontWeight: FontWeight.w500,
+                                  color: c.textTertiary,
+                                ),
+                              ),
+                              const Spacer(),
+                              if (visibleHeads.isNotEmpty)
+                                TextButton.icon(
+                                  onPressed: busy
+                                      ? null
+                                      : () =>
+                                            setState(() => deleteSelection = {}),
+                                  icon: const Icon(
+                                    Icons.checklist_rounded,
+                                    size: 14,
+                                  ),
+                                  label: const Text('多选'),
+                                  style: TextButton.styleFrom(
+                                    foregroundColor: c.textSecondary,
+                                    minimumSize: const Size(0, 24),
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 6,
+                                    ),
+                                    textStyle: Theme.of(context)
+                                        .textTheme
+                                        .labelLarge
+                                        ?.copyWith(fontSize: 11.5),
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
+                        Expanded(
+                          child: Padding(
+                            padding: const EdgeInsets.only(bottom: 16),
+                            child: WSurface(
+                              radius: WRadius.lg,
+                              child: ClipRRect(
+                                borderRadius: BorderRadius.circular(WRadius.lg),
+                                child: Scrollbar(
+                                  child: ListView.builder(
+                                    padding: const EdgeInsets.only(bottom: 8),
+                                    itemCount: filtered.length,
+                                    itemBuilder: (context, index) =>
+                                        buildRow(filtered[index]),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  VerticalDivider(width: 1, color: c.border),
+                  Expanded(child: detailPane()),
+                ],
+              ),
+            ),
+          )
+        else ...[
+          if (deleteSelection == null && visibleHeads.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 8, 16, 4),
+              child: Row(
+                children: [
+                  Text(
+                    '共 ${_countLabel(filtered.length)} 个账号',
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.w500,
+                      color: c.textTertiary,
+                    ),
+                  ),
+                  const Spacer(),
+                  TextButton.icon(
+                    onPressed: busy
+                        ? null
+                        : () => setState(() => deleteSelection = {}),
+                    icon: const Icon(Icons.checklist_rounded, size: 14),
+                    label: const Text('多选'),
+                    style: TextButton.styleFrom(
+                      foregroundColor: c.textSecondary,
+                      minimumSize: const Size(0, 24),
+                      padding: const EdgeInsets.symmetric(horizontal: 6),
+                      textStyle: Theme.of(
+                        context,
+                      ).textTheme.labelLarge?.copyWith(fontSize: 11.5),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          Expanded(child: listCard()),
+        ],
       ],
     );
   }
@@ -4404,8 +5175,8 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   Widget _conflictAvatar(BuildContext context) {
     final c = WColors.of(context);
     return Container(
-      width: 30,
-      height: 30,
+      width: 32,
+      height: 32,
       alignment: Alignment.center,
       decoration: BoxDecoration(
         color: c.warningSoft,
@@ -4422,6 +5193,8 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       showSyncHistory = index == 2;
       trash = index == 1;
       selectedGroup = EntryFilter.all;
+      selectedEntryId = null;
+      detailRevealPassword = false;
       deleteSelection = null;
     });
   }
@@ -4451,8 +5224,12 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
           Icons.copy_outlined,
           () => copy(_targetFolder(target), label: '目录名'),
         ),
-      if (syncConfigured)
-        WorkspaceCommand('复制加入邀请链接', Icons.link, _copyVaultInvite),
+      if (!busy)
+        WorkspaceCommand(
+          '邀请新设备加入',
+          Icons.qr_code_2_rounded,
+          _openInviteDialog,
+        ),
       if (canSync)
         WorkspaceCommand(
           '修改主密码',
@@ -4478,21 +5255,20 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     required VoidCallback onTap,
     IconData? icon,
     int? count,
-    bool indented = false,
   }) {
     final c = WColors.of(context);
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
       child: Material(
         color: selected ? c.brandSoft : Colors.transparent,
-        borderRadius: BorderRadius.circular(WRadius.xs),
+        borderRadius: BorderRadius.circular(WRadius.sm),
         child: InkWell(
-          borderRadius: BorderRadius.circular(WRadius.xs),
+          borderRadius: BorderRadius.circular(WRadius.sm),
           hoverColor: c.hover,
           onTap: onTap,
           child: Container(
-            height: 27,
-            padding: EdgeInsets.only(left: indented ? 27 : 8, right: 8),
+            height: 30,
+            padding: const EdgeInsets.symmetric(horizontal: 9),
             child: Row(
               children: [
                 if (icon != null) ...[
@@ -4509,18 +5285,18 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
-                      fontSize: 12.3,
+                      fontSize: 12.5,
                       fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
                       color: selected ? c.brand : c.textSecondary,
                     ),
                   ),
                 ),
-                if (count != null) ...[
+                if (count != null && count > 0) ...[
                   const SizedBox(width: 6),
                   Text(
                     _countLabel(count),
                     style: TextStyle(
-                      fontSize: 10.8,
+                      fontSize: 11,
                       fontWeight: FontWeight.w500,
                       color: selected ? c.brand : c.textTertiary,
                     ),
@@ -4536,17 +5312,35 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
 
   Widget _workspaceSidebar() {
     final c = WColors.of(context);
-    final filters = [
-      if (entries.any((row) => row['deleted'] != true && _isPinned(row)))
-        (EntryFilter.pinned as Object, '已置顶', Icons.push_pin_outlined),
-      for (final group in _groupOptions())
-        (group.toLowerCase() as Object, group, Icons.folder_outlined),
-    ];
-    final vaultCount = entries.where((row) => row['deleted'] != true).length;
-    final trashCount = entries.where((row) => row['deleted'] == true).length;
-    final narrow = MediaQuery.sizeOf(context).width < 1000;
+    final activeEntries = entries
+        .where((row) => row['deleted'] != true)
+        .toList();
+    final vaultCount = activeEntries.length;
+    final trashCount = entries.length - vaultCount;
+    var pinnedCount = 0;
+    var ungroupedCount = 0;
+    final groupCounts = <String, int>{};
+    final groupNames = <String, String>{};
+    for (final row in activeEntries) {
+      if (_isPinned(row)) pinnedCount++;
+      final groups = _entryGroups(row);
+      if (groups.isEmpty) {
+        ungroupedCount++;
+      } else {
+        for (final g in groups) {
+          final key = g.toLowerCase();
+          groupNames.putIfAbsent(key, () => g);
+          groupCounts[key] = (groupCounts[key] ?? 0) + 1;
+        }
+      }
+    }
+    final sortedGroups = groupNames.entries.toList()
+      ..sort((a, b) => a.value.compareTo(b.value));
+    final narrow = MediaQuery.sizeOf(context).width < 1020;
+    final cmdShortcut = Platform.isMacOS ? '⌘K' : 'Ctrl+K';
+
     return Container(
-      width: narrow ? 188 : 214,
+      width: narrow ? 186 : 210,
       decoration: BoxDecoration(
         color: c.sidebar,
         border: Border(right: BorderSide(color: c.border)),
@@ -4555,7 +5349,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Padding(
-            padding: const EdgeInsets.fromLTRB(14, 11, 8, 10),
+            padding: const EdgeInsets.fromLTRB(14, 12, 10, 12),
             child: Row(
               children: [
                 const WBrandMark(size: 22, radius: 6),
@@ -4563,19 +5357,20 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                 Text(
                   'Wencrypt',
                   style: TextStyle(
-                    fontSize: 13.5,
+                    fontSize: 14,
                     fontWeight: FontWeight.w700,
-                    letterSpacing: -0.2,
+                    letterSpacing: -0.25,
                     color: c.textPrimary,
                   ),
                 ),
                 const Spacer(),
-                WIconButton(
-                  icon: Icons.bolt_outlined,
-                  tooltip: '命令  ${Platform.isMacOS ? '⌘K' : 'Ctrl+K'}',
-                  size: 24,
-                  iconSize: 15,
-                  onPressed: token == null ? null : _openCommands,
+                Tooltip(
+                  message: '打开命令面板 ($cmdShortcut)',
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(5),
+                    onTap: token == null ? null : _openCommands,
+                    child: WShortcutBadge(label: cmdShortcut),
+                  ),
                 ),
               ],
             ),
@@ -4588,6 +5383,20 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
             count: vaultCount,
             onTap: () => _selectWorkspace(0),
           ),
+          if (pinnedCount > 0)
+            _sidebarItem(
+              label: '已置顶',
+              icon: Icons.push_pin_outlined,
+              selected:
+                  !showSyncHistory &&
+                  !trash &&
+                  selectedGroup == EntryFilter.pinned,
+              count: pinnedCount,
+              onTap: () {
+                _selectWorkspace(0);
+                _selectGroup(EntryFilter.pinned);
+              },
+            ),
           _sidebarItem(
             label: '回收站',
             icon: Icons.delete_outline_rounded,
@@ -4601,13 +5410,13 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
             selected: showSyncHistory,
             onTap: () => _selectWorkspace(2),
           ),
-          if (filters.isNotEmpty) ...[
+          if (sortedGroups.isNotEmpty) ...[
             Padding(
-              padding: const EdgeInsets.fromLTRB(16, 14, 16, 5),
+              padding: const EdgeInsets.fromLTRB(17, 16, 16, 6),
               child: Text(
                 '分组',
                 style: TextStyle(
-                  fontSize: 10.5,
+                  fontSize: 10.8,
                   fontWeight: FontWeight.w600,
                   letterSpacing: 0.4,
                   color: c.textTertiary,
@@ -4618,24 +5427,25 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
               child: ListView(
                 padding: const EdgeInsets.only(bottom: 8),
                 children: [
-                  for (final (filter, label, _) in filters)
+                  for (final entry in sortedGroups)
                     _sidebarItem(
-                      label: label,
-                      indented: true,
+                      label: entry.value,
+                      icon: Icons.folder_outlined,
+                      count: groupCounts[entry.key],
                       selected:
-                          !showSyncHistory && !trash && selectedGroup == filter,
+                          !showSyncHistory &&
+                          !trash &&
+                          selectedGroup == entry.key,
                       onTap: () {
                         _selectWorkspace(0);
-                        _selectGroup(filter);
+                        _selectGroup(entry.key);
                       },
                     ),
-                  if (entries.any(
-                    (row) =>
-                        row['deleted'] != true && _entryGroups(row).isEmpty,
-                  ))
+                  if (ungroupedCount > 0)
                     _sidebarItem(
                       label: '未分组',
-                      indented: true,
+                      icon: Icons.label_off_outlined,
+                      count: ungroupedCount,
                       selected:
                           !showSyncHistory &&
                           !trash &&
@@ -4655,19 +5465,21 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
             padding: const EdgeInsets.fromLTRB(12, 8, 8, 9),
             child: Row(
               children: [
-                Icon(Icons.shield_outlined, size: 13, color: c.textTertiary),
+                Icon(Icons.shield_outlined, size: 13.5, color: c.success),
                 const SizedBox(width: 6),
                 Expanded(
                   child: Text(
                     '本地加密 · 离线可用',
-                    style: TextStyle(fontSize: 10.8, color: c.textTertiary),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 11, color: c.textTertiary),
                   ),
                 ),
                 WIconButton(
                   icon: Icons.lock_outline_rounded,
                   tooltip: '锁定密码库',
-                  size: 22,
-                  iconSize: 14,
+                  size: 26,
+                  iconSize: 15,
                   onPressed: lock,
                 ),
               ],
@@ -4713,7 +5525,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       ),
       if (token != null)
         WMenuSection(
-          label: '安全',
+          label: '主密码与恢复',
           entries: [
             WMenuEntry(
               label: '修改主密码',
@@ -4756,222 +5568,193 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     ),
   );
 
-  WCommandMenu _moreMenu() => WCommandMenu(
-    width: 264,
-    sections: [
-      WMenuSection(
-        label: '安全设置',
-        entries: [
-          if (Platform.isMacOS || Platform.isWindows || Platform.isLinux)
-            WMenuEntry(
-              label: '切换窗口时保持解锁',
-              icon: Icons.lock_clock_rounded,
-              checked: !lockOnFocusLoss,
-              onTap: _toggleFocusLock,
-            ),
-          if (token != null && (Platform.isMacOS || Platform.isAndroid))
-            WMenuEntry(
-              label: biometricEnabled ? '重新绑定指纹解锁' : '启用指纹解锁',
-              icon: Icons.fingerprint_rounded,
-              onTap: enableBiometric,
-            ),
-          if (token != null && biometricEnabled)
-            WMenuEntry(
-              label: '关闭指纹解锁',
-              icon: Icons.fingerprint_rounded,
-              danger: true,
-              onTap: disableBiometric,
-            ),
-        ],
-      ),
-      if (token != null)
-        WMenuSection(
-          label: '云同步',
-          entries: [
-            WMenuEntry(
-              label: syncConfigured ? '坚果云设置（已配置）' : '坚果云设置',
-              icon: Icons.cloud_outlined,
-              enabled: !busy && !syncing,
-              onTap: () => sync(configure: true),
-            ),
-            WMenuEntry(
-              label: '同步记录',
-              icon: Icons.history_rounded,
-              onTap: () => _selectWorkspace(2),
-            ),
-            if (syncConfigured)
+  WCommandMenu _moreMenu() {
+    final dangerEntries = <WMenuEntry>[
+      if (token != null && biometricEnabled)
+        WMenuEntry(
+          label: '关闭指纹解锁',
+          icon: Icons.fingerprint_rounded,
+          danger: true,
+          onTap: disableBiometric,
+        ),
+      if (token != null && syncConfigured)
+        WMenuEntry(
+          label: '清除坚果云凭据',
+          icon: Icons.link_off_rounded,
+          danger: true,
+          enabled: !busy && !syncing,
+          onTap: forgetSyncSettings,
+        ),
+    ];
+
+    return WCommandMenu(
+      width: 260,
+      sections: [
+        if (exists)
+          WMenuSection(
+            label: '数据与备份',
+            entries: [
+              if (Platform.isMacOS || Platform.isWindows)
+                WMenuEntry(
+                  label: '从 Edge / Chrome 自动导入',
+                  icon: Icons.download_outlined,
+                  enabled: !busy,
+                  onTap: importFromBrowser,
+                ),
               WMenuEntry(
-                label: '复制加入邀请链接',
-                icon: Icons.link_rounded,
-                onTap: _copyVaultInvite,
+                label: '手动导入浏览器 CSV',
+                icon: Icons.file_open_outlined,
+                enabled: !busy,
+                onTap: importCsv,
               ),
-            if (syncConfigured)
+              if (token != null)
+                WMenuEntry(
+                  label: '导出加密备份',
+                  icon: Icons.save_alt_rounded,
+                  enabled: !busy,
+                  onTap: backup,
+                ),
+            ],
+          ),
+        if (token != null)
+          WMenuSection(
+            label: '云同步',
+            entries: [
               WMenuEntry(
-                label: '清除坚果云凭据',
-                icon: Icons.link_off_rounded,
-                danger: true,
+                label: syncConfigured ? '坚果云设置（已配置）' : '坚果云设置',
+                icon: Icons.cloud_outlined,
                 enabled: !busy && !syncing,
-                onTap: forgetSyncSettings,
+                onTap: () => sync(configure: true),
+              ),
+              WMenuEntry(
+                label: '邀请新设备加入',
+                icon: Icons.qr_code_2_rounded,
+                enabled: !busy,
+                onTap: _openInviteDialog,
+              ),
+            ],
+          ),
+        WMenuSection(
+          label: '安全设置',
+          entries: [
+            if (Platform.isMacOS || Platform.isWindows || Platform.isLinux)
+              WMenuEntry(
+                label: '切换窗口时保持解锁',
+                icon: Icons.lock_clock_rounded,
+                checked: !lockOnFocusLoss,
+                onTap: _toggleFocusLock,
+              ),
+            if (token != null && (Platform.isMacOS || Platform.isAndroid))
+              WMenuEntry(
+                label: biometricEnabled ? '重新绑定指纹解锁' : '启用指纹解锁',
+                icon: Icons.fingerprint_rounded,
+                onTap: enableBiometric,
               ),
           ],
         ),
-      WMenuSection(
-        label: '数据管理',
-        entries: [
-          if (exists && (Platform.isMacOS || Platform.isWindows))
-            WMenuEntry(
-              label: '从 Edge / Chrome 自动导入',
-              icon: Icons.download_outlined,
-              enabled: !busy,
-              onTap: importFromBrowser,
-            ),
-          if (exists)
-            WMenuEntry(
-              label: '手动导入浏览器 CSV',
-              icon: Icons.file_open_outlined,
-              enabled: !busy,
-              onTap: importCsv,
-            ),
-        ],
+        if (dangerEntries.isNotEmpty) WMenuSection(entries: dangerEntries),
+      ],
+      triggerBuilder: (context, controller, open) => WIconButton(
+        icon: Icons.more_horiz_rounded,
+        tooltip: '更多',
+        active: open,
+        onPressed: () => open ? controller.close() : controller.open(),
       ),
-      WMenuSection(
-        label: '系统工具',
-        entries: [
-          WMenuEntry(
-            label: '设备诊断',
-            icon: Icons.monitor_heart_outlined,
-            onTap: token == null ? null : _openProbe,
-            enabled: token != null,
-          ),
-        ],
-      ),
-    ],
-    triggerBuilder: (context, controller, open) => WIconButton(
-      icon: Icons.more_horiz_rounded,
-      tooltip: '更多',
-      active: open,
-      onPressed: () => open ? controller.close() : controller.open(),
-    ),
-  );
+    );
+  }
 
   Widget _headerActions(BuildContext context) {
     final c = WColors.of(context);
-    Widget gap() => const SizedBox(width: 2);
-    Widget separator() => Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8),
-      child: Container(width: 1, height: 18, color: c.border),
-    );
-    final canImport =
-        exists && (Platform.isMacOS || Platform.isWindows || Platform.isLinux);
+    final syncBadge = initialSyncPending
+        ? c.warning
+        : remoteUpdateAvailable
+        ? c.brand
+        : null;
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
         if (!trash && !showSyncHistory) ...[
           SizedBox(
-            height: 30,
+            height: 32,
             child: FilledButton.icon(
               onPressed: busy ? null : () => edit(null),
               icon: const Icon(Icons.add_rounded, size: 16),
               label: const Text('新增账号'),
               style: FilledButton.styleFrom(
-                minimumSize: const Size(0, 30),
-                padding: const EdgeInsets.symmetric(horizontal: 10),
-                textStyle: Theme.of(context).textTheme.labelLarge
-                    ?.copyWith(fontSize: 12),
+                minimumSize: const Size(0, 32),
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                textStyle: Theme.of(
+                  context,
+                ).textTheme.labelLarge?.copyWith(fontSize: 12.2),
               ),
             ),
           ),
           const SizedBox(width: 8),
         ],
-        WCommandMenu(
-          width: 226,
-          sections: [
-            WMenuSection(
-              label: '导入密码',
-              entries: [
-                if (Platform.isMacOS || Platform.isWindows)
-                  WMenuEntry(
-                    label: '从 Edge / Chrome 自动导入',
-                    icon: Icons.download_outlined,
-                    enabled: canImport && !busy,
-                    onTap: importFromBrowser,
-                  ),
-                WMenuEntry(
-                  label: '手动导入浏览器 CSV',
-                  icon: Icons.file_open_outlined,
-                  enabled: canImport && !busy,
-                  onTap: importCsv,
-                ),
-              ],
-            ),
-          ],
-          triggerBuilder: (context, controller, open) => WIconButton(
-            icon: Icons.download_outlined,
-            tooltip: '导入密码',
-            active: open,
-            onPressed: () => open ? controller.close() : controller.open(),
-          ),
-        ),
-        gap(),
         WIconButton(
           icon: Icons.sync_rounded,
           tooltip: syncing ? '正在同步…' : '立即同步',
           busy: syncing,
+          badgeColor: syncBadge,
           onPressed: busy || syncing ? null : sync,
         ),
-        gap(),
-        WIconButton(
-          icon: Icons.save_alt_rounded,
-          tooltip: '导出加密备份',
-          onPressed: busy ? null : backup,
-        ),
-        separator(),
-        WIconButton(
-          icon: Icons.lock_outline_rounded,
-          tooltip: '锁定密码库',
-          onPressed: lock,
-        ),
+        const SizedBox(width: 2),
         _settingsMenu(),
+        const SizedBox(width: 2),
         _moreMenu(),
       ],
     );
   }
 
+  String _activePageTitle() {
+    if (showSyncHistory) return '同步记录';
+    if (trash) return '回收站';
+    if (selectedGroup == EntryFilter.pinned) return '已置顶';
+    if (selectedGroup == EntryFilter.ungrouped) return '未分组';
+    if (selectedGroup is String) {
+      return _selectedNamedGroup(_groupOptions()) ?? selectedGroup as String;
+    }
+    return '密码库';
+  }
+
   Widget _pageHeader(BuildContext context, String pageLabel) {
     final c = WColors.of(context);
-    final count = showSyncHistory
-        ? null
-        : entries.where((row) => row['deleted'] == trash).length;
+    final searchShortcut = Platform.isMacOS ? '⌘F' : 'Ctrl+F';
     return Container(
-      height: 52,
-      padding: const EdgeInsets.symmetric(horizontal: 16),
+      height: 54,
+      padding: const EdgeInsets.symmetric(horizontal: 18),
       color: c.surface,
       child: Row(
         children: [
-          Text(
-            pageLabel,
-            style: TextStyle(
-              fontSize: 13.5,
-              fontWeight: FontWeight.w600,
-              letterSpacing: -0.1,
-              color: c.textPrimary,
+          Flexible(
+            flex: 0,
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 160),
+              child: Text(
+                pageLabel,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: -0.2,
+                  color: c.textPrimary,
+                ),
+              ),
             ),
           ),
-          if (count != null) ...[
-            const SizedBox(width: 8),
-            WStatusPill(label: _countLabel(count), compact: true),
-          ],
-          const SizedBox(width: 16),
+          const SizedBox(width: 18),
           if (!showSyncHistory)
             Expanded(
               child: Align(
                 alignment: Alignment.centerLeft,
                 child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 330),
+                  constraints: const BoxConstraints(maxWidth: 360),
                   child: WSearchField(
                     controller: searchController,
                     focusNode: searchFocus,
                     hintText: '搜索名称、用户名、网址、分组或备注',
+                    shortcutHint: query.isEmpty ? searchShortcut : null,
                     trailing: query.isEmpty
                         ? null
                         : SizedBox(
@@ -5019,13 +5802,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
         MediaQuery.sizeOf(context).width >= 860;
     final c = WColors.of(context);
     final mac = Platform.isMacOS;
-    final pageLabel = !unlocked
-        ? 'Wencrypt'
-        : showSyncHistory
-        ? '同步记录'
-        : trash
-        ? '回收站'
-        : '密码库';
+    final pageLabel = !unlocked ? 'Wencrypt' : _activePageTitle();
     final page = !unlocked
         ? _buildLockedView(context)
         : showSyncHistory
@@ -5037,6 +5814,11 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
           icon: Icons.sync_rounded,
           tooltip: syncing ? '正在同步…' : '立即同步',
           busy: syncing,
+          badgeColor: initialSyncPending
+              ? c.warning
+              : remoteUpdateAvailable
+              ? c.brand
+              : null,
           onPressed: busy || syncing ? null : sync,
         ),
       if (unlocked)
@@ -5058,6 +5840,12 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
           if (unlocked)
             SingleActivator(LogicalKeyboardKey.keyF, meta: mac, control: !mac):
                 _focusVaultSearch,
+          if (unlocked && !busy)
+            SingleActivator(LogicalKeyboardKey.keyN, meta: mac, control: !mac):
+                () {
+                  _selectWorkspace(0);
+                  edit(null);
+                },
         },
         child: Focus(
           autofocus: true,
@@ -5114,11 +5902,696 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                   )
                 : page,
             floatingActionButton:
-                unlocked && !trash && !showSyncHistory && !busy
+                !desktop && unlocked && !trash && !showSyncHistory && !busy
                 ? WFloatingAction(label: '新增账号', onPressed: () => edit(null))
                 : null,
             floatingActionButtonLocation: FloatingActionButtonLocation.endFloat,
           ),
+        ),
+      ),
+    );
+  }
+}
+
+class _InviteDeviceDialog extends StatefulWidget {
+  const _InviteDeviceDialog({
+    required this.vaultId,
+    required this.sessionToken,
+    required this.syncConfigured,
+    required this.hasSyncTargets,
+    required this.invoke,
+    required this.onSenderChanged,
+    required this.onCopyCode,
+    required this.onCopyLegacyLink,
+    required this.onActivity,
+    required this.describeError,
+  });
+
+  final String vaultId;
+  final String sessionToken;
+  final bool syncConfigured;
+  final bool hasSyncTargets;
+  final CoreInvoker invoke;
+  final ValueChanged<LanTransferSender?> onSenderChanged;
+  final Future<void> Function(String value, String label) onCopyCode;
+  final Future<void> Function()? onCopyLegacyLink;
+  final VoidCallback onActivity;
+  final String Function(Object error) describeError;
+
+  @override
+  State<_InviteDeviceDialog> createState() => _InviteDeviceDialogState();
+}
+
+class _InviteDeviceDialogState extends State<_InviteDeviceDialog> {
+  late int _mode; // 0 = offline encrypted invite, 1 = LAN direct
+
+  // Offline invite state
+  bool _loadingOffline = false;
+  String? _offlineUri;
+  int _offlineFolderCount = 0;
+  String? _offlineError;
+
+  // LAN transfer state
+  bool _includeSync = true;
+  bool _startingLan = false;
+  LanTransferSender? _sender;
+  String? _lanUri;
+  String? _lanError;
+  bool _lanExpired = false;
+  bool _lanCompleted = false;
+  int _remainingSeconds = 120;
+  Timer? _countdown;
+  LanPeerRequest? _pendingPeer;
+  Completer<bool>? _peerDecision;
+  LanTransferProgress? _lanProgress;
+
+  @override
+  void initState() {
+    super.initState();
+    _mode = widget.syncConfigured ? 0 : 1;
+    _includeSync = widget.syncConfigured;
+    if (_mode == 0) {
+      unawaited(_loadOfflineInvite());
+    } else {
+      unawaited(_startLan());
+    }
+  }
+
+  @override
+  void dispose() {
+    _countdown?.cancel();
+    if (_peerDecision != null && !_peerDecision!.isCompleted) {
+      _peerDecision!.complete(false);
+    }
+    _sender?.dispose();
+    widget.onSenderChanged(null);
+    super.dispose();
+  }
+
+  Future<void> _loadOfflineInvite() async {
+    if (!widget.syncConfigured || _loadingOffline || _offlineUri != null) {
+      return;
+    }
+    setState(() {
+      _loadingOffline = true;
+      _offlineError = null;
+    });
+    try {
+      final res = await widget.invoke({'op': 'export_encrypted_invite'});
+      final payloadHex = res['payload'] as String;
+      final parsed = EncryptedVaultInvite.fromPayloadHex(payloadHex);
+      if (parsed == null) throw StateError('invalid_invite');
+      if (!mounted) return;
+      setState(() {
+        _offlineUri = parsed.toUri().toString();
+        _offlineFolderCount = (res['folder_count'] as int?) ?? 1;
+        _loadingOffline = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _offlineError = widget.describeError(e);
+        _loadingOffline = false;
+      });
+    }
+  }
+
+  void _stopLan() {
+    _countdown?.cancel();
+    _countdown = null;
+    if (_peerDecision != null && !_peerDecision!.isCompleted) {
+      _peerDecision!.complete(false);
+    }
+    _peerDecision = null;
+    _sender?.dispose();
+    _sender = null;
+    widget.onSenderChanged(null);
+  }
+
+  Future<void> _startLan() async {
+    _stopLan();
+    setState(() {
+      _startingLan = true;
+      _lanUri = null;
+      _lanError = null;
+      _lanExpired = false;
+      _lanCompleted = false;
+      _pendingPeer = null;
+      _lanProgress = null;
+      _remainingSeconds = 120;
+    });
+    try {
+      final sender = await LanTransferSender.start(
+        vaultId: widget.vaultId,
+        sessionToken: widget.sessionToken,
+        invoke: widget.invoke,
+        includeSyncSettings: _includeSync && widget.syncConfigured,
+        onPeerRequest: (peer) async {
+          widget.onActivity();
+          if (!mounted) return false;
+          final decision = Completer<bool>();
+          setState(() {
+            _pendingPeer = peer;
+            _peerDecision = decision;
+          });
+          return decision.future;
+        },
+        onProgress: (progress) {
+          widget.onActivity();
+          if (!mounted) return;
+          setState(() => _lanProgress = progress);
+        },
+        onComplete: () {
+          if (!mounted) return;
+          _countdown?.cancel();
+          setState(() {
+            _lanCompleted = true;
+            _pendingPeer = null;
+          });
+        },
+        onExpired: () {
+          if (_peerDecision != null && !_peerDecision!.isCompleted) {
+            _peerDecision!.complete(false);
+          }
+          _peerDecision = null;
+          if (!mounted) return;
+          _countdown?.cancel();
+          setState(() {
+            _lanExpired = true;
+            _pendingPeer = null;
+            _lanUri = null;
+          });
+        },
+        onError: (err) {
+          if (_peerDecision != null && !_peerDecision!.isCompleted) {
+            _peerDecision!.complete(false);
+          }
+          _peerDecision = null;
+          if (!mounted) return;
+          _countdown?.cancel();
+          setState(() {
+            _lanError = widget.describeError(err);
+            _pendingPeer = null;
+          });
+        },
+      );
+      if (!mounted) {
+        sender.dispose();
+        return;
+      }
+      widget.onSenderChanged(sender);
+      _countdown = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (!mounted || _sender == null) return;
+        final left = _sender!.expiresAt.difference(DateTime.now()).inSeconds;
+        setState(() => _remainingSeconds = left.clamp(0, 120));
+      });
+      setState(() {
+        _sender = sender;
+        _lanUri = sender.ticket.toUri().toString();
+        _startingLan = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _lanError = widget.describeError(e);
+        _startingLan = false;
+      });
+    }
+  }
+
+  void _switchMode(int next) {
+    if (_mode == next) return;
+    widget.onActivity();
+    setState(() => _mode = next);
+    if (next == 0) {
+      _stopLan();
+      unawaited(_loadOfflineInvite());
+    } else if (_sender == null && !_lanCompleted) {
+      unawaited(_startLan());
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = WColors.of(context);
+    final theme = Theme.of(context);
+    return WDialog(
+      width: 520,
+      icon: Icons.qr_code_2_rounded,
+      title: '邀请新设备加入',
+      subtitle: '免输入坚果云账号与应用密码，通过加密二维码或配对码安全添加设备。',
+      footer: WDialogFooter(
+        leading: _mode == 0 && widget.onCopyLegacyLink != null
+            ? TextButton(
+                style: TextButton.styleFrom(foregroundColor: c.textSecondary),
+                onPressed: () async {
+                  final nav = Navigator.of(context);
+                  nav.pop();
+                  await widget.onCopyLegacyLink!();
+                },
+                child: const Text('复制旧版目录链接'),
+              )
+            : null,
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: Text(_lanCompleted ? '完成' : '关闭'),
+          ),
+        ],
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Center(
+            child: WSegmented<int>(
+              value: _mode,
+              onChanged: _switchMode,
+              segments: const [
+                (0, '离线加密邀请', Icons.lock_outline_rounded),
+                (1, '同 WiFi 直连', Icons.wifi_tethering_rounded),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          if (_mode == 0) _buildOfflineTab(c, theme) else _buildLanTab(c, theme),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildOfflineTab(WColors c, ThemeData theme) {
+    if (!widget.syncConfigured) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const WNote(
+            tone: WTone.warning,
+            child: Text(
+              '离线加密邀请需要将坚果云凭据用主密码加密打包。请先配置坚果云同步，或直接切换到上方「同 WiFi 直连」免云盘传输密码库。',
+            ),
+          ),
+          const SizedBox(height: 12),
+          OutlinedButton.icon(
+            onPressed: () => _switchMode(1),
+            icon: const Icon(Icons.wifi_tethering_rounded, size: 16),
+            label: const Text('改用同 WiFi 直连'),
+          ),
+        ],
+      );
+    }
+    if (_loadingOffline) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 48),
+        child: Center(child: CircularProgressIndicator(strokeWidth: 2)),
+      );
+    }
+    if (_offlineError != null) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          WNote(tone: WTone.danger, child: Text(_offlineError!)),
+          const SizedBox(height: 12),
+          OutlinedButton(
+            onPressed: _loadOfflineInvite,
+            child: const Text('重试生成'),
+          ),
+        ],
+      );
+    }
+    final uri = _offlineUri;
+    if (uri == null) return const SizedBox.shrink();
+    final canQr = utf8.encode(uri).length <= 858;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        if (canQr)
+          WQrCode(data: uri, size: 204)
+        else
+          const WNote(
+            tone: WTone.info,
+            icon: Icons.info_outline_rounded,
+            child: Text('同步目录较多，超出二维码单码容量，请直接点击下方按钮复制加密邀请码发送给新设备。'),
+          ),
+        const SizedBox(height: 12),
+        Text(
+          '已打包 $_offlineFolderCount 个已启用同步目录与加密凭据',
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: c.textSecondary,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+        const SizedBox(height: 12),
+        SizedBox(
+          width: double.infinity,
+          child: FilledButton.icon(
+            onPressed: () => widget.onCopyCode(uri, '加密邀请码'),
+            icon: const Icon(Icons.copy_rounded, size: 16),
+            label: const Text('复制加密邀请码'),
+          ),
+        ),
+        const SizedBox(height: 12),
+        const WNote(
+          tone: WTone.info,
+          icon: Icons.shield_outlined,
+          child: Text(
+            '新设备扫码或粘贴后仅需输入 1 次主密码即可自动同步。密文经过 Argon2id 与 AES-256-GCM 保护，通过微信或剪贴板转发同样安全。',
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildLanTab(WColors c, ThemeData theme) {
+    if (_lanCompleted) {
+      return const WNote(
+        tone: WTone.success,
+        icon: Icons.check_circle_outline_rounded,
+        child: Text('传输完成！新设备已安全加入此密码库，临时局域网通道与会话密钥已自动销毁。'),
+      );
+    }
+    if (_pendingPeer case final peer?) {
+      final transferring = _peerDecision?.isCompleted == true;
+      final frac = _lanProgress?.fraction;
+      return WSurface(
+        radius: WRadius.lg,
+        padding: const EdgeInsets.all(16),
+        color: c.surfaceMuted,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.devices_rounded, size: 18, color: c.brand),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    '新设备请求加入：${peer.deviceLabel}',
+                    style: theme.textTheme.titleSmall,
+                  ),
+                ),
+                WMono(peer.remoteAddress, size: 11, color: c.textTertiary),
+              ],
+            ),
+            const SizedBox(height: 14),
+            Container(
+              padding: const EdgeInsets.symmetric(vertical: 14),
+              decoration: BoxDecoration(
+                color: c.surface,
+                borderRadius: BorderRadius.circular(WRadius.md),
+                border: Border.all(color: c.border),
+              ),
+              child: Column(
+                children: [
+                  Text(
+                    '安全核对码',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      color: c.textTertiary,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    peer.sas,
+                    style: TextStyle(
+                      fontFamily: wMonoFamily,
+                      fontSize: 26,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 3,
+                      color: c.brand,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            if (!transferring) ...[
+              Text(
+                '请确认新设备屏幕显示相同核对码。允许后将在加密信道中直接传输密钥与本地账号。',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: c.textSecondary,
+                ),
+              ),
+              const SizedBox(height: 14),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton(
+                      onPressed: () {
+                        if (_peerDecision != null &&
+                            !_peerDecision!.isCompleted) {
+                          _peerDecision!.complete(false);
+                        }
+                        setState(() => _pendingPeer = null);
+                      },
+                      child: const Text('拒绝'),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: FilledButton(
+                      onPressed: () {
+                        if (_peerDecision != null &&
+                            !_peerDecision!.isCompleted) {
+                          _peerDecision!.complete(true);
+                          setState(() {});
+                        }
+                      },
+                      child: const Text('允许传输'),
+                    ),
+                  ),
+                ],
+              ),
+            ] else ...[
+              LinearProgressIndicator(value: frac),
+              const SizedBox(height: 8),
+              Text(
+                _lanProgress == null
+                    ? '正在加密打包密码库…'
+                    : '正在安全传输 ${_lanProgress!.transferred}/${_lanProgress!.total} 条修订…',
+                textAlign: TextAlign.center,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: c.textSecondary,
+                ),
+              ),
+            ],
+          ],
+        ),
+      );
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (widget.syncConfigured)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: CheckboxListTile(
+              dense: true,
+              value: _includeSync,
+              contentPadding: EdgeInsets.zero,
+              onChanged: _startingLan
+                  ? null
+                  : (v) {
+                      setState(() => _includeSync = v == true);
+                      unawaited(_startLan());
+                    },
+              title: const Text('同时传输坚果云同步配置'),
+            ),
+          ),
+        if (_startingLan)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 42),
+            child: Center(child: CircularProgressIndicator(strokeWidth: 2)),
+          )
+        else if (_lanError != null) ...[
+          WNote(tone: WTone.danger, child: Text(_lanError!)),
+          const SizedBox(height: 12),
+          OutlinedButton(
+            onPressed: _startLan,
+            child: const Text('重新开启直连'),
+          ),
+        ] else if (_lanExpired || _lanUri == null) ...[
+          const WNote(
+            tone: WTone.warning,
+            child: Text('本次局域网配对已超时关闭（120 秒），请重新生成一次性配对码。'),
+          ),
+          const SizedBox(height: 12),
+          FilledButton(
+            onPressed: _startLan,
+            child: const Text('重新开启（120 秒）'),
+          ),
+        ] else ...[
+          Center(child: WQrCode(data: _lanUri!, size: 196)),
+          const SizedBox(height: 10),
+          Center(
+            child: WMono(
+              '${_sender!.ticket.ips.join(' / ')} : ${_sender!.ticket.port} · 剩余 $_remainingSeconds 秒',
+              size: 11,
+              color: c.textSecondary,
+            ),
+          ),
+          const SizedBox(height: 12),
+          FilledButton.icon(
+            onPressed: () => widget.onCopyCode(_lanUri!, '局域网配对码'),
+            icon: const Icon(Icons.copy_rounded, size: 16),
+            label: const Text('复制局域网配对码'),
+          ),
+          const SizedBox(height: 10),
+          const WNote(
+            tone: WTone.info,
+            icon: Icons.wifi_tethering_rounded,
+            child: Text(
+              '请确保两台设备在同一 WiFi 下。新设备扫码或粘贴后，本机将弹出 6 位安全核对码，确认后免输主密码直接完成加入。',
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+class _LanJoinDialog extends StatefulWidget {
+  const _LanJoinDialog({
+    required this.ticket,
+    required this.vaultPath,
+    required this.deviceLabel,
+    required this.invoke,
+    required this.describeError,
+  });
+
+  final LanTransferTicket ticket;
+  final String vaultPath;
+  final String deviceLabel;
+  final CoreInvoker invoke;
+  final String Function(Object error) describeError;
+
+  @override
+  State<_LanJoinDialog> createState() => _LanJoinDialogState();
+}
+
+class _LanJoinDialogState extends State<_LanJoinDialog> {
+  bool _cancelled = false;
+  String? _sas;
+  LanTransferProgress? _progress;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_run());
+  }
+
+  @override
+  void dispose() {
+    _cancelled = true;
+    super.dispose();
+  }
+
+  Future<void> _run() async {
+    try {
+      final result = await LanTransferReceiver.join(
+        ticket: widget.ticket,
+        vaultPath: widget.vaultPath,
+        deviceLabel: widget.deviceLabel,
+        invoke: widget.invoke,
+        onSasReady: (sas) {
+          if (mounted) setState(() => _sas = sas);
+        },
+        onProgress: (p) {
+          if (mounted) setState(() => _progress = p);
+        },
+        isCancelled: () => _cancelled || !mounted,
+      );
+      if (mounted && !_cancelled) {
+        Navigator.of(context).pop(result);
+      }
+    } catch (e) {
+      if (!mounted || _cancelled) return;
+      setState(() => _error = widget.describeError(e));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = WColors.of(context);
+    final theme = Theme.of(context);
+    final finished = _error != null;
+    return PopScope(
+      canPop: finished,
+      child: WDialog(
+        width: 440,
+        icon: Icons.wifi_tethering_rounded,
+        title: '同 WiFi 快捷加入',
+        subtitle: '端到端加密通道已建立，无需输入主密码或坚果云凭据。',
+        footer: WDialogFooter(
+          actions: [
+            TextButton(
+              onPressed: () {
+                _cancelled = true;
+                Navigator.of(context).pop();
+              },
+              child: Text(finished ? '关闭' : '取消'),
+            ),
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (_error case final err?)
+              WNote(tone: WTone.danger, child: Text(err))
+            else ...[
+              if (_sas case final sas?) ...[
+                Container(
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  decoration: BoxDecoration(
+                    color: c.surfaceMuted,
+                    borderRadius: BorderRadius.circular(WRadius.md),
+                    border: Border.all(color: c.border),
+                  ),
+                  child: Column(
+                    children: [
+                      Text(
+                        '安全核对码',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          color: c.textTertiary,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        sas,
+                        style: TextStyle(
+                          fontFamily: wMonoFamily,
+                          fontSize: 26,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: 3,
+                          color: c.brand,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 14),
+              ],
+              LinearProgressIndicator(value: _progress?.fraction),
+              const SizedBox(height: 10),
+              Text(
+                _progress != null
+                    ? '正在安全接收密码数据 (${_progress!.transferred}/${_progress!.total})…'
+                    : _sas != null
+                    ? '正在等待原设备核对并允许传输…'
+                    : '正在连接原设备 (${widget.ticket.ips.first}:${widget.ticket.port})…',
+                textAlign: TextAlign.center,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: c.textSecondary,
+                ),
+              ),
+            ],
+          ],
         ),
       ),
     );

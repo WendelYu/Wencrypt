@@ -43,6 +43,7 @@ class WIconButton extends StatelessWidget {
     this.color,
     this.active = false,
     this.busy = false,
+    this.badgeColor,
   });
 
   final IconData icon;
@@ -53,6 +54,7 @@ class WIconButton extends StatelessWidget {
   final Color? color;
   final bool active;
   final bool busy;
+  final Color? badgeColor;
 
   @override
   Widget build(BuildContext context) {
@@ -73,17 +75,35 @@ class WIconButton extends StatelessWidget {
             borderRadius: BorderRadius.circular(WRadius.sm),
             hoverColor: c.hover,
             onTap: busy ? null : onPressed,
-            child: Center(
-              child: busy
-                  ? SizedBox(
-                      width: iconSize - 3,
-                      height: iconSize - 3,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 1.7,
-                        color: c.brand,
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                if (busy)
+                  SizedBox(
+                    width: iconSize - 3,
+                    height: iconSize - 3,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 1.7,
+                      color: c.brand,
+                    ),
+                  )
+                else
+                  Icon(icon, size: iconSize, color: foreground),
+                if (badgeColor != null && !busy)
+                  Positioned(
+                    top: 4,
+                    right: 4,
+                    child: Container(
+                      width: 6,
+                      height: 6,
+                      decoration: BoxDecoration(
+                        color: badgeColor,
+                        shape: BoxShape.circle,
+                        border: Border.all(color: c.surface, width: 1),
                       ),
-                    )
-                  : Icon(icon, size: iconSize, color: foreground),
+                    ),
+                  ),
+              ],
             ),
           ),
         ),
@@ -300,13 +320,13 @@ class WAvatar extends StatelessWidget {
     final base = HSLColor.fromAHSL(
       1,
       hue.toDouble(),
-      dark ? 0.35 : 0.46,
-      dark ? 0.26 : 0.94,
+      dark ? 0.26 : 0.44,
+      dark ? 0.21 : 0.94,
     ).toColor();
     final fg = HSLColor.fromAHSL(
       1,
       hue.toDouble(),
-      dark ? 0.55 : 0.52,
+      dark ? 0.48 : 0.50,
       dark ? 0.78 : 0.34,
     ).toColor();
     final initial = label.trim().isEmpty
@@ -319,7 +339,7 @@ class WAvatar extends StatelessWidget {
       decoration: BoxDecoration(
         color: base,
         borderRadius: BorderRadius.circular(size * 0.28),
-        border: Border.all(color: fg.withValues(alpha: dark ? 0.16 : 0.10)),
+        border: Border.all(color: fg.withValues(alpha: dark ? 0.14 : 0.10)),
       ),
       child: Text(
         initial,
@@ -521,6 +541,7 @@ class WSearchField extends StatelessWidget {
     this.onChanged,
     this.onSubmitted,
     this.trailing,
+    this.shortcutHint,
     this.focusNode,
     this.autofocus = false,
   });
@@ -530,12 +551,21 @@ class WSearchField extends StatelessWidget {
   final ValueChanged<String>? onChanged;
   final ValueChanged<String>? onSubmitted;
   final Widget? trailing;
+  final String? shortcutHint;
   final FocusNode? focusNode;
   final bool autofocus;
 
   @override
   Widget build(BuildContext context) {
     final c = WColors.of(context);
+    final effectiveTrailing =
+        trailing ??
+        (shortcutHint != null
+            ? Padding(
+                padding: const EdgeInsets.only(right: 6),
+                child: WShortcutBadge(label: shortcutHint!),
+              )
+            : null);
     return SizedBox(
       height: 34,
       child: TextField(
@@ -544,8 +574,9 @@ class WSearchField extends StatelessWidget {
         autofocus: autofocus,
         onChanged: onChanged,
         onSubmitted: onSubmitted,
-        style: Theme.of(context).textTheme.bodyMedium
-            ?.copyWith(color: c.textPrimary),
+        style: Theme.of(
+          context,
+        ).textTheme.bodyMedium?.copyWith(color: c.textPrimary),
         decoration: InputDecoration(
           hintText: hintText,
           isDense: true,
@@ -563,7 +594,7 @@ class WSearchField extends StatelessWidget {
             minWidth: 32,
             minHeight: 32,
           ),
-          suffixIcon: trailing,
+          suffixIcon: effectiveTrailing,
           suffixIconConstraints: const BoxConstraints(
             minWidth: 30,
             minHeight: 30,
@@ -947,11 +978,14 @@ class WAccountRow extends StatefulWidget {
     this.group,
     this.avatar,
     this.pinned = false,
+    this.active = false,
     this.selected = false,
     this.selectionMode = false,
     this.showCheckbox = false,
     this.showPin = true,
+    this.compactActions = false,
     this.onOpen,
+    this.onDoubleTap,
     this.onTogglePin,
     this.onCopyPassword,
     this.onCopyUsername,
@@ -965,12 +999,15 @@ class WAccountRow extends StatefulWidget {
   final String? group;
   final Widget? avatar;
   final bool pinned;
+  final bool active;
   final bool selected;
   final bool selectionMode;
   final bool showCheckbox;
   final bool showPin;
+  final bool compactActions;
   final List<WMenuSection> menuSections;
   final VoidCallback? onOpen;
+  final VoidCallback? onDoubleTap;
   final VoidCallback? onTogglePin;
   final VoidCallback? onCopyPassword;
   final VoidCallback? onCopyUsername;
@@ -989,23 +1026,35 @@ class _WAccountRowState extends State<WAccountRow> {
   Widget build(BuildContext context) {
     final c = WColors.of(context);
     final theme = Theme.of(context);
-    final actionsVisible = _hover || widget.selected;
+    final highlighted = widget.selected || widget.active;
+    final actionsVisible = _hover || highlighted;
+    final showGroupTag =
+        widget.group != null &&
+        widget.group!.isNotEmpty &&
+        widget.group!.trim().toLowerCase() != widget.title.trim().toLowerCase();
     return MouseRegion(
       cursor: SystemMouseCursors.click,
       onEnter: (_) => setState(() => _hover = true),
       onExit: (_) => setState(() => _hover = false),
       child: Material(
-        color: widget.selected
+        color: highlighted
             ? c.brandSoft
             : (_hover ? c.hover : Colors.transparent),
         child: InkWell(
           onTap: widget.selectionMode ? widget.onToggleSelect : widget.onOpen,
+          onDoubleTap: widget.selectionMode ? null : widget.onDoubleTap,
           hoverColor: Colors.transparent,
           child: Container(
-            padding: const EdgeInsets.fromLTRB(12, 6, 8, 6),
+            padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
             decoration: BoxDecoration(
               border: Border(
-                bottom: BorderSide(color: c.border.withValues(alpha: 0.7)),
+                left: BorderSide(
+                  color: widget.active && !widget.selectionMode
+                      ? c.brand
+                      : Colors.transparent,
+                  width: 2.5,
+                ),
+                bottom: BorderSide(color: c.border.withValues(alpha: 0.6)),
               ),
             ),
             child: Row(
@@ -1018,7 +1067,7 @@ class _WAccountRowState extends State<WAccountRow> {
                   const SizedBox(width: 8),
                 ],
                 widget.avatar ??
-                    WAvatar(label: widget.title, seed: widget.title, size: 30),
+                    WAvatar(label: widget.title, seed: widget.title, size: 32),
                 const SizedBox(width: 10),
                 Expanded(
                   child: Column(
@@ -1027,6 +1076,14 @@ class _WAccountRowState extends State<WAccountRow> {
                     children: [
                       Row(
                         children: [
+                          if (widget.pinned && widget.compactActions) ...[
+                            Icon(
+                              Icons.push_pin_rounded,
+                              size: 11.5,
+                              color: c.brand,
+                            ),
+                            const SizedBox(width: 4),
+                          ],
                           Flexible(
                             child: Text(
                               widget.title,
@@ -1036,22 +1093,22 @@ class _WAccountRowState extends State<WAccountRow> {
                                 fontSize:
                                     theme.platform == TargetPlatform.windows
                                     ? 13.5
-                                    : 12.8,
+                                    : 13,
                                 fontWeight:
                                     theme.platform == TargetPlatform.windows
                                     ? FontWeight.w400
                                     : FontWeight.w600,
+                                color: widget.active ? c.brand : c.textPrimary,
                               ),
                             ),
                           ),
-                          if (widget.group case final group?
-                              when group.isNotEmpty) ...[
+                          if (showGroupTag) ...[
                             const SizedBox(width: 6),
-                            _groupTag(context, group),
+                            _groupTag(context, widget.group!),
                           ],
                         ],
                       ),
-                      const SizedBox(height: 1),
+                      const SizedBox(height: 2),
                       Text(
                         widget.meta,
                         maxLines: 1,
@@ -1061,15 +1118,15 @@ class _WAccountRowState extends State<WAccountRow> {
                               ? 12
                               : 11.5,
                           height: 1.3,
-                          color: c.textTertiary,
+                          color: c.textSecondary.withValues(alpha: 0.85),
                         ),
                       ),
                     ],
                   ),
                 ),
-                const SizedBox(width: 8),
+                const SizedBox(width: 6),
                 if (!widget.selectionMode) ...[
-                  if (widget.showPin)
+                  if (widget.showPin && !widget.compactActions)
                     AnimatedOpacity(
                       duration: const Duration(milliseconds: 120),
                       opacity: actionsVisible || widget.pinned ? 1 : 0,
@@ -1087,7 +1144,7 @@ class _WAccountRowState extends State<WAccountRow> {
                   if (widget.onPurge != null)
                     AnimatedOpacity(
                       duration: const Duration(milliseconds: 120),
-                      opacity: actionsVisible ? 1 : 0.55,
+                      opacity: actionsVisible ? 1 : 0.45,
                       child: WIconButton(
                         icon: Icons.delete_forever_outlined,
                         tooltip: '从回收站清除',
@@ -1099,7 +1156,9 @@ class _WAccountRowState extends State<WAccountRow> {
                     ),
                   AnimatedOpacity(
                     duration: const Duration(milliseconds: 120),
-                    opacity: actionsVisible ? 1 : 0.5,
+                    opacity: actionsVisible
+                        ? 1
+                        : (widget.compactActions ? 0 : 0.35),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
@@ -1110,13 +1169,14 @@ class _WAccountRowState extends State<WAccountRow> {
                           size: 26,
                           iconSize: 15,
                         ),
-                        WIconButton(
-                          icon: Icons.person_outline_rounded,
-                          tooltip: '查看账号详情',
-                          onPressed: widget.onEdit,
-                          size: 26,
-                          iconSize: 15,
-                        ),
+                        if (!widget.compactActions)
+                          WIconButton(
+                            icon: Icons.edit_outlined,
+                            tooltip: '编辑详情',
+                            onPressed: widget.onEdit,
+                            size: 26,
+                            iconSize: 15,
+                          ),
                         WCommandMenu(
                           width: 224,
                           sections: widget.menuSections,
@@ -1147,7 +1207,7 @@ class _WAccountRowState extends State<WAccountRow> {
   Widget _groupTag(BuildContext context, String group) {
     final c = WColors.of(context);
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
       decoration: BoxDecoration(
         color: c.surfaceMuted,
         borderRadius: BorderRadius.circular(4),
@@ -1301,6 +1361,570 @@ class WMono extends StatelessWidget {
         fontWeight: weight,
         color: color ?? c.textTertiary,
         letterSpacing: -0.1,
+      ),
+    );
+  }
+}
+
+/// Subtle keyboard shortcut cap (e.g. `⌘K`, `⌘F`).
+class WShortcutBadge extends StatelessWidget {
+  const WShortcutBadge({super.key, required this.label});
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = WColors.of(context);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+      decoration: BoxDecoration(
+        color: c.surface,
+        borderRadius: BorderRadius.circular(5),
+        border: Border.all(color: c.border),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          fontFamily: wMonoFamily,
+          fontSize: 10.5,
+          fontWeight: FontWeight.w500,
+          height: 1.1,
+          color: c.textTertiary,
+        ),
+      ),
+    );
+  }
+}
+
+/// Pure visual password strength meter based on length and character classes.
+class WPasswordStrength extends StatelessWidget {
+  const WPasswordStrength({super.key, required this.password});
+
+  final String password;
+
+  static (int score, String label) evaluate(String value) {
+    if (value.isEmpty) return (0, '未填写');
+    var classes = 0;
+    if (RegExp(r'[a-z]').hasMatch(value)) classes++;
+    if (RegExp(r'[A-Z]').hasMatch(value)) classes++;
+    if (RegExp(r'[0-9]').hasMatch(value)) classes++;
+    if (RegExp(r'[^a-zA-Z0-9]').hasMatch(value)) classes++;
+    final len = value.characters.length;
+    if (len >= 14 && classes >= 3) return (4, '强');
+    if (len >= 10 && classes >= 3) return (3, '较强');
+    if (len >= 8 && classes >= 2) return (2, '一般');
+    return (1, '较弱');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (password.isEmpty) return const SizedBox.shrink();
+    final c = WColors.of(context);
+    final (score, label) = evaluate(password);
+    final color = switch (score) {
+      4 => c.success,
+      3 => c.brand,
+      2 => c.warning,
+      _ => c.danger,
+    };
+    return Row(
+      children: [
+        for (var i = 1; i <= 4; i++) ...[
+          if (i > 1) const SizedBox(width: 4),
+          Expanded(
+            child: Container(
+              height: 3,
+              decoration: BoxDecoration(
+                color: i <= score ? color : c.border,
+                borderRadius: BorderRadius.circular(WRadius.pill),
+              ),
+            ),
+          ),
+        ],
+        const SizedBox(width: 8),
+        Text(
+          '$label · ${password.characters.length} 位',
+          style: TextStyle(
+            fontSize: 10.8,
+            fontWeight: FontWeight.w500,
+            color: color,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Desktop master-detail inspector for a selected vault account.
+class WAccountDetailPanel extends StatelessWidget {
+  const WAccountDetailPanel({
+    super.key,
+    required this.title,
+    required this.username,
+    required this.password,
+    required this.url,
+    required this.notes,
+    required this.groups,
+    required this.pinned,
+    required this.trash,
+    required this.hasConflict,
+    required this.revealPassword,
+    required this.onToggleReveal,
+    required this.onCopyUsername,
+    required this.onCopyPassword,
+    required this.onCopyUrl,
+    required this.onCopyNotes,
+    required this.onTogglePin,
+    required this.onEdit,
+    required this.onHistory,
+    this.onExport,
+    this.onTrashOrRestore,
+    this.onPurge,
+    this.avatar,
+    this.busy = false,
+  });
+
+  final String title;
+  final String username;
+  final String password;
+  final String url;
+  final String notes;
+  final List<String> groups;
+  final bool pinned;
+  final bool trash;
+  final bool hasConflict;
+  final bool revealPassword;
+  final VoidCallback onToggleReveal;
+  final VoidCallback? onCopyUsername;
+  final VoidCallback? onCopyPassword;
+  final VoidCallback? onCopyUrl;
+  final VoidCallback? onCopyNotes;
+  final VoidCallback? onTogglePin;
+  final VoidCallback? onEdit;
+  final VoidCallback? onHistory;
+  final VoidCallback? onExport;
+  final VoidCallback? onTrashOrRestore;
+  final VoidCallback? onPurge;
+  final Widget? avatar;
+  final bool busy;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = WColors.of(context);
+    final theme = Theme.of(context);
+    final displayTitle = title.isEmpty ? '未命名账号' : title;
+    final visibleGroups = groups
+        .where(
+          (g) =>
+              g.trim().isNotEmpty &&
+              g.trim().toLowerCase() != displayTitle.trim().toLowerCase(),
+        )
+        .toList();
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // Header card
+          WSurface(
+            radius: WRadius.lg,
+            padding: const EdgeInsets.fromLTRB(18, 16, 16, 16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    avatar ??
+                        WAvatar(
+                          label: displayTitle,
+                          seed: displayTitle,
+                          size: 42,
+                        ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            displayTitle,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.headlineSmall?.copyWith(
+                              fontSize: 17,
+                            ),
+                          ),
+                          if (visibleGroups.isNotEmpty || pinned || trash) ...[
+                            const SizedBox(height: 6),
+                            Wrap(
+                              spacing: 6,
+                              runSpacing: 4,
+                              children: [
+                                if (pinned)
+                                  const WStatusPill(
+                                    label: '已置顶',
+                                    icon: Icons.push_pin_rounded,
+                                    tone: WTone.info,
+                                    compact: true,
+                                  ),
+                                if (trash)
+                                  const WStatusPill(
+                                    label: '在回收站中',
+                                    icon: Icons.delete_outline_rounded,
+                                    tone: WTone.warning,
+                                    compact: true,
+                                  ),
+                                for (final g in visibleGroups)
+                                  WStatusPill(label: g, compact: true),
+                              ],
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    if (!trash)
+                      WIconButton(
+                        icon: pinned
+                            ? Icons.push_pin_rounded
+                            : Icons.push_pin_outlined,
+                        tooltip: pinned ? '取消置顶' : '置顶',
+                        active: pinned,
+                        onPressed: busy ? null : onTogglePin,
+                      ),
+                    const SizedBox(width: 4),
+                    SizedBox(
+                      height: 30,
+                      child: OutlinedButton.icon(
+                        onPressed: busy ? null : onEdit,
+                        icon: const Icon(Icons.edit_outlined, size: 14),
+                        label: Text(hasConflict ? '解决冲突' : '编辑'),
+                        style: OutlinedButton.styleFrom(
+                          minimumSize: const Size(0, 30),
+                          padding: const EdgeInsets.symmetric(horizontal: 10),
+                          textStyle: theme.textTheme.labelLarge?.copyWith(
+                            fontSize: 12,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                if (hasConflict) ...[
+                  const SizedBox(height: 14),
+                  WNote(
+                    tone: WTone.warning,
+                    child: const Text(
+                      '检测到多设备并发修改，点击右上角「解决冲突」选择保留的版本。',
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+          // Credentials surface
+          WSurface(
+            radius: WRadius.lg,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                _detailRow(
+                  context,
+                  label: '用户名',
+                  value: username.isEmpty ? '未填写' : username,
+                  muted: username.isEmpty,
+                  actions: [
+                    if (username.isNotEmpty)
+                      _copyChip(
+                        context,
+                        label: '复制',
+                        icon: Icons.copy_outlined,
+                        onTap: onCopyUsername,
+                      ),
+                  ],
+                ),
+                Divider(height: 1, color: c.border),
+                _detailRow(
+                  context,
+                  label: '密码',
+                  value: password.isEmpty
+                      ? '未填写'
+                      : (revealPassword ? password : '••••••••••••••••'),
+                  muted: password.isEmpty,
+                  mono: revealPassword,
+                  extra: password.isEmpty
+                      ? null
+                      : Padding(
+                          padding: const EdgeInsets.only(top: 8),
+                          child: WPasswordStrength(password: password),
+                        ),
+                  actions: [
+                    if (password.isNotEmpty)
+                      WIconButton(
+                        icon: revealPassword
+                            ? Icons.visibility_off_outlined
+                            : Icons.visibility_outlined,
+                        tooltip: revealPassword ? '隐藏密码' : '显示密码',
+                        size: 28,
+                        iconSize: 16,
+                        onPressed: onToggleReveal,
+                      ),
+                    if (password.isNotEmpty) ...[
+                      const SizedBox(width: 4),
+                      _copyChip(
+                        context,
+                        label: '复制密码',
+                        icon: Icons.key_outlined,
+                        primary: true,
+                        onTap: onCopyPassword,
+                      ),
+                    ],
+                  ],
+                ),
+                if (url.isNotEmpty) ...[
+                  Divider(height: 1, color: c.border),
+                  _detailRow(
+                    context,
+                    label: '网址',
+                    value: url,
+                    mono: true,
+                    actions: [
+                      _copyChip(
+                        context,
+                        label: '复制',
+                        icon: Icons.copy_outlined,
+                        onTap: onCopyUrl,
+                      ),
+                    ],
+                  ),
+                ],
+              ],
+            ),
+          ),
+          if (notes.trim().isNotEmpty) ...[
+            const SizedBox(height: 12),
+            WSurface(
+              radius: WRadius.lg,
+              padding: const EdgeInsets.fromLTRB(16, 12, 12, 14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          '备注',
+                          style: TextStyle(
+                            fontSize: 11.5,
+                            fontWeight: FontWeight.w600,
+                            color: c.textTertiary,
+                          ),
+                        ),
+                      ),
+                      WIconButton(
+                        icon: Icons.copy_outlined,
+                        tooltip: '复制备注',
+                        size: 26,
+                        iconSize: 14,
+                        onPressed: onCopyNotes,
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  SelectableText(
+                    notes,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: c.textPrimary,
+                      height: 1.55,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+          const SizedBox(height: 14),
+          // Secondary actions bar
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              _secondaryAction(
+                context,
+                icon: Icons.history_rounded,
+                label: '历史版本',
+                onTap: busy ? null : onHistory,
+              ),
+              if (onExport != null)
+                _secondaryAction(
+                  context,
+                  icon: Icons.image_outlined,
+                  label: '导出账号',
+                  onTap: busy ? null : onExport,
+                ),
+              if (onTrashOrRestore != null)
+                _secondaryAction(
+                  context,
+                  icon: trash
+                      ? Icons.restore_rounded
+                      : Icons.delete_outline_rounded,
+                  label: trash ? '恢复账号' : '移入回收站',
+                  danger: !trash,
+                  onTap: busy ? null : onTrashOrRestore,
+                ),
+              if (onPurge != null)
+                _secondaryAction(
+                  context,
+                  icon: Icons.delete_forever_outlined,
+                  label: '彻底清除',
+                  danger: true,
+                  onTap: busy ? null : onPurge,
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _detailRow(
+    BuildContext context, {
+    required String label,
+    required String value,
+    required List<Widget> actions,
+    bool muted = false,
+    bool mono = false,
+    Widget? extra,
+  }) {
+    final c = WColors.of(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 12, 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      label,
+                      style: TextStyle(
+                        fontSize: 11.2,
+                        fontWeight: FontWeight.w600,
+                        color: c.textTertiary,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    SelectableText(
+                      value,
+                      style: TextStyle(
+                        fontFamily: mono ? wMonoFamily : null,
+                        fontSize: mono ? 12.8 : 13.5,
+                        fontWeight: muted ? FontWeight.w400 : FontWeight.w500,
+                        color: muted ? c.textTertiary : c.textPrimary,
+                        letterSpacing: !mono && label == '密码' && !muted
+                            ? 2.0
+                            : 0,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              ...actions,
+            ],
+          ),
+          ?extra,
+        ],
+      ),
+    );
+  }
+
+  Widget _copyChip(
+    BuildContext context, {
+    required String label,
+    required IconData icon,
+    required VoidCallback? onTap,
+    bool primary = false,
+  }) {
+    final c = WColors.of(context);
+    return Material(
+      color: primary ? c.brandSoft : c.surfaceMuted,
+      borderRadius: BorderRadius.circular(WRadius.sm),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(WRadius.sm),
+        hoverColor: primary ? c.brand.withValues(alpha: 0.14) : c.hover,
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                icon,
+                size: 13.5,
+                color: primary ? c.brand : c.textSecondary,
+              ),
+              const SizedBox(width: 5),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 11.8,
+                  fontWeight: FontWeight.w600,
+                  color: primary ? c.brand : c.textSecondary,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _secondaryAction(
+    BuildContext context, {
+    required IconData icon,
+    required String label,
+    required VoidCallback? onTap,
+    bool danger = false,
+  }) {
+    final c = WColors.of(context);
+    final fg = danger ? c.danger : c.textSecondary;
+    return Material(
+      color: c.surface,
+      borderRadius: BorderRadius.circular(WRadius.sm),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(WRadius.sm),
+        hoverColor: danger ? c.dangerSoft : c.hover,
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(WRadius.sm),
+            border: Border.all(
+              color: danger ? c.danger.withValues(alpha: 0.25) : c.border,
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 14, color: fg),
+              const SizedBox(width: 6),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 11.8,
+                  fontWeight: FontWeight.w500,
+                  color: fg,
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }

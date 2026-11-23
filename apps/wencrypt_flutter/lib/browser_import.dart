@@ -756,136 +756,215 @@ Future<List<Map<String, String>>?> selectPasswords(
   final customGroups = groups.where((name) => name != '导入').toList();
   var group = customGroups.contains(initialGroup) ? initialGroup! : '';
 
+  final duplicateCount = duplicate.where((d) => d).length;
+  final newCount = batch.rows.length - duplicateCount;
+
   return showDialog<List<Map<String, String>>>(
     context: context,
     builder: (ctx) => StatefulBuilder(
-      builder: (ctx, update) => WDialog(
-        width: 560,
-        icon: Icons.playlist_add_check_rounded,
-        title: '选择要导入的账号（${selected.length}/${batch.rows.length}）',
-        subtitle: '相同凭据会自动合并，取消勾选可跳过。',
-        scrollable: false,
-        bodyPadding: const EdgeInsets.fromLTRB(20, 8, 20, 12),
-        footer: WDialogFooter(
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text('取消'),
-            ),
-            FilledButton(
-              onPressed: selected.isEmpty
-                  ? null
-                  : () => Navigator.pop(ctx, [
-                      for (final i in selected.toList()..sort())
-                        {...batch.rows[i], if (group.isNotEmpty) 'tags': group},
-                    ]),
-              child: const Text('导入所选账号'),
-            ),
-          ],
-        ),
-        child: SizedBox(
-          width: double.infinity,
-          height: 400,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              if (sourceFileName != null)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 4),
-                  child: Text(
-                    '已自动捕获导出文件：$sourceFileName',
-                    style: TextStyle(
-                      color: Theme.of(ctx).colorScheme.primary,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ),
-              Text('已识别 ${batch.source}，跳过 ${batch.skipped} 条无效记录。'),
-              if (customGroups.isNotEmpty)
-                DropdownButton<String>(
-                  isExpanded: true,
-                  value: group,
-                  items: [
-                    const DropdownMenuItem(value: '', child: Text('分组：导入')),
-                    for (final name in customGroups)
-                      DropdownMenuItem(
-                        value: name,
-                        child: Text(
-                          '分组：$name',
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                  ],
-                  onChanged: (value) => update(() => group = value ?? ''),
-                ),
-              const SizedBox(height: 4),
-              Wrap(
-                spacing: 8,
-                children: [
-                  TextButton(
-                    onPressed: () => update(
-                      () => selected.addAll(
-                        List.generate(batch.rows.length, (i) => i),
-                      ),
-                    ),
-                    child: const Text('全选'),
-                  ),
-                  TextButton(
-                    onPressed: () => update(selected.clear),
-                    child: const Text('清空选择'),
-                  ),
-                ],
+      builder: (ctx, update) {
+        final c = WColors.of(ctx);
+        return WDialog(
+          width: 560,
+          icon: Icons.playlist_add_check_rounded,
+          title: '选择要导入的账号（${selected.length}/${batch.rows.length}）',
+          subtitle: '相同凭据会自动合并去重，取消勾选可跳过。',
+          scrollable: false,
+          bodyPadding: const EdgeInsets.fromLTRB(20, 10, 20, 12),
+          footer: WDialogFooter(
+            actions: [
+              TextButton(
+                style: TextButton.styleFrom(foregroundColor: c.textSecondary),
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('取消'),
               ),
-              Expanded(
-                child: ListView.separated(
-                  itemCount: batch.rows.length,
-                  separatorBuilder: (_, _) => const Divider(height: 1),
-                  itemBuilder: (_, i) {
-                    final row = batch.rows[i];
-                    return CheckboxListTile(
-                      value: selected.contains(i),
-                      onChanged: (v) => update(() {
-                        if (v == true) {
-                          selected.add(i);
-                        } else {
-                          selected.remove(i);
-                        }
-                      }),
-                      title: Text(
-                        row['title']!,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      subtitle: Text(
-                        [
-                          if (duplicate[i]) '相同凭据会合并',
-                          row['username']!,
-                          row['url']!,
-                        ].where((s) => s.isNotEmpty).join(' · '),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    );
-                  },
-                ),
+              FilledButton(
+                onPressed: selected.isEmpty
+                    ? null
+                    : () => Navigator.pop(ctx, [
+                        for (final i in selected.toList()..sort())
+                          {
+                            ...batch.rows[i],
+                            if (group.isNotEmpty) 'tags': group,
+                          },
+                      ]),
+                child: const Text('导入所选账号'),
               ),
-              if (onShredChanged != null) ...[
-                const SizedBox(height: 8),
-                CheckboxListTile(
-                  value: shred,
-                  contentPadding: EdgeInsets.zero,
-                  onChanged: (v) {
-                    final next = v == true;
-                    update(() => shred = next);
-                    onShredChanged(next);
-                  },
-                  title: const Text('导入后覆盖并删除临时 CSV 文件'),
-                ),
-              ],
             ],
           ),
-        ),
-      ),
+          child: SizedBox(
+            width: double.infinity,
+            height: 410,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (sourceFileName != null)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: WNote(
+                      tone: WTone.info,
+                      icon: Icons.check_circle_outline_rounded,
+                      child: Text('已自动捕获导出文件：$sourceFileName'),
+                    ),
+                  ),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        '来源：${batch.source} · 新增 $newCount 条，重复 $duplicateCount 条'
+                        '${batch.skipped > 0 ? '，跳过 ${batch.skipped} 条无效' : ''}',
+                        style: Theme.of(ctx).textTheme.bodySmall?.copyWith(
+                          color: c.textSecondary,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                if (customGroups.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    decoration: BoxDecoration(
+                      color: c.surfaceMuted,
+                      borderRadius: BorderRadius.circular(WRadius.sm),
+                      border: Border.all(color: c.border),
+                    ),
+                    child: DropdownButtonHideUnderline(
+                      child: DropdownButton<String>(
+                        isExpanded: true,
+                        isDense: true,
+                        value: group,
+                        items: [
+                          const DropdownMenuItem(
+                            value: '',
+                            child: Text('目标分组：导入'),
+                          ),
+                          for (final name in customGroups)
+                            DropdownMenuItem(
+                              value: name,
+                              child: Text(
+                                '目标分组：$name',
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                        ],
+                        onChanged: (value) => update(() => group = value ?? ''),
+                      ),
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 6),
+                Wrap(
+                  spacing: 4,
+                  children: [
+                    TextButton(
+                      onPressed: () => update(
+                        () => selected.addAll(
+                          List.generate(batch.rows.length, (i) => i),
+                        ),
+                      ),
+                      child: const Text('全选'),
+                    ),
+                    if (duplicateCount > 0 && newCount > 0)
+                      TextButton(
+                        onPressed: () => update(() {
+                          selected
+                            ..clear()
+                            ..addAll([
+                              for (var i = 0; i < batch.rows.length; i++)
+                                if (!duplicate[i]) i,
+                            ]);
+                        }),
+                        child: Text('仅选新增 ($newCount)'),
+                      ),
+                    TextButton(
+                      style: TextButton.styleFrom(
+                        foregroundColor: c.textSecondary,
+                      ),
+                      onPressed: () => update(selected.clear),
+                      child: const Text('清空选择'),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                Expanded(
+                  child: WSurface(
+                    radius: WRadius.md,
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(WRadius.md),
+                      child: Material(
+                        type: MaterialType.transparency,
+                        child: ListView.separated(
+                          itemCount: batch.rows.length,
+                          separatorBuilder: (_, _) => Divider(
+                            height: 1,
+                            color: c.border.withValues(alpha: 0.7),
+                          ),
+                          itemBuilder: (_, i) {
+                            final row = batch.rows[i];
+                            return CheckboxListTile(
+                              dense: true,
+                              value: selected.contains(i),
+                              onChanged: (v) => update(() {
+                                if (v == true) {
+                                  selected.add(i);
+                                } else {
+                                  selected.remove(i);
+                                }
+                              }),
+                              title: Row(
+                                children: [
+                                  Flexible(
+                                    child: Text(
+                                      row['title']!,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                  if (duplicate[i]) ...[
+                                    const SizedBox(width: 6),
+                                    const WStatusPill(
+                                      label: '相同凭据会合并',
+                                      tone: WTone.info,
+                                      compact: true,
+                                    ),
+                                  ],
+                                ],
+                              ),
+                              subtitle: Text(
+                                [
+                                  row['username']!,
+                                  row['url']!,
+                                ].where((s) => s.isNotEmpty).join(' · '),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                if (onShredChanged != null) ...[
+                  const SizedBox(height: 8),
+                  CheckboxListTile(
+                    dense: true,
+                    value: shred,
+                    contentPadding: EdgeInsets.zero,
+                    onChanged: (v) {
+                      final next = v == true;
+                      update(() => shred = next);
+                      onShredChanged(next);
+                    },
+                    title: const Text('导入后覆盖并删除临时 CSV 文件'),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        );
+      },
     ),
   );
 }

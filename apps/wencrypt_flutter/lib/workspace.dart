@@ -1,6 +1,9 @@
 import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 
+import 'design/wencrypt_theme.dart';
+import 'design/wencrypt_widgets.dart';
+
 class WorkspaceSection extends StatelessWidget {
   const WorkspaceSection({
     super.key,
@@ -117,9 +120,16 @@ class _CommandDialogState extends State<_CommandDialog> {
       if (matches.isNotEmpty) Navigator.pop(context, matches[_selected]);
     }
 
+    final c = WColors.of(context);
+    final theme = Theme.of(context);
     return Dialog(
+      backgroundColor: c.surface,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(WRadius.xl),
+        side: BorderSide(color: c.border),
+      ),
       child: SizedBox(
-        width: 480,
+        width: 500,
         child: CallbackShortcuts(
           bindings: {
             const SingleActivator(LogicalKeyboardKey.arrowUp): () => move(-1),
@@ -130,12 +140,28 @@ class _CommandDialogState extends State<_CommandDialog> {
             mainAxisSize: MainAxisSize.min,
             children: [
               Padding(
-                padding: const EdgeInsets.all(12),
+                padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
                 child: TextField(
                   autofocus: true,
-                  decoration: const InputDecoration(
-                    hintText: '搜索命令',
-                    prefixIcon: Icon(Icons.search),
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: c.textPrimary,
+                  ),
+                  decoration: InputDecoration(
+                    hintText: '搜索命令或快捷操作…',
+                    fillColor: c.surfaceMuted,
+                    prefixIcon: Icon(
+                      Icons.search_rounded,
+                      size: 18,
+                      color: c.textTertiary,
+                    ),
+                    suffixIcon: const Padding(
+                      padding: EdgeInsets.only(right: 8),
+                      child: WShortcutBadge(label: 'ESC'),
+                    ),
+                    suffixIconConstraints: const BoxConstraints(
+                      minWidth: 32,
+                      minHeight: 24,
+                    ),
                   ),
                   onChanged: (query) => setState(() {
                     _query = query.trim().toLowerCase();
@@ -145,39 +171,92 @@ class _CommandDialogState extends State<_CommandDialog> {
                   onSubmitted: (_) => execute(),
                 ),
               ),
-              const Divider(height: 1),
+              Divider(height: 1, color: c.border),
               if (matches.isEmpty)
-                const Padding(
-                  padding: EdgeInsets.all(22),
-                  child: Text('没有匹配的命令'),
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 28),
+                  child: Text(
+                    '没有匹配的命令',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: c.textTertiary,
+                    ),
+                  ),
                 )
               else
                 ConstrainedBox(
-                  constraints: const BoxConstraints(maxHeight: 294),
+                  constraints: const BoxConstraints(maxHeight: 300),
                   child: ListView.builder(
                     controller: _list,
                     shrinkWrap: true,
+                    padding: const EdgeInsets.all(6),
                     itemExtent: 42,
                     itemCount: matches.length,
                     itemBuilder: (context, index) {
                       final command = matches[index];
-                      return ListTile(
-                        dense: true,
-                        selected: index == _selected,
-                        selectedTileColor: Theme.of(context)
-                            .colorScheme
-                            .primaryContainer,
-                        leading: Icon(command.icon, size: 18),
-                        title: Text(
-                          command.label,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
+                      final active = index == _selected;
+                      return Material(
+                        color: active ? c.brandSoft : Colors.transparent,
+                        borderRadius: BorderRadius.circular(WRadius.sm),
+                        child: InkWell(
+                          borderRadius: BorderRadius.circular(WRadius.sm),
+                          hoverColor: c.hover,
+                          onTap: () => Navigator.pop(context, command),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 10),
+                            child: Row(
+                              children: [
+                                Icon(
+                                  command.icon,
+                                  size: 16,
+                                  color: active ? c.brand : c.textSecondary,
+                                ),
+                                const SizedBox(width: 10),
+                                Expanded(
+                                  child: Text(
+                                    command.label,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: theme.textTheme.bodyMedium?.copyWith(
+                                      fontSize: 13,
+                                      fontWeight: active
+                                          ? FontWeight.w600
+                                          : FontWeight.w500,
+                                      color: active ? c.brand : c.textPrimary,
+                                    ),
+                                  ),
+                                ),
+                                if (active)
+                                  Icon(
+                                    Icons.keyboard_return_rounded,
+                                    size: 14,
+                                    color: c.brand.withValues(alpha: 0.7),
+                                  ),
+                              ],
+                            ),
+                          ),
                         ),
-                        onTap: () => Navigator.pop(context, command),
                       );
                     },
                   ),
                 ),
+              Divider(height: 1, color: c.border),
+              Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 8,
+                ),
+                child: Row(
+                  children: [
+                    Text(
+                      '↑↓ 选择  ·  ↵ 执行  ·  Esc 关闭',
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        fontSize: 11,
+                        color: c.textTertiary,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             ],
           ),
         ),

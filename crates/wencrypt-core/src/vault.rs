@@ -18,6 +18,11 @@ const LIMIT: usize = 10000;
 const PACK_LIMIT: usize = 512 * 1024;
 const PACK_OBJECTS: usize = 128;
 const PACK_MAGIC: &[u8] = b"WPK1";
+const INVITE_V2_MAGIC: &[u8] = b"WENCINV2";
+const INVITE_V2_PURPOSE: &str = "wencrypt-invite-v2";
+const LAN_DEK_PROOF: &[u8] = b"wencrypt-lan-dek-proof-v1";
+const LAN_PACK_LIMIT: usize = 256 * 1024;
+const LAN_PACK_OBJECTS: usize = 64;
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
@@ -66,6 +71,39 @@ impl Revision {
     }
 }
 
+struct StagedInstall {
+    stage_path: String,
+    final_path: String,
+}
+impl Drop for StagedInstall {
+    fn drop(&mut self) {
+        remove_sqlite_files(&self.stage_path);
+    }
+}
+fn remove_sqlite_files(path: &str) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(format!("{path}-wal"));
+    let _ = std::fs::remove_file(format!("{path}-shm"));
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LanSeed {
+    version: u8,
+    bootstrap: Vec<u8>,
+    dek: Vec<u8>,
+    dek_proof: Vec<u8>,
+    sync_settings: Option<Vec<u8>>,
+    object_count: u32,
+}
+impl Drop for LanSeed {
+    fn drop(&mut self) {
+        self.dek.zeroize();
+        if let Some(bytes) = &mut self.sync_settings {
+            bytes.zeroize();
+        }
+    }
+}
+
 struct Session {
     token: String,
     db: Connection,
@@ -73,6 +111,7 @@ struct Session {
     dek: Zeroizing<[u8; 32]>,
     revisions: BTreeMap<String, Revision>,
     backup_grant: Option<(String, std::time::Instant)>,
+    staged: Option<StagedInstall>,
 }
 #[derive(Default)]
 pub struct Vault {
@@ -154,16 +193,20 @@ fn install(
             .open(&temporary)
             .and_then(|f| f.sync_all())
             .map_err(|_| "storage_failed")?;
-        publish_database(&temporary, path).map_err(|error| match error.kind() {
-            std::io::ErrorKind::AlreadyExists => "vault_already_exists",
-            std::io::ErrorKind::PermissionDenied => "install_permission_denied",
-            std::io::ErrorKind::Unsupported => "install_filesystem_unsupported",
-            _ => "install_failed",
-        })?;
+        publish_database(&temporary, path).map_err(publish_error)?;
         Ok(())
     })();
     let _ = std::fs::remove_file(&temporary);
     result
+}
+
+fn publish_error(error: std::io::Error) -> &'static str {
+    match error.kind() {
+        std::io::ErrorKind::AlreadyExists => "vault_already_exists",
+        std::io::ErrorKind::PermissionDenied => "install_permission_denied",
+        std::io::ErrorKind::Unsupported => "install_filesystem_unsupported",
+        _ => "install_failed",
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -694,6 +737,136 @@ fn load(db: &Connection, dek: &[u8; 32], id: &[u8; 16]) -> Result<BTreeMap<Strin
 fn field<'a>(v: &'a Value, name: &str) -> Result<&'a str> {
     v.get(name).and_then(Value::as_str).ok_or("invalid_request")
 }
+fn decode_hex_32(v: &Value, name: &str) -> Result<Zeroizing<[u8; 32]>> {
+    let raw = Zeroizing::new(hex::decode(field(v, name)?).map_err(|_| "invalid_request")?);
+    if raw.len() != 32 {
+        return Err("invalid_request");
+    }
+    let mut out = Zeroizing::new([0u8; 32]);
+    out.copy_from_slice(&raw);
+    Ok(out)
+}
+fn decode_hex_16(v: &Value, name: &str) -> Result<[u8; 16]> {
+    let raw = hex::decode(field(v, name)?).map_err(|_| "invalid_request")?;
+    if raw.len() != 16 {
+        return Err("invalid_request");
+    }
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&raw);
+    Ok(out)
+}
+fn validate_folder_name(name: &str) -> Result<()> {
+    if name.trim().is_empty()
+        || name.chars().count() > 32
+        || name == "."
+        || name.contains("..")
+        || name.contains('/')
+        || name.contains('\\')
+        || name.bytes().any(|b| b < 32 || b == 127)
+    {
+        return Err("invalid_settings");
+    }
+    Ok(())
+}
+fn normalize_sync_mode(v: &Value) -> Result<&'static str> {
+    match v.get("sync_mode") {
+        None | Some(Value::Null) => Ok("notify"),
+        Some(Value::String(mode)) => match mode.as_str() {
+            "manual" => Ok("manual"),
+            "notify" => Ok("notify"),
+            "automatic" => Ok("automatic"),
+            _ => Err("invalid_settings"),
+        },
+        _ => Err("invalid_settings"),
+    }
+}
+fn normalize_join_targets(
+    raw: Option<&Value>,
+    default_folder: &str,
+    force_enabled: bool,
+    existing_only: bool,
+) -> Result<Vec<Value>> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    if let Some(Value::Array(list)) = raw {
+        if list.len() > 32 {
+            return Err("invalid_settings");
+        }
+        for (idx, item) in list.iter().enumerate() {
+            let folder_raw = item
+                .get("folder")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .trim_matches('/');
+            let folder = if folder_raw.is_empty() {
+                default_folder.to_owned()
+            } else {
+                folder_raw.to_owned()
+            };
+            validate_folder_name(&folder)?;
+            if !seen.insert(folder.clone()) {
+                continue;
+            }
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && s.chars().count() <= 64)
+                .unwrap_or("主同步目录");
+            let enabled =
+                force_enabled || item.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+            out.push(json!({
+                "id": format!("joined-{idx}"),
+                "name": name,
+                "folder": folder,
+                "enabled": enabled,
+                "existingOnly": existing_only,
+            }));
+        }
+    }
+    if out.is_empty() {
+        validate_folder_name(default_folder)?;
+        out.push(json!({
+            "id": "joined-0",
+            "name": "主同步目录",
+            "folder": default_folder,
+            "enabled": true,
+            "existingOnly": existing_only,
+        }));
+    }
+    Ok(out)
+}
+fn lan_purpose_info(purpose: &str) -> Result<Vec<u8>> {
+    match purpose {
+        "hello" | "ack" | "reject" => Ok(format!("wencrypt/lan/v1/{purpose}").into_bytes()),
+        _ => Err("invalid_request"),
+    }
+}
+fn build_pack_body(
+    db: &Connection,
+    hashes: &[String],
+    max_objects: usize,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    if hashes.is_empty()
+        || hashes.len() > max_objects
+        || hashes.iter().collect::<BTreeSet<_>>().len() != hashes.len()
+    {
+        return Err("invalid_sync_pack");
+    }
+    let mut body = PACK_MAGIC.to_vec();
+    let mut stmt = sql(db.prepare("SELECT body FROM objects WHERE hash=?1"))?;
+    for hash in hashes {
+        let bytes: Vec<u8> = sql(stmt.query_row(params![hash], |r| r.get(0)))?;
+        if body.len() + 4 + bytes.len() > max_bytes || object_hash(&bytes) != *hash {
+            return Err("invalid_sync_pack");
+        }
+        body.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        body.extend_from_slice(&bytes);
+    }
+    Ok(body)
+}
 impl Vault {
     pub const fn new() -> Self {
         Self {
@@ -759,6 +932,7 @@ impl Vault {
             dek,
             revisions,
             backup_grant: None,
+            staged: None,
         });
         Ok(token)
     }
@@ -796,6 +970,258 @@ impl Vault {
             self.session = None;
             self.grant = None;
             return Ok(json!({"locked":true}));
+        }
+        if op == "lan_seal" {
+            let key = decode_hex_32(v, "key")?;
+            let info = lan_purpose_info(field(v, "purpose")?)?;
+            let aad = field(v, "aad")?;
+            let plain =
+                Zeroizing::new(hex::decode(field(v, "plain")?).map_err(|_| "invalid_request")?);
+            if plain.len() > 4096 {
+                return Err("invalid_request");
+            }
+            let cipher = crypto(envelope::seal_ephemeral(
+                &key,
+                &info,
+                aad.as_bytes(),
+                &plain,
+            ))?;
+            return Ok(json!({"cipher":hex::encode(cipher)}));
+        }
+        if op == "lan_open" {
+            let key = decode_hex_32(v, "key")?;
+            let info = lan_purpose_info(field(v, "purpose")?)?;
+            let aad = field(v, "aad")?;
+            let cipher = hex::decode(field(v, "cipher")?).map_err(|_| "invalid_request")?;
+            if cipher.len() > 4096 + 44 {
+                return Err("invalid_request");
+            }
+            let plain = envelope::open_ephemeral(&key, &info, aad.as_bytes(), &cipher)
+                .map_err(|_| "lan_auth_failed")?;
+            return Ok(json!({"plain":hex::encode(&*plain)}));
+        }
+        if op == "lan_sas" {
+            let key = decode_hex_32(v, "key")?;
+            let token = decode_hex_16(v, "token")?;
+            let nonce = decode_hex_16(v, "nonce")?;
+            let mut hasher = Sha256::new();
+            hasher.update(b"wencrypt/lan/v1/sas");
+            hasher.update(*key);
+            hasher.update(token);
+            hasher.update(nonce);
+            let digest = hasher.finalize();
+            let code = u32::from_be_bytes(digest[0..4].try_into().unwrap()) % 1_000_000;
+            return Ok(json!({"sas":format!("{:03}-{:03}", code / 1000, code % 1000)}));
+        }
+        if op == "join_encrypted_invite" {
+            self.session = None;
+            self.grant = None;
+            let path = field(v, "path")?;
+            let password = field(v, "password")?;
+            if Path::new(path).exists() {
+                return Err("vault_already_exists");
+            }
+            let raw = hex::decode(field(v, "payload")?).map_err(|_| "invalid_invite")?;
+            let rest = raw.strip_prefix(INVITE_V2_MAGIC).ok_or("invalid_invite")?;
+            let (boot, sealed) = rest
+                .split_at_checked(envelope::BOOTSTRAP_LEN)
+                .ok_or("invalid_invite")?;
+            let parsed = envelope::parse(boot).map_err(|_| "invalid_invite")?.0;
+            if parsed.kind != Kind::Bootstrap {
+                return Err("invalid_invite");
+            }
+            let id = parsed.vault_id;
+            let dek = envelope::unlock_bootstrap(password, boot).map_err(|error| match error {
+                envelope::Error::Authentication => "join_master_password_invalid",
+                _ => "invalid_invite",
+            })?;
+            let plain = envelope::decrypt_object(&dek, &id, Kind::Backup, sealed)
+                .map_err(|_| "invalid_invite")?;
+            let payload: Value = serde_json::from_slice(&plain).map_err(|_| "invalid_invite")?;
+            if payload.get("purpose").and_then(Value::as_str) != Some(INVITE_V2_PURPOSE) {
+                return Err("invalid_invite");
+            }
+            let username = payload
+                .get("username")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|u| !u.is_empty() && u.len() <= 320 && !u.contains(':'))
+                .ok_or("invalid_invite")?;
+            let app_password = payload
+                .get("password")
+                .and_then(Value::as_str)
+                .filter(|p| !p.is_empty() && p.len() <= 1024)
+                .ok_or("invalid_invite")?;
+            let raw_targets = payload
+                .get("targets")
+                .and_then(Value::as_array)
+                .filter(|arr| !arr.is_empty() && arr.len() <= 32)
+                .ok_or("invalid_invite")?;
+            let default_folder = format!("wc-{}", &hex::encode(id)[..16]);
+            let targets = normalize_join_targets(
+                Some(&Value::Array(raw_targets.clone())),
+                &default_folder,
+                true,
+                true,
+            )
+            .map_err(|_| "invalid_invite")?;
+            let mode = normalize_sync_mode(v)?;
+            let settings = json!({
+                "username": username,
+                "password": app_password,
+                "syncMode": mode,
+                "auto": mode == "automatic",
+                "joinPending": true,
+                "targets": targets,
+            });
+            let sealed_settings = sealed_sync_settings(&dek, &id, &settings)?;
+            install(path, boot, &[], Some(&sealed_settings))?;
+            let db = connection(path, false)?;
+            let revisions = load(&db, &dek, &id)?;
+            save_master_authentication(&db, &dek, &id, now()?)?;
+            let token = identifier()?;
+            self.session = Some(Session {
+                token: token.clone(),
+                db,
+                id,
+                dek,
+                revisions,
+                backup_grant: None,
+                staged: None,
+            });
+            return Ok(json!({
+                "session": token,
+                "vault": hex::encode(id),
+                "username": username,
+                "password": app_password,
+                "targets": targets,
+            }));
+        }
+        if op == "join_lan_seed" {
+            self.session = None;
+            self.grant = None;
+            let path = field(v, "path")?;
+            if Path::new(path).exists() {
+                return Err("vault_already_exists");
+            }
+            let key = decode_hex_32(v, "key")?;
+            let aad = field(v, "aad")?;
+            let cipher = hex::decode(field(v, "cipher")?).map_err(|_| "invalid_lan_bundle")?;
+            let plain =
+                envelope::open_ephemeral(&key, b"wencrypt/lan/v1/seed", aad.as_bytes(), &cipher)
+                    .map_err(|_| "invalid_lan_bundle")?;
+            let mut reader = std::io::Cursor::new(&*plain);
+            let seed: LanSeed =
+                ciborium::from_reader(&mut reader).map_err(|_| "invalid_lan_bundle")?;
+            if reader.position() as usize != plain.len()
+                || seed.version != 1
+                || seed.bootstrap.len() != envelope::BOOTSTRAP_LEN
+                || seed.dek.len() != 32
+                || seed.object_count as usize > LIMIT
+            {
+                return Err("invalid_lan_bundle");
+            }
+            let parsed = envelope::parse(&seed.bootstrap)
+                .map_err(|_| "invalid_lan_bundle")?
+                .0;
+            if parsed.kind != Kind::Bootstrap {
+                return Err("invalid_lan_bundle");
+            }
+            let id = parsed.vault_id;
+            if v["expected_vault"]
+                .as_str()
+                .is_some_and(|expected| expected != hex::encode(id))
+            {
+                return Err("invitation_vault_mismatch");
+            }
+            let mut dek = Zeroizing::new([0u8; 32]);
+            dek.copy_from_slice(&seed.dek);
+            let proof = envelope::decrypt_object(&dek, &id, Kind::Backup, &seed.dek_proof)
+                .map_err(|_| "invalid_lan_bundle")?;
+            if proof.as_slice() != LAN_DEK_PROOF {
+                return Err("invalid_lan_bundle");
+            }
+            let sealed = if let Some(sync_bytes) = seed.sync_settings.as_deref() {
+                let raw: Value =
+                    serde_json::from_slice(sync_bytes).map_err(|_| "invalid_lan_bundle")?;
+                let username = raw
+                    .get("username")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|u| !u.is_empty() && u.len() <= 320 && !u.contains(':'))
+                    .ok_or("invalid_lan_bundle")?;
+                let app_password = raw
+                    .get("password")
+                    .and_then(Value::as_str)
+                    .filter(|p| !p.is_empty() && p.len() <= 1024)
+                    .ok_or("invalid_lan_bundle")?;
+                let default_folder = format!("wc-{}", &hex::encode(id)[..16]);
+                let targets =
+                    normalize_join_targets(raw.get("targets"), &default_folder, false, true)
+                        .map_err(|_| "invalid_lan_bundle")?;
+                let mode = normalize_sync_mode(v)?;
+                let settings = json!({
+                    "username": username,
+                    "password": app_password,
+                    "syncMode": mode,
+                    "auto": mode == "automatic",
+                    "joinPending": false,
+                    "targets": targets,
+                });
+                Some(sealed_sync_settings(&dek, &id, &settings)?)
+            } else {
+                None
+            };
+            let has_sync = sealed.is_some();
+            let token = identifier()?;
+            if seed.object_count == 0 {
+                install(path, &seed.bootstrap, &[], sealed.as_deref())?;
+                let db = connection(path, false)?;
+                let revisions = load(&db, &dek, &id)?;
+                self.session = Some(Session {
+                    token: token.clone(),
+                    db,
+                    id,
+                    dek,
+                    revisions,
+                    backup_grant: None,
+                    staged: None,
+                });
+                return Ok(json!({
+                    "session": token,
+                    "vault": hex::encode(id),
+                    "staged": false,
+                    "has_sync": has_sync,
+                }));
+            }
+            let stage_path = format!("{path}.{}.lanstage", identifier()?);
+            install(&stage_path, &seed.bootstrap, &[], sealed.as_deref())?;
+            let db = match connection(&stage_path, false) {
+                Ok(db) => db,
+                Err(e) => {
+                    remove_sqlite_files(&stage_path);
+                    return Err(e);
+                }
+            };
+            let revisions = load(&db, &dek, &id)?;
+            self.session = Some(Session {
+                token: token.clone(),
+                db,
+                id,
+                dek,
+                revisions,
+                backup_grant: None,
+                staged: Some(StagedInstall {
+                    stage_path,
+                    final_path: path.to_owned(),
+                }),
+            });
+            return Ok(json!({
+                "session": token,
+                "vault": hex::encode(id),
+                "staged": true,
+                "has_sync": has_sync,
+            }));
         }
         if op == "device_info" {
             let db = connection(field(v, "path")?, false)?;
@@ -882,6 +1308,7 @@ impl Vault {
                 dek,
                 revisions,
                 backup_grant: None,
+                staged: None,
             });
             return Ok(json!({"session":token}));
         }
@@ -963,8 +1390,54 @@ impl Vault {
                 dek,
                 revisions,
                 backup_grant: None,
+                staged: None,
             });
             return Ok(json!({"session":token,"adopted_cloud_password":adopted}));
+        }
+        if op == "lan_finish_join" {
+            let expected = self.session.as_ref().ok_or("locked")?.token.as_str();
+            if field(v, "session")? != expected {
+                return Err("session_expired");
+            }
+            let has_staged = self.session.as_ref().unwrap().staged.is_some();
+            if !has_staged {
+                let count = self.session.as_ref().unwrap().revisions.len();
+                return Ok(json!({"committed":true,"entries":count}));
+            }
+            {
+                let s = self.session.as_mut().unwrap();
+                s.revisions = load(&s.db, &s.dek, &s.id)?;
+                if !view(&s.revisions)?.pending.is_empty() {
+                    return Err("incomplete_backup");
+                }
+                sql(s.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);"))?;
+            }
+            let mut session = self.session.take().unwrap();
+            let staged = session.staged.take().unwrap();
+            let final_path = staged.final_path.clone();
+            let stage_path = staged.stage_path.clone();
+            session.db.close().map_err(|_| "storage_failed")?;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&stage_path)
+                .and_then(|f| f.sync_all())
+                .map_err(|_| "storage_failed")?;
+            let publish_res = publish_database(&stage_path, &final_path);
+            drop(staged);
+            publish_res.map_err(publish_error)?;
+            let db = connection(&final_path, false)?;
+            let revisions = load(&db, &session.dek, &session.id)?;
+            let count = revisions.len();
+            self.session = Some(Session {
+                token: session.token,
+                db,
+                id: session.id,
+                dek: session.dek,
+                revisions,
+                backup_grant: session.backup_grant,
+                staged: None,
+            });
+            return Ok(json!({"committed":true,"entries":count}));
         }
         let s = self.session.as_mut().ok_or("locked")?;
         if field(v, "session")? != s.token {
@@ -1484,22 +1957,7 @@ impl Vault {
                 let hashes: Vec<String> =
                     serde_json::from_value(v.get("hashes").cloned().ok_or("invalid_sync_pack")?)
                         .map_err(|_| "invalid_sync_pack")?;
-                if hashes.is_empty()
-                    || hashes.len() > PACK_OBJECTS
-                    || hashes.iter().collect::<BTreeSet<_>>().len() != hashes.len()
-                {
-                    return Err("invalid_sync_pack");
-                }
-                let mut body = PACK_MAGIC.to_vec();
-                let mut stmt = sql(s.db.prepare("SELECT body FROM objects WHERE hash=?1"))?;
-                for hash in &hashes {
-                    let bytes: Vec<u8> = sql(stmt.query_row(params![hash], |r| r.get(0)))?;
-                    if body.len() + 4 + bytes.len() > PACK_LIMIT || object_hash(&bytes) != *hash {
-                        return Err("invalid_sync_pack");
-                    }
-                    body.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-                    body.extend_from_slice(&bytes);
-                }
+                let body = build_pack_body(&s.db, &hashes, PACK_OBJECTS, PACK_LIMIT)?;
                 let pack = object_hash(&body);
                 record_pack(&s.db, &pack, &hashes)?;
                 Ok(json!({"hash":pack,"body":hex::encode(body)}))
@@ -1566,6 +2024,179 @@ impl Vault {
                 Ok(
                     json!({"format":"WENBACK1-alpha","bootstrap":hex::encode(b),"backup":hex::encode(backup)}),
                 )
+            }
+            "export_encrypted_invite" => {
+                let settings = local_sync_settings(&s.db, &s.dek, &s.id)?;
+                if settings.is_null() {
+                    return Err("sync_not_configured");
+                }
+                let username = settings
+                    .get("username")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|u| !u.is_empty() && u.len() <= 320 && !u.contains(':'))
+                    .ok_or("sync_not_configured")?;
+                let app_password = settings
+                    .get("password")
+                    .and_then(Value::as_str)
+                    .filter(|p| !p.is_empty() && p.len() <= 1024)
+                    .ok_or("sync_not_configured")?;
+                let default_folder = format!("wc-{}", &hex::encode(s.id)[..16]);
+                let folder_filter: Option<BTreeSet<String>> = match v.get("folders") {
+                    None | Some(Value::Null) => None,
+                    Some(raw) => Some(
+                        serde_json::from_value::<Vec<String>>(raw.clone())
+                            .map_err(|_| "invalid_settings")?
+                            .into_iter()
+                            .map(|f| f.trim().trim_matches('/').to_owned())
+                            .collect(),
+                    ),
+                };
+                let all_targets =
+                    normalize_join_targets(settings.get("targets"), &default_folder, false, false)?;
+                let mut selected = Vec::new();
+                for item in all_targets {
+                    let folder = item["folder"].as_str().unwrap_or_default();
+                    let keep = match &folder_filter {
+                        Some(filter) => filter.contains(folder),
+                        None => item["enabled"].as_bool() == Some(true),
+                    };
+                    if keep {
+                        selected.push(json!({
+                            "name": item["name"],
+                            "folder": folder,
+                            "enabled": true,
+                        }));
+                    }
+                }
+                if selected.is_empty() {
+                    return Err("sync_not_configured");
+                }
+                let boot = bootstrap(&s.db)?;
+                let plain = Zeroizing::new(
+                    serde_json::to_vec(&json!({
+                        "purpose": INVITE_V2_PURPOSE,
+                        "created_at": now()?,
+                        "username": username,
+                        "password": app_password,
+                        "targets": selected,
+                    }))
+                    .map_err(|_| "encode_failed")?,
+                );
+                let sealed = crypto(envelope::encrypt_object(
+                    &s.dek,
+                    &s.id,
+                    Kind::Backup,
+                    &plain,
+                ))?;
+                let mut blob =
+                    Vec::with_capacity(INVITE_V2_MAGIC.len() + boot.len() + sealed.len());
+                blob.extend_from_slice(INVITE_V2_MAGIC);
+                blob.extend_from_slice(&boot);
+                blob.extend_from_slice(&sealed);
+                Ok(json!({
+                    "payload": hex::encode(blob),
+                    "vault": hex::encode(s.id),
+                    "folder_count": selected.len(),
+                }))
+            }
+            "export_lan_seed" => {
+                let key = decode_hex_32(v, "key")?;
+                let aad = field(v, "aad")?;
+                let include_sync =
+                    v.get("include_sync_settings").and_then(Value::as_bool) != Some(false);
+                s.revisions = load(&s.db, &s.dek, &s.id)?;
+                if !view(&s.revisions)?.pending.is_empty() {
+                    return Err("incomplete_backup");
+                }
+                let mut stmt = sql(s
+                    .db
+                    .prepare("SELECT hash,length(body) FROM objects ORDER BY hash"))?;
+                let objects = sql(
+                    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, usize>(1)?)))
+                )?
+                .map(sql)
+                .collect::<Result<BTreeMap<_, _>>>()?;
+                let object_count = u32::try_from(objects.len()).map_err(|_| "vault_limit")?;
+                let boot = bootstrap(&s.db)?;
+                let dek_proof = crypto(envelope::encrypt_object(
+                    &s.dek,
+                    &s.id,
+                    Kind::Backup,
+                    LAN_DEK_PROOF,
+                ))?;
+                let sync_settings = if include_sync {
+                    match local_sync_settings(&s.db, &s.dek, &s.id)? {
+                        Value::Null => None,
+                        val => Some(
+                            Zeroizing::new(serde_json::to_vec(&val).map_err(|_| "encode_failed")?)
+                                .to_vec(),
+                        ),
+                    }
+                } else {
+                    None
+                };
+                let has_sync = sync_settings.is_some();
+                let seed = LanSeed {
+                    version: 1,
+                    bootstrap: boot,
+                    dek: s.dek.to_vec(),
+                    dek_proof,
+                    sync_settings,
+                    object_count,
+                };
+                let mut plain = Zeroizing::new(Vec::new());
+                ciborium::into_writer(&seed, &mut *plain).map_err(|_| "encode_failed")?;
+                drop(seed);
+                let cipher = crypto(envelope::seal_ephemeral(
+                    &key,
+                    b"wencrypt/lan/v1/seed",
+                    aad.as_bytes(),
+                    &plain,
+                ))?;
+                Ok(json!({
+                    "cipher": hex::encode(cipher),
+                    "objects": objects,
+                    "object_count": object_count,
+                    "has_sync": has_sync,
+                }))
+            }
+            "lan_build_pack" => {
+                let key = decode_hex_32(v, "key")?;
+                let aad = field(v, "aad")?;
+                let hashes: Vec<String> =
+                    serde_json::from_value(v.get("hashes").cloned().ok_or("invalid_sync_pack")?)
+                        .map_err(|_| "invalid_sync_pack")?;
+                let body = build_pack_body(&s.db, &hashes, LAN_PACK_OBJECTS, LAN_PACK_LIMIT)?;
+                let cipher = crypto(envelope::seal_ephemeral(
+                    &key,
+                    b"wencrypt/lan/v1/pack",
+                    aad.as_bytes(),
+                    &body,
+                ))?;
+                Ok(json!({"cipher":hex::encode(cipher)}))
+            }
+            "lan_ingest_pack" => {
+                let key = decode_hex_32(v, "key")?;
+                let aad = field(v, "aad")?;
+                let cipher = hex::decode(field(v, "cipher")?).map_err(|_| "invalid_sync_pack")?;
+                let plain = envelope::open_ephemeral(
+                    &key,
+                    b"wencrypt/lan/v1/pack",
+                    aad.as_bytes(),
+                    &cipher,
+                )
+                .map_err(|_| "lan_auth_failed")?;
+                let objects = pack_objects(&plain)?;
+                let hashes = objects
+                    .iter()
+                    .map(|bytes| object_hash(bytes))
+                    .collect::<Vec<_>>();
+                if hashes.iter().collect::<BTreeSet<_>>().len() != hashes.len() {
+                    return Err("invalid_sync_pack");
+                }
+                ingest_objects(s, &objects, &hashes, None)?;
+                Ok(json!({"count":hashes.len()}))
             }
             _ => Err("unknown_operation"),
         }
@@ -2491,5 +3122,224 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn encrypted_invite_roundtrip_and_wrong_password_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("src.db");
+        let dst_path = dir.path().join("dst.db");
+        let pass = "public invite fixture password";
+        let mut src = Vault::new();
+        let opened = src
+            .command(&json!({"op":"create","path":src_path,"password":pass}))
+            .unwrap();
+        let src_token = opened["session"].as_str().unwrap().to_owned();
+        call(
+            &mut src,
+            &src_token,
+            json!({
+                "op":"sync_settings_set",
+                "settings":{
+                    "username":"fixture@example.com",
+                    "password":"webdav-app-password-fixture",
+                    "syncMode":"automatic",
+                    "auto":true,
+                    "targets":[
+                        {"id":"t1","name":"主目录","folder":"wc-primary-fixture","enabled":true},
+                        {"id":"t2","name":"未启用目录","folder":"wc-disabled-fixture","enabled":false}
+                    ]
+                }
+            }),
+        );
+
+        let exported = call(
+            &mut src,
+            &src_token,
+            json!({"op":"export_encrypted_invite"}),
+        );
+        assert_eq!(exported["folder_count"], 1);
+        let payload = exported["payload"].as_str().unwrap();
+
+        let mut dst = Vault::new();
+        assert_eq!(
+            dst.command(&json!({
+                "op":"join_encrypted_invite",
+                "path":dst_path,
+                "password":"wrong password for test",
+                "payload":payload,
+            }))
+            .unwrap_err(),
+            "join_master_password_invalid"
+        );
+        assert!(!dst_path.exists());
+
+        let joined = dst
+            .command(&json!({
+                "op":"join_encrypted_invite",
+                "path":dst_path,
+                "password":pass,
+                "payload":payload,
+                "sync_mode":"manual"
+            }))
+            .unwrap();
+        let dst_token = joined["session"].as_str().unwrap().to_owned();
+        assert_eq!(joined["vault"], exported["vault"]);
+        assert_eq!(joined["username"], "fixture@example.com");
+        assert_eq!(joined["password"], "webdav-app-password-fixture");
+        let targets = joined["targets"].as_array().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0]["folder"], "wc-primary-fixture");
+        assert_eq!(targets[0]["existingOnly"], true);
+
+        let settings =
+            call(&mut dst, &dst_token, json!({"op":"sync_settings_get"}))["settings"].clone();
+        assert_eq!(settings["syncMode"], "manual");
+        assert_eq!(settings["joinPending"], true);
+        assert_eq!(settings["password"], "webdav-app-password-fixture");
+    }
+
+    #[test]
+    fn lan_transfer_roundtrip_with_packs_and_atomic_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("src.db");
+        let abort_path = dir.path().join("abort.db");
+        let final_path = dir.path().join("final.db");
+        let pass = "public lan fixture password";
+
+        let mut src = Vault::new();
+        let src_token = src
+            .command(&json!({"op":"create","path":src_path,"password":pass}))
+            .unwrap()["session"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        call(
+            &mut src,
+            &src_token,
+            json!({"op":"save","data":entry("pw-one")}),
+        );
+        call(
+            &mut src,
+            &src_token,
+            json!({"op":"save","data":entry("pw-two")}),
+        );
+        call(
+            &mut src,
+            &src_token,
+            json!({
+                "op":"sync_settings_set",
+                "settings":{
+                    "username":"lan@example.com",
+                    "password":"lan-webdav-app-password",
+                    "syncMode":"notify",
+                    "auto":false,
+                    "targets":[{"id":"t1","name":"主备份","folder":"wc-lan-fixture","enabled":true}]
+                }
+            }),
+        );
+
+        let key = hex::encode([0x42u8; 32]);
+        let token_hex = hex::encode([0x11u8; 16]);
+        let nonce_hex = hex::encode([0x22u8; 16]);
+        let sas_a = src
+            .command(&json!({"op":"lan_sas","key":key,"token":token_hex,"nonce":nonce_hex}))
+            .unwrap()["sas"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let sas_b = Vault::new()
+            .command(&json!({"op":"lan_sas","key":key,"token":token_hex,"nonce":nonce_hex}))
+            .unwrap()["sas"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(sas_a, sas_b);
+        assert_eq!(sas_a.len(), 7);
+
+        let seed = call(
+            &mut src,
+            &src_token,
+            json!({"op":"export_lan_seed","key":key,"aad":"seed-aad"}),
+        );
+        assert_eq!(seed["object_count"], 2);
+        assert_eq!(seed["has_sync"], true);
+        let hashes: Vec<String> = seed["objects"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let pack = call(
+            &mut src,
+            &src_token,
+            json!({"op":"lan_build_pack","key":key,"aad":"pack-0","hashes":hashes}),
+        );
+
+        // Aborting before lan_finish_join must clean up staged files and leave no vault.
+        let mut aborted = Vault::new();
+        aborted
+            .command(&json!({
+                "op":"join_lan_seed",
+                "path":abort_path,
+                "key":key,
+                "aad":"seed-aad",
+                "cipher":seed["cipher"],
+            }))
+            .unwrap();
+        assert!(!abort_path.exists());
+        aborted.command(&json!({"op":"lock"})).unwrap();
+        assert!(!abort_path.exists());
+        let left_stage = std::fs::read_dir(dir.path()).unwrap().any(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".lanstage")
+        });
+        assert!(!left_stage);
+
+        // Full transfer commits atomically and yields all entries + sync settings.
+        let mut dst = Vault::new();
+        let joined = dst
+            .command(&json!({
+                "op":"join_lan_seed",
+                "path":final_path,
+                "key":key,
+                "aad":"seed-aad",
+                "cipher":seed["cipher"],
+                "sync_mode":"automatic",
+            }))
+            .unwrap();
+        let dst_token = joined["session"].as_str().unwrap().to_owned();
+        assert_eq!(joined["staged"], true);
+        assert!(!final_path.exists());
+
+        call(
+            &mut dst,
+            &dst_token,
+            json!({"op":"lan_ingest_pack","key":key,"aad":"pack-0","cipher":pack["cipher"]}),
+        );
+        let committed = call(&mut dst, &dst_token, json!({"op":"lan_finish_join"}));
+        assert_eq!(committed["committed"], true);
+        assert_eq!(committed["entries"], 2);
+        assert!(final_path.exists());
+        let left_stage_after = std::fs::read_dir(dir.path()).unwrap().any(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".lanstage")
+        });
+        assert!(!left_stage_after);
+
+        let entries = call(&mut dst, &dst_token, json!({"op":"list"}))["entries"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert_eq!(entries, 2);
+        let settings =
+            call(&mut dst, &dst_token, json!({"op":"sync_settings_get"}))["settings"].clone();
+        assert_eq!(settings["username"], "lan@example.com");
+        assert_eq!(settings["syncMode"], "automatic");
+        assert_eq!(settings["joinPending"], false);
     }
 }

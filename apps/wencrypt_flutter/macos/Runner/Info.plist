@@ -35,6 +35,8 @@
 	<string>$(PRODUCT_COPYRIGHT)</string>
 	<key>NSAppleEventsUsageDescription</key>
 	<string>在你选择浏览器导入时，允许 Wencrypt 打开该浏览器的密码管理页。</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>用于在同一 WiFi 下与其他设备直接安全传输密码库加入邀请。</string>
 	<key>NSMainNibFile</key>
 	<string>MainMenu</string>
 	<key>NSPrincipalClass</key>

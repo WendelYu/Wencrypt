@@ -246,101 +246,137 @@ class _SyncHistoryViewState extends State<SyncHistoryView> {
     return LayoutBuilder(
       builder: (context, constraints) {
         final wide = constraints.maxWidth >= 690;
+        final c = WColors.of(context);
         return Padding(
           padding: EdgeInsets.symmetric(
-            horizontal: wide ? 28 : 16,
-            vertical: 18,
+            horizontal: wide ? 24 : 16,
+            vertical: 16,
           ),
           child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              WFilterChips(
-                labels: const ['全部', '失败', '未完成'],
-                selectedIndex: _Filter.values.indexOf(_filter),
-                onSelected: (index) =>
-                    setState(() => _filter = _Filter.values[index]),
+              Row(
+                children: [
+                  Expanded(
+                    child: WFilterChips(
+                      labels: const ['全部', '失败', '未完成'],
+                      selectedIndex: _Filter.values.indexOf(_filter),
+                      onSelected: (index) =>
+                          setState(() => _filter = _Filter.values[index]),
+                    ),
+                  ),
+                ],
               ),
               const SizedBox(height: 12),
               if (_failed)
-                Row(
-                  children: [
-                    const Expanded(child: Text('无法读取同步记录')),
-                    TextButton(onPressed: _load, child: const Text('重试')),
-                  ],
-                ),
-              if (wide && visible.isNotEmpty)
-                DecoratedBox(
-                  decoration: BoxDecoration(
-                    color: WColors.of(context).surfaceMuted,
-                    borderRadius: const BorderRadius.vertical(
-                      top: Radius.circular(WRadius.md),
-                    ),
-                    border: Border(
-                      top: BorderSide(color: WColors.of(context).border),
-                      left: BorderSide(color: WColors.of(context).border),
-                      right: BorderSide(color: WColors.of(context).border),
-                    ),
-                  ),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 16,
-                      vertical: 10,
-                    ),
-                    child: DefaultTextStyle(
-                      style: theme.textTheme.labelMedium!,
-                      child: const Row(
-                        children: [
-                          SizedBox(width: 172, child: Text('时间')),
-                          Expanded(child: Text('同步目录')),
-                          SizedBox(
-                            width: 70,
-                            child: Text('上传', textAlign: TextAlign.center),
-                          ),
-                          SizedBox(
-                            width: 70,
-                            child: Text('下载', textAlign: TextAlign.center),
-                          ),
-                          SizedBox(width: 94, child: Text('结果')),
-                        ],
-                      ),
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: WNote(
+                    tone: WTone.danger,
+                    child: Row(
+                      children: [
+                        const Expanded(child: Text('无法读取同步记录')),
+                        TextButton(onPressed: _load, child: const Text('重试')),
+                      ],
                     ),
                   ),
                 ),
               Expanded(
-                child: ListView(
-                  children: [
-                    if (visible.isEmpty && !_loading && !_failed)
-                      Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 48),
-                        child: Center(
-                          child: Text(
-                            _filter == _Filter.all ? '还没有同步记录' : '没有符合筛选条件的记录',
-                          ),
-                        ),
-                      ),
-                    for (final record in visible) ...[
-                      _row(context, record, wide),
-                      const Divider(height: 1),
-                    ],
-                    if (_loading)
-                      const Padding(
-                        padding: EdgeInsets.all(14),
-                        child: Center(
-                          child: SizedBox.square(
-                            dimension: 20,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          ),
-                        ),
+                child: visible.isEmpty && !_loading && !_failed
+                    ? WEmptyState(
+                        icon: Icons.history_rounded,
+                        title: _filter == _Filter.all ? '还没有同步记录' : '没有符合条件的记录',
+                        message: _filter == _Filter.all
+                            ? '完成首次云端同步后，传输记录会保存在本机并显示在这里'
+                            : '尝试切换到「全部」查看所有同步记录',
                       )
-                    else if (_cursor != null)
-                      Center(
-                        child: TextButton(
-                          onPressed: () => _load(earlier: true),
-                          child: const Text('加载更早的记录'),
+                    : WSurface(
+                        radius: WRadius.lg,
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(WRadius.lg),
+                          child: Column(
+                            children: [
+                              if (wide && visible.isNotEmpty)
+                                Container(
+                                  color: c.surfaceMuted,
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 16,
+                                    vertical: 10,
+                                  ),
+                                  child: DefaultTextStyle(
+                                    style: theme.textTheme.labelMedium!
+                                        .copyWith(
+                                          fontSize: 11.5,
+                                          fontWeight: FontWeight.w600,
+                                          color: c.textTertiary,
+                                        ),
+                                    child: const Row(
+                                      children: [
+                                        SizedBox(width: 172, child: Text('时间')),
+                                        Expanded(child: Text('同步目录')),
+                                        SizedBox(
+                                          width: 70,
+                                          child: Text(
+                                            '上传',
+                                            textAlign: TextAlign.center,
+                                          ),
+                                        ),
+                                        SizedBox(
+                                          width: 70,
+                                          child: Text(
+                                            '下载',
+                                            textAlign: TextAlign.center,
+                                          ),
+                                        ),
+                                        SizedBox(width: 94, child: Text('结果')),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              if (wide && visible.isNotEmpty)
+                                Divider(height: 1, color: c.border),
+                              Expanded(
+                                child: ListView(
+                                  children: [
+                                    for (final record in visible) ...[
+                                      _row(context, record, wide),
+                                      Divider(
+                                        height: 1,
+                                        color: c.border.withValues(alpha: 0.7),
+                                      ),
+                                    ],
+                                    if (_loading)
+                                      const Padding(
+                                        padding: EdgeInsets.all(14),
+                                        child: Center(
+                                          child: SizedBox.square(
+                                            dimension: 20,
+                                            child: CircularProgressIndicator(
+                                              strokeWidth: 2,
+                                            ),
+                                          ),
+                                        ),
+                                      )
+                                    else if (_cursor != null)
+                                      Padding(
+                                        padding: const EdgeInsets.symmetric(
+                                          vertical: 8,
+                                        ),
+                                        child: Center(
+                                          child: TextButton(
+                                            onPressed: () =>
+                                                _load(earlier: true),
+                                            child: const Text('加载更早的记录'),
+                                          ),
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
                         ),
                       ),
-                  ],
-                ),
               ),
             ],
           ),

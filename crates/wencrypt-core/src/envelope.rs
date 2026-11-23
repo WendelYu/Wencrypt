@@ -278,6 +278,76 @@ pub fn decrypt_object(
     open(&key, &h, aad, body)
 }
 
+pub fn seal_ephemeral(
+    key: &[u8; 32],
+    info: &[u8],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
+    if plaintext.len() > 2 * 1024 * 1024 {
+        return Err(Error::Bounds);
+    }
+    let mut salt = [0u8; 16];
+    let mut nonce = [0u8; 12];
+    getrandom::getrandom(&mut salt).map_err(|_| Error::Random)?;
+    getrandom::getrandom(&mut nonce).map_err(|_| Error::Random)?;
+    let mut subkey = Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(Some(&salt), key)
+        .expand(info, &mut *subkey)
+        .map_err(|_| Error::Kdf)?;
+    let mut full_aad = Vec::with_capacity(28 + aad.len());
+    full_aad.extend_from_slice(&salt);
+    full_aad.extend_from_slice(&nonce);
+    full_aad.extend_from_slice(aad);
+    let cipher = Aes256Gcm::new_from_slice(&*subkey).map_err(|_| Error::Format)?;
+    let encrypted = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: &full_aad,
+            },
+        )
+        .map_err(|_| Error::Authentication)?;
+    let mut out = Vec::with_capacity(28 + encrypted.len());
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&encrypted);
+    Ok(out)
+}
+
+pub fn open_ephemeral(
+    key: &[u8; 32],
+    info: &[u8],
+    aad: &[u8],
+    ciphertext: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
+    if ciphertext.len() < 44 || ciphertext.len() > 2 * 1024 * 1024 + 44 {
+        return Err(Error::Bounds);
+    }
+    let (salt, rest) = ciphertext.split_at(16);
+    let (nonce, body) = rest.split_at(12);
+    let mut subkey = Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(Some(salt), key)
+        .expand(info, &mut *subkey)
+        .map_err(|_| Error::Kdf)?;
+    let mut full_aad = Vec::with_capacity(28 + aad.len());
+    full_aad.extend_from_slice(salt);
+    full_aad.extend_from_slice(nonce);
+    full_aad.extend_from_slice(aad);
+    let cipher = Aes256Gcm::new_from_slice(&*subkey).map_err(|_| Error::Format)?;
+    cipher
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: body,
+                aad: &full_aad,
+            },
+        )
+        .map(Zeroizing::new)
+        .map_err(|_| Error::Authentication)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,5 +413,37 @@ mod tests {
         assert_eq!(*unlock_bootstrap(password, &b).unwrap(), [6; 32]);
         assert!(unlock_bootstrap(password.trim(), &b).is_err());
         assert!(unlock_bootstrap(&password.replace("e\u{301}", "é"), &b).is_err());
+    }
+    #[test]
+    fn ephemeral_roundtrip_and_domain_separation() {
+        let key = [7u8; 32];
+        let wrong_key = [8u8; 32];
+        let ct =
+            seal_ephemeral(&key, b"wencrypt/lan/v1/seed", b"aad-1", b"secret-payload").unwrap();
+        assert_eq!(
+            &**open_ephemeral(&key, b"wencrypt/lan/v1/seed", b"aad-1", &ct).unwrap(),
+            b"secret-payload"
+        );
+        assert_eq!(
+            open_ephemeral(&wrong_key, b"wencrypt/lan/v1/seed", b"aad-1", &ct).unwrap_err(),
+            Error::Authentication
+        );
+        assert_eq!(
+            open_ephemeral(&key, b"wencrypt/lan/v1/pack", b"aad-1", &ct).unwrap_err(),
+            Error::Authentication
+        );
+        assert_eq!(
+            open_ephemeral(&key, b"wencrypt/lan/v1/seed", b"aad-2", &ct).unwrap_err(),
+            Error::Authentication
+        );
+        for i in 0..ct.len() {
+            let mut tampered = ct.clone();
+            tampered[i] ^= 1;
+            assert!(open_ephemeral(&key, b"wencrypt/lan/v1/seed", b"aad-1", &tampered).is_err());
+        }
+        assert_eq!(
+            open_ephemeral(&key, b"wencrypt/lan/v1/seed", b"aad-1", &ct[..43]).unwrap_err(),
+            Error::Bounds
+        );
     }
 }

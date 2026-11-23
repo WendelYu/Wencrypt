@@ -7,6 +7,7 @@ import 'package:material_ui/material_ui.dart';
 import 'package:wencrypt/design/wencrypt_theme.dart';
 import 'package:wencrypt/main.dart';
 import 'package:wencrypt/sync.dart';
+import 'package:wencrypt/vault_invite.dart';
 
 void main() {
   test('Windows theme keeps Chinese and Latin text in the same UI family', () {
@@ -269,5 +270,155 @@ void main() {
     } finally {
       await dir.delete(recursive: true);
     }
+  });
+
+  testWidgets(
+    'wide desktop uses master-detail inspector without duplicate FAB',
+    (tester) async {
+      tester.view.physicalSize = const Size(1280, 800);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: wencryptTheme(Brightness.light),
+          home: const VaultPage(
+            preview: VaultPreview(
+              unlocked: true,
+              entries: [
+                {
+                  'id': 'rev-1',
+                  'entry': 'entry-1',
+                  'deleted': false,
+                  'data': {
+                    'title': 'GitHub',
+                    'username': 'fixture@example.com',
+                    'password': 'Fixture-Password-123!',
+                    'url': 'https://github.com',
+                    'tags': '开发',
+                    'notes': 'Fixture note one',
+                  },
+                },
+                {
+                  'id': 'rev-2',
+                  'entry': 'entry-2',
+                  'deleted': false,
+                  'data': {
+                    'title': 'Linear',
+                    'username': 'second@example.com',
+                    'password': 'Second-Password-456!',
+                    'url': 'https://linear.app',
+                    'tags': '工作',
+                    'notes': '',
+                  },
+                },
+              ],
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Only one primary "新增账号" CTA on desktop (no floating FAB duplicate).
+      expect(find.text('新增账号'), findsOneWidget);
+      // Right-hand inspector displays the first account with masked password.
+      expect(find.text('Fixture note one'), findsOneWidget);
+      expect(find.text('Fixture-Password-123!'), findsNothing);
+
+      // Reveal password in inspector.
+      await tester.tap(find.byTooltip('显示密码'));
+      await tester.pumpAndSettle();
+      expect(find.text('Fixture-Password-123!'), findsOneWidget);
+
+      // Selecting the second account switches the inspector and re-masks password.
+      await tester.tap(find.text('Linear'));
+      await tester.pumpAndSettle();
+      expect(find.text('second@example.com'), findsOneWidget);
+      expect(find.text('Second-Password-456!'), findsNothing);
+    },
+  );
+
+  test('parseJoinInvite handles legacy v1, encrypted v2, and LAN tickets', () {
+    const vaultId = '0123456789abcdef0123456789abcdef';
+    final legacy = parseJoinInvite('wencrypt://join?folder=work&vault=$vaultId');
+    expect(legacy, isA<LegacyVaultInvite>());
+    expect((legacy as LegacyVaultInvite).invite.folder, 'work');
+    expect(legacy.vaultId, vaultId);
+
+    final payload = Uint8List(234);
+    payload.setRange(0, 8, utf8.encode('WENCINV2'));
+    payload.setRange(8, 16, utf8.encode('WENCRYPT'));
+    payload[16] = 1;
+    payload[17] = 0;
+    payload[18] = 1;
+    for (var i = 0; i < 16; i++) {
+      payload[19 + i] = i;
+    }
+    final expectedVaultHex = '000102030405060708090a0b0c0d0e0f';
+    final b64Payload = base64Url.encode(payload).replaceAll('=', '');
+
+    final encUri = parseJoinInvite('wencrypt://join?v=2&p=$b64Payload');
+    expect(encUri, isA<EncryptedVaultInvite>());
+    expect(encUri!.vaultId, expectedVaultHex);
+
+    final encPrefix = parseJoinInvite('wencrypt-invite:v2:$b64Payload');
+    expect(encPrefix, isA<EncryptedVaultInvite>());
+    expect(encPrefix!.vaultId, expectedVaultHex);
+
+    final badShort = base64Url.encode(payload.sublist(0, 200)).replaceAll('=', '');
+    expect(parseJoinInvite('wencrypt://join?v=2&p=$badShort'), isNull);
+    final badMagic = Uint8List.fromList(payload)..[0] = 0x58;
+    expect(
+      parseJoinInvite(
+        'wencrypt://join?v=2&p=${base64Url.encode(badMagic).replaceAll('=', '')}',
+      ),
+      isNull,
+    );
+
+    String encodeLan(List<String> ips, int port) {
+      final raw = utf8.encode(
+        jsonEncode({
+          'i': ips,
+          'p': port,
+          'k': base64Url.encode(List<int>.filled(32, 0x2a)).replaceAll('=', ''),
+          't': base64Url.encode(List<int>.filled(16, 0x1b)).replaceAll('=', ''),
+          'v': vaultId,
+        }),
+      );
+      return 'wencrypt://join?v=2&lan=${base64Url.encode(raw).replaceAll('=', '')}';
+    }
+
+    final lan = parseJoinInvite(encodeLan(const ['192.168.1.20'], 45123));
+    expect(lan, isA<LanTransferTicket>());
+    final ticket = lan as LanTransferTicket;
+    expect(ticket.ips, const ['192.168.1.20']);
+    expect(ticket.port, 45123);
+    expect(ticket.vaultId, vaultId);
+    expect(parseJoinInvite(encodeLan(const ['127.0.0.1'], 45123)), isNull);
+    expect(parseJoinInvite(encodeLan(const ['192.168.1.20'], 80)), isNull);
+  });
+
+  testWidgets('quick join and invite menu entries are visible in UI', (
+    tester,
+  ) async {
+    await tester.pumpWidget(const WencryptApp());
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('加入已有库'));
+    await tester.pumpAndSettle();
+    expect(find.text('快捷加入（邀请码 / 同 WiFi 配对）'), findsOneWidget);
+    expect(find.text('从坚果云加入'), findsOneWidget);
+    expect(find.text('从加密备份恢复'), findsOneWidget);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: wencryptTheme(Brightness.light),
+        home: const VaultPage(preview: VaultPreview(unlocked: true)),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('更多'));
+    await tester.pumpAndSettle();
+    expect(find.text('邀请新设备加入'), findsOneWidget);
   });
 }
