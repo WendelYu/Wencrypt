@@ -362,6 +362,8 @@ class WDialog extends StatelessWidget {
     required this.child,
     this.subtitle,
     this.icon,
+    this.danger = false,
+    this.showClose = false,
     this.width = 480,
     this.footer,
     this.scrollable = true,
@@ -372,6 +374,8 @@ class WDialog extends StatelessWidget {
   final String title;
   final String? subtitle;
   final IconData? icon;
+  final bool danger;
+  final bool showClose;
   final double width;
   final Widget child;
   final Widget? footer;
@@ -383,10 +387,26 @@ class WDialog extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = WColors.of(context);
     final media = MediaQuery.of(context);
-    final maxHeight = math.max(320.0, media.size.height * 0.82);
-    final maxWidth = math.max(280.0, media.size.width - 48);
+    final narrow = media.size.width < 600;
+    final availableHeight = math.max(
+      260.0,
+      media.size.height - media.viewInsets.bottom,
+    );
+    final maxHeight = math.max(
+      260.0,
+      availableHeight * (narrow ? 0.86 : 0.82),
+    );
+    final maxWidth = math.max(
+      280.0,
+      media.size.width - (narrow ? 32.0 : 48.0),
+    );
     return Dialog(
-      insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
+      elevation: c.isDark ? 0 : 8,
+      shadowColor: c.shadow.withValues(alpha: 0.28),
+      insetPadding: EdgeInsets.symmetric(
+        horizontal: narrow ? 16 : 24,
+        vertical: narrow ? 16 : 24,
+      ),
       clipBehavior: Clip.antiAlias,
       child: ConstrainedBox(
         constraints: BoxConstraints(
@@ -400,16 +420,33 @@ class WDialog extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               Padding(
-                padding: const EdgeInsets.fromLTRB(20, 18, 14, 14),
+                padding: EdgeInsets.fromLTRB(
+                  20,
+                  16,
+                  14,
+                  subtitle == null ? 13 : 14,
+                ),
                 child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+                  crossAxisAlignment: subtitle == null
+                      ? CrossAxisAlignment.center
+                      : CrossAxisAlignment.start,
                   children: [
                     if (icon != null) ...[
-                      Padding(
-                        padding: const EdgeInsets.only(top: 2),
-                        child: Icon(icon, size: 17, color: c.brand),
+                      Container(
+                        width: 28,
+                        height: 28,
+                        decoration: BoxDecoration(
+                          color: danger ? c.dangerSoft : c.brandSoft,
+                          borderRadius: BorderRadius.circular(WRadius.sm),
+                        ),
+                        alignment: Alignment.center,
+                        child: Icon(
+                          icon,
+                          size: 16,
+                          color: danger ? c.danger : c.brand,
+                        ),
                       ),
-                      const SizedBox(width: 9),
+                      const SizedBox(width: 10),
                     ],
                     Expanded(
                       child: Column(
@@ -420,7 +457,7 @@ class WDialog extends StatelessWidget {
                             style: Theme.of(context).textTheme.headlineSmall,
                           ),
                           if (subtitle != null) ...[
-                            const SizedBox(height: 4),
+                            const SizedBox(height: 3),
                             Text(
                               subtitle!,
                               style: Theme.of(context).textTheme.bodySmall
@@ -434,6 +471,14 @@ class WDialog extends StatelessWidget {
                       ),
                     ),
                     ?headerTrailing,
+                    if (showClose)
+                      WIconButton(
+                        icon: Icons.close_rounded,
+                        tooltip: '关闭',
+                        size: 26,
+                        iconSize: 16,
+                        onPressed: () => Navigator.of(context).maybePop(),
+                      ),
                   ],
                 ),
               ),
@@ -446,7 +491,7 @@ class WDialog extends StatelessWidget {
               if (footer != null) ...[
                 Divider(height: 1, color: c.border),
                 Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+                  padding: const EdgeInsets.fromLTRB(16, 11, 16, 11),
                   child: footer!,
                 ),
               ],
@@ -469,7 +514,10 @@ class WDialogFooter extends StatelessWidget {
   Widget build(BuildContext context) {
     return Row(
       children: [
-        ?leading,
+        if (leading != null) ...[
+          Flexible(child: leading!),
+          const SizedBox(width: 8),
+        ],
         const Spacer(),
         for (var i = 0; i < actions.length; i++) ...[
           if (i > 0) const SizedBox(width: 8),
@@ -544,6 +592,7 @@ class WSearchField extends StatelessWidget {
     this.shortcutHint,
     this.focusNode,
     this.autofocus = false,
+    this.mobile = false,
   });
 
   final TextEditingController controller;
@@ -554,6 +603,7 @@ class WSearchField extends StatelessWidget {
   final String? shortcutHint;
   final FocusNode? focusNode;
   final bool autofocus;
+  final bool mobile;
 
   @override
   Widget build(BuildContext context) {
@@ -566,39 +616,52 @@ class WSearchField extends StatelessWidget {
                 child: WShortcutBadge(label: shortcutHint!),
               )
             : null);
+    final mobileBorder = mobile
+        ? OutlineInputBorder(
+            borderRadius: BorderRadius.circular(WRadius.md),
+            borderSide: BorderSide(color: c.border),
+          )
+        : null;
+    final mobileFocusedBorder = mobile
+        ? OutlineInputBorder(
+            borderRadius: BorderRadius.circular(WRadius.md),
+            borderSide: BorderSide(color: c.brand, width: 1.5),
+          )
+        : null;
     return SizedBox(
-      height: 34,
+      height: mobile ? 44 : 34,
       child: TextField(
         controller: controller,
         focusNode: focusNode,
         autofocus: autofocus,
         onChanged: onChanged,
         onSubmitted: onSubmitted,
-        style: Theme.of(
-          context,
-        ).textTheme.bodyMedium?.copyWith(color: c.textPrimary),
+        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+          color: c.textPrimary,
+          fontSize: mobile ? 14.5 : null,
+        ),
         decoration: InputDecoration(
           hintText: hintText,
-          isDense: true,
-          contentPadding: const EdgeInsets.symmetric(
-            horizontal: 10,
-            vertical: 9,
-          ),
+          isDense: !mobile,
+          contentPadding: mobile
+              ? const EdgeInsets.symmetric(horizontal: 12, vertical: 11)
+              : const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
           fillColor: c.surfaceMuted,
+          border: mobileBorder,
+          enabledBorder: mobileBorder,
+          focusedBorder: mobileFocusedBorder,
           prefixIcon: Icon(
             Icons.search_rounded,
-            size: 16,
+            size: mobile ? 19 : 16,
             color: c.textTertiary,
           ),
-          prefixIconConstraints: const BoxConstraints(
-            minWidth: 32,
-            minHeight: 32,
-          ),
+          prefixIconConstraints: mobile
+              ? const BoxConstraints(minWidth: 40, minHeight: 40)
+              : const BoxConstraints(minWidth: 32, minHeight: 32),
           suffixIcon: effectiveTrailing,
-          suffixIconConstraints: const BoxConstraints(
-            minWidth: 30,
-            minHeight: 30,
-          ),
+          suffixIconConstraints: mobile
+              ? const BoxConstraints(minWidth: 40, minHeight: 40)
+              : const BoxConstraints(minWidth: 30, minHeight: 30),
         ),
       ),
     );
@@ -701,35 +764,38 @@ class WFilterChips extends StatelessWidget {
     required this.labels,
     required this.selectedIndex,
     required this.onSelected,
+    this.mobile = false,
   });
 
   final List<String> labels;
   final int selectedIndex;
   final ValueChanged<int> onSelected;
+  final bool mobile;
 
   @override
   Widget build(BuildContext context) {
     final c = WColors.of(context);
+    final radius = mobile ? WRadius.pill : WRadius.xs;
     return SizedBox(
-      height: 26,
+      height: mobile ? 36 : 26,
       child: ListView.separated(
         scrollDirection: Axis.horizontal,
         padding: const EdgeInsets.symmetric(horizontal: 1),
         itemCount: labels.length,
-        separatorBuilder: (_, _) => const SizedBox(width: 6),
+        separatorBuilder: (_, _) => SizedBox(width: mobile ? 8 : 6),
         itemBuilder: (context, index) {
           final selected = index == selectedIndex;
           return Material(
             color: selected ? c.brandSoft : c.surface,
-            borderRadius: BorderRadius.circular(WRadius.xs),
+            borderRadius: BorderRadius.circular(radius),
             child: InkWell(
-              borderRadius: BorderRadius.circular(WRadius.xs),
+              borderRadius: BorderRadius.circular(radius),
               hoverColor: selected ? null : c.hover,
               onTap: () => onSelected(index),
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 9),
+                padding: EdgeInsets.symmetric(horizontal: mobile ? 13 : 9),
                 decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(WRadius.xs),
+                  borderRadius: BorderRadius.circular(radius),
                   border: Border.all(
                     color: selected
                         ? c.brand.withValues(alpha: 0.28)
@@ -739,13 +805,17 @@ class WFilterChips extends StatelessWidget {
                 child: Row(
                   children: [
                     if (selected) ...[
-                      Icon(Icons.check_rounded, size: 12, color: c.brand),
+                      Icon(
+                        Icons.check_rounded,
+                        size: mobile ? 14 : 12,
+                        color: c.brand,
+                      ),
                       const SizedBox(width: 4),
                     ],
                     Text(
                       labels[index],
                       style: TextStyle(
-                        fontSize: 11.5,
+                        fontSize: mobile ? 13 : 11.5,
                         fontWeight: selected
                             ? FontWeight.w600
                             : FontWeight.w500,
@@ -1289,39 +1359,391 @@ class WFloatingAction extends StatelessWidget {
     required this.label,
     required this.onPressed,
     this.icon = Icons.add_rounded,
+    this.mobile = false,
   });
 
   final String label;
   final VoidCallback onPressed;
   final IconData icon;
+  final bool mobile;
 
   @override
   Widget build(BuildContext context) {
     final c = WColors.of(context);
+    final radius = mobile ? WRadius.lg : WRadius.md;
     return DecoratedBox(
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(WRadius.md),
+        borderRadius: BorderRadius.circular(radius),
         boxShadow: WShadows.floating(c),
       ),
       child: Material(
         color: c.brand,
-        borderRadius: BorderRadius.circular(WRadius.md),
+        borderRadius: BorderRadius.circular(radius),
         child: InkWell(
-          borderRadius: BorderRadius.circular(WRadius.md),
+          borderRadius: BorderRadius.circular(radius),
           onTap: onPressed,
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9),
+            padding: mobile
+                ? const EdgeInsets.symmetric(horizontal: 18, vertical: 14)
+                : const EdgeInsets.symmetric(horizontal: 13, vertical: 9),
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Icon(icon, size: 16, color: c.onBrand),
-                const SizedBox(width: 6),
+                Icon(icon, size: mobile ? 20 : 16, color: c.onBrand),
+                SizedBox(width: mobile ? 8 : 6),
                 Text(
                   label,
-                  style: Theme.of(context).textTheme.labelLarge
-                      ?.copyWith(fontSize: 12.5, color: c.onBrand),
+                  style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                    fontSize: mobile ? 14.5 : 12.5,
+                    fontWeight: FontWeight.w600,
+                    color: c.onBrand,
+                  ),
                 ),
               ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Touch-first card row for mobile account lists.
+class WMobileAccountTile extends StatelessWidget {
+  const WMobileAccountTile({
+    super.key,
+    required this.title,
+    required this.meta,
+    this.group,
+    this.pinned = false,
+    this.hasConflict = false,
+    this.selectionMode = false,
+    this.selected = false,
+    this.avatar,
+    this.onOpen,
+    this.onLongPress,
+    this.onToggleSelect,
+    this.onQuickAction,
+    this.quickActionIcon = Icons.copy_rounded,
+    this.quickActionTooltip = '复制密码',
+  });
+
+  final String title;
+  final String meta;
+  final String? group;
+  final bool pinned;
+  final bool hasConflict;
+  final bool selectionMode;
+  final bool selected;
+  final Widget? avatar;
+  final VoidCallback? onOpen;
+  final VoidCallback? onLongPress;
+  final VoidCallback? onToggleSelect;
+  final VoidCallback? onQuickAction;
+  final IconData quickActionIcon;
+  final String quickActionTooltip;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = WColors.of(context);
+    final theme = Theme.of(context);
+    final showGroupTag =
+        group != null &&
+        group!.isNotEmpty &&
+        group!.trim().toLowerCase() != title.trim().toLowerCase();
+    return WSurface(
+      radius: WRadius.md,
+      color: selected ? c.brandSoft : c.surface,
+      border: true,
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(WRadius.md),
+          onTap: selectionMode ? onToggleSelect : onOpen,
+          onLongPress: selectionMode ? null : onLongPress,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(14, 12, 10, 12),
+            child: Row(
+              children: [
+                if (selectionMode) ...[
+                  Container(
+                    width: 22,
+                    height: 22,
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: selected ? c.brand : Colors.transparent,
+                      border: Border.all(
+                        color: hasConflict
+                            ? c.border
+                            : (selected ? c.brand : c.borderStrong),
+                        width: 1.5,
+                      ),
+                    ),
+                    child: selected
+                        ? Icon(Icons.check_rounded, size: 14, color: c.onBrand)
+                        : null,
+                  ),
+                  const SizedBox(width: 12),
+                ],
+                avatar ?? WAvatar(label: title, seed: title, size: 40),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Row(
+                        children: [
+                          if (pinned) ...[
+                            Icon(
+                              Icons.push_pin_rounded,
+                              size: 13,
+                              color: c.brand,
+                            ),
+                            const SizedBox(width: 4),
+                          ],
+                          Flexible(
+                            child: Text(
+                              title,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: theme.textTheme.titleSmall?.copyWith(
+                                fontSize: 15,
+                                fontWeight: FontWeight.w600,
+                                color: c.textPrimary,
+                              ),
+                            ),
+                          ),
+                          if (showGroupTag) ...[
+                            const SizedBox(width: 6),
+                            ConstrainedBox(
+                              constraints: const BoxConstraints(maxWidth: 96),
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 6,
+                                  vertical: 2,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: c.surfaceMuted,
+                                  borderRadius: BorderRadius.circular(5),
+                                  border: Border.all(color: c.border),
+                                ),
+                                child: Text(
+                                  group!,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w500,
+                                    height: 1.15,
+                                    color: c.textSecondary,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                      const SizedBox(height: 3),
+                      Text(
+                        meta,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          fontSize: 13,
+                          height: 1.35,
+                          color: hasConflict ? c.warning : c.textSecondary,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                if (!selectionMode && onQuickAction != null) ...[
+                  const SizedBox(width: 8),
+                  Tooltip(
+                    message: quickActionTooltip,
+                    child: Material(
+                      color: c.surfaceMuted,
+                      borderRadius: BorderRadius.circular(WRadius.sm),
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(WRadius.sm),
+                        onTap: onQuickAction,
+                        child: SizedBox(
+                          width: 40,
+                          height: 40,
+                          child: Icon(
+                            quickActionIcon,
+                            size: 18,
+                            color: c.textSecondary,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Grouped settings section for mobile screens.
+class WMobileSettingsGroup extends StatelessWidget {
+  const WMobileSettingsGroup({
+    super.key,
+    required this.title,
+    required this.children,
+  });
+
+  final String title;
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = WColors.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(4, 0, 4, 8),
+          child: Text(
+            title,
+            style: TextStyle(
+              fontSize: 12.5,
+              fontWeight: FontWeight.w600,
+              color: c.textTertiary,
+            ),
+          ),
+        ),
+        WSurface(
+          radius: WRadius.lg,
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(WRadius.lg),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                for (var i = 0; i < children.length; i++) ...[
+                  if (i > 0) Divider(height: 1, indent: 58, color: c.border),
+                  children[i],
+                ],
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Touch-friendly setting row inside [WMobileSettingsGroup].
+class WMobileSettingTile extends StatelessWidget {
+  const WMobileSettingTile({
+    super.key,
+    required this.icon,
+    required this.title,
+    this.subtitle,
+    this.trailingText,
+    this.trailing,
+    this.danger = false,
+    this.enabled = true,
+    this.showChevron = true,
+    this.onTap,
+  });
+
+  final IconData icon;
+  final String title;
+  final String? subtitle;
+  final String? trailingText;
+  final Widget? trailing;
+  final bool danger;
+  final bool enabled;
+  final bool showChevron;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = WColors.of(context);
+    final fg = danger ? c.danger : c.textPrimary;
+    final badgeBg = danger ? c.dangerSoft : c.brandSoft;
+    final badgeFg = danger ? c.danger : c.brand;
+    return Opacity(
+      opacity: enabled ? 1 : 0.52,
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: enabled ? onTap : null,
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(minHeight: 54),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              child: Row(
+                children: [
+                  Container(
+                    width: 34,
+                    height: 34,
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                      color: badgeBg,
+                      borderRadius: BorderRadius.circular(WRadius.sm),
+                    ),
+                    child: Icon(icon, size: 18, color: badgeFg),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          title,
+                          style: TextStyle(
+                            fontSize: 14.5,
+                            fontWeight: FontWeight.w500,
+                            color: fg,
+                          ),
+                        ),
+                        if (subtitle != null) ...[
+                          const SizedBox(height: 2),
+                          Text(
+                            subtitle!,
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              color: c.textSecondary,
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                  if (trailing != null) ...[
+                    const SizedBox(width: 8),
+                    trailing!,
+                  ] else if (trailingText != null) ...[
+                    const SizedBox(width: 8),
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 130),
+                      child: Text(
+                        trailingText!,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontSize: 13, color: c.textSecondary),
+                      ),
+                    ),
+                  ],
+                  if (showChevron && onTap != null && trailing == null) ...[
+                    const SizedBox(width: 4),
+                    Icon(
+                      Icons.chevron_right_rounded,
+                      size: 18,
+                      color: c.textTertiary,
+                    ),
+                  ],
+                ],
+              ),
             ),
           ),
         ),

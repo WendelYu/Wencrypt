@@ -586,23 +586,26 @@ ThemeData wencryptTheme(
     ),
     snackBarTheme: SnackBarThemeData(
       behavior: SnackBarBehavior.floating,
-      backgroundColor: dark ? const Color(0xFFEDEFF3) : const Color(0xFF1B1F27),
-      contentTextStyle: textTheme.bodyMedium?.copyWith(
-        color: dark ? const Color(0xFF1B1F27) : Colors.white,
+      backgroundColor: dark ? const Color(0xFF252A36) : const Color(0xFF1A202C),
+      contentTextStyle: textTheme.bodySmall?.copyWith(
+        color: Colors.white,
+        fontWeight: FontWeight.w500,
       ),
-      elevation: 0,
-      insetPadding: const EdgeInsets.fromLTRB(20, 0, 20, 18),
+      elevation: 2,
+      insetPadding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(WRadius.sm),
+        borderRadius: BorderRadius.circular(WRadius.md),
+        side: dark ? BorderSide(color: c.borderStrong) : BorderSide.none,
       ),
     ),
     bottomSheetTheme: BottomSheetThemeData(
-      backgroundColor: c.surface,
+      backgroundColor: c.canvas,
       surfaceTintColor: Colors.transparent,
-      modalBackgroundColor: c.surface,
+      modalBackgroundColor: c.canvas,
+      showDragHandle: false,
       elevation: 0,
       shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(WRadius.xl)),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
       ),
     ),
     scrollbarTheme: ScrollbarThemeData(
@@ -630,11 +633,14 @@ ThemeData wencryptTheme(
       ),
     ),
     navigationBarTheme: NavigationBarThemeData(
-      height: 58,
+      height: 64,
       elevation: 0,
       backgroundColor: c.surface,
       surfaceTintColor: Colors.transparent,
       indicatorColor: c.brandSoft,
+      indicatorShape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(WRadius.md),
+      ),
       labelTextStyle: WidgetStateProperty.resolveWith(
         (states) => textTheme.labelSmall?.copyWith(
           color: states.contains(WidgetState.selected)
@@ -645,7 +651,7 @@ ThemeData wencryptTheme(
       ),
       iconTheme: WidgetStateProperty.resolveWith(
         (states) => IconThemeData(
-          size: 20,
+          size: 22,
           color: states.contains(WidgetState.selected)
               ? c.brand
               : c.textSecondary,

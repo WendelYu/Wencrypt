@@ -486,7 +486,6 @@ Future<BrowserWatchResult?> watchBrowserExportDialog(
               width: 520,
               icon: Icons.file_download_outlined,
               title: '等待 $browser 导出密码…',
-              subtitle: 'Wencrypt 会监听下载目录，导出 CSV 后自动识别并预览。',
               headerTrailing: const SizedBox(
                 width: 16,
                 height: 16,

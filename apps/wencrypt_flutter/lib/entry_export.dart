@@ -4,6 +4,9 @@ import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 
+import 'design/wencrypt_theme.dart';
+import 'design/wencrypt_widgets.dart';
+
 enum EntryExportFormat { image, text }
 
 class EntryExportDialog extends StatefulWidget {
@@ -106,141 +109,149 @@ class _EntryExportDialogState extends State<EntryExportDialog> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final c = WColors.of(context);
     final isImage = _format == EntryExportFormat.image;
     return PopScope(
       canPop: !_exporting,
-      child: AlertDialog(
-        title: const Text('导出账号'),
-        content: SizedBox(
-          width: 400,
-          child: SingleChildScrollView(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                SegmentedButton<EntryExportFormat>(
-                  showSelectedIcon: false,
-                  segments: const [
-                    ButtonSegment(
-                      value: EntryExportFormat.image,
-                      label: Text('图片'),
-                      icon: Icon(Icons.image_outlined),
-                    ),
-                    ButtonSegment(
-                      value: EntryExportFormat.text,
-                      label: Text('文字'),
-                      icon: Icon(Icons.notes),
-                    ),
-                  ],
-                  selected: {_format},
-                  onSelectionChanged: _exporting
-                      ? null
-                      : (selection) {
-                          setState(() {
-                            _format = selection.single;
-                            _includePassword = false;
-                            _error = null;
-                          });
-                        },
-                ),
-                const SizedBox(height: 12),
-                if (isImage)
-                  RepaintBoundary(
-                    key: _card,
-                    child: ColoredBox(
-                      color: const Color(0xfff1f5f9),
-                      child: Padding(
-                        padding: const EdgeInsets.all(16),
-                        child: Container(
-                          decoration: BoxDecoration(
-                            color: Colors.white,
-                            borderRadius: BorderRadius.circular(12),
+      child: WDialog(
+        width: 420,
+        icon: Icons.ios_share_rounded,
+        title: '导出账号',
+        bodyPadding: const EdgeInsets.fromLTRB(20, 12, 20, 14),
+        footer: WDialogFooter(
+          actions: [
+            TextButton(
+              style: TextButton.styleFrom(foregroundColor: c.textSecondary),
+              onPressed: _exporting ? null : () => Navigator.pop(context),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: _exporting ? null : _export,
+              child: Text(
+                !isImage
+                    ? '复制文字'
+                    : widget.toAlbum
+                    ? '保存到相册'
+                    : '复制图片',
+              ),
+            ),
+          ],
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Center(
+              child: WSegmented<EntryExportFormat>(
+                value: _format,
+                onChanged: (next) {
+                  if (_exporting) return;
+                  setState(() {
+                    _format = next;
+                    _includePassword = false;
+                    _error = null;
+                  });
+                },
+                segments: const [
+                  (EntryExportFormat.image, '图片', Icons.image_outlined),
+                  (EntryExportFormat.text, '文字', Icons.notes),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            if (isImage)
+              RepaintBoundary(
+                key: _card,
+                child: ColoredBox(
+                  color: const Color(0xfff1f5f9),
+                  child: Padding(
+                    padding: const EdgeInsets.all(14),
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      padding: const EdgeInsets.all(18),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            _value('title'),
+                            style: const TextStyle(
+                              color: Color(0xff10213a),
+                              fontSize: 20,
+                              fontWeight: FontWeight.w700,
+                            ),
                           ),
-                          padding: const EdgeInsets.all(20),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                _value('title'),
-                                style: const TextStyle(
-                                  color: Color(0xff10213a),
-                                  fontSize: 22,
-                                  fontWeight: FontWeight.w700,
-                                ),
+                          for (final field in _fields.entries) ...[
+                            const SizedBox(height: 14),
+                            Text(
+                              field.key,
+                              style: const TextStyle(
+                                color: Color(0xff475569),
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w600,
                               ),
-                              for (final field in _fields.entries) ...[
-                                const SizedBox(height: 16),
-                                Text(
-                                  field.key,
-                                  style: const TextStyle(
-                                    color: Color(0xff475569),
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                                Text(
-                                  field.value,
-                                  style: const TextStyle(
-                                    color: Color(0xff10213a),
-                                    fontSize: 16,
-                                  ),
-                                ),
-                              ],
-                            ],
-                          ),
-                        ),
+                            ),
+                            Text(
+                              field.value,
+                              style: const TextStyle(
+                                color: Color(0xff10213a),
+                                fontSize: 15,
+                              ),
+                            ),
+                          ],
+                        ],
                       ),
                     ),
-                  )
-                else
-                  DecoratedBox(
-                    decoration: BoxDecoration(
-                      color: theme.colorScheme.surfaceContainerHigh,
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Padding(
-                      padding: const EdgeInsets.all(14),
-                      child: Text(_text, style: theme.textTheme.bodyMedium),
-                    ),
                   ),
-                if (_value('password').isNotEmpty)
-                  CheckboxListTile(
-                    contentPadding: EdgeInsets.zero,
-                    value: _includePassword,
-                    title: const Text('包含密码'),
-                    onChanged: _exporting
-                        ? null
-                        : (value) =>
-                              setState(() => _includePassword = value == true),
-                  ),
-                if (_includePassword) const Text('收到导出内容的人可以直接查看密码。'),
-                if (_error case final error?)
-                  Text(
-                    error,
-                    style: TextStyle(
-                      color: Theme.of(context).colorScheme.error,
+                ),
+              )
+            else
+              DecoratedBox(
+                decoration: BoxDecoration(
+                  color: c.surfaceMuted,
+                  borderRadius: BorderRadius.circular(WRadius.sm),
+                  border: Border.all(color: c.border),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Text(
+                    _text,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: c.textPrimary,
                     ),
                   ),
-              ],
-            ),
-          ),
+                ),
+              ),
+            if (_value('password').isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: CheckboxListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: _includePassword,
+                  title: const Text('包含密码'),
+                  onChanged: _exporting
+                      ? null
+                      : (value) =>
+                            setState(() => _includePassword = value == true),
+                ),
+              ),
+            if (_includePassword)
+              const Padding(
+                padding: EdgeInsets.only(top: 4),
+                child: WNote(
+                  tone: WTone.warning,
+                  child: Text('包含密码，请仅发送给受信任的接收方'),
+                ),
+              ),
+            if (_error case final error?)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: WNote(tone: WTone.danger, child: Text(error)),
+              ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: _exporting ? null : () => Navigator.pop(context),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: _exporting ? null : _export,
-            child: Text(
-              !isImage
-                  ? '复制文字'
-                  : widget.toAlbum
-                  ? '保存到相册'
-                  : '复制图片',
-            ),
-          ),
-        ],
       ),
     );
   }

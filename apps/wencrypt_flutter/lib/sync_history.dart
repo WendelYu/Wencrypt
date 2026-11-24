@@ -132,7 +132,12 @@ class _SyncHistoryViewState extends State<SyncHistoryView> {
     return WStatusPill(label: label, tone: tone, compact: true);
   }
 
-  Widget _row(BuildContext context, SyncHistoryRecord record, bool wide) {
+  Widget _row(
+    BuildContext context,
+    SyncHistoryRecord record,
+    bool wide,
+    bool mobile,
+  ) {
     final theme = Theme.of(context);
     final outcome = _outcome(record);
     final reason = record.issue != null
@@ -147,13 +152,13 @@ class _SyncHistoryViewState extends State<SyncHistoryView> {
       children: [
         WMono(
           _time(record.started),
-          size: 11.5,
+          size: mobile ? 12 : 11.5,
           color: WColors.of(context).textSecondary,
         ),
         Text(
           record.automatic ? '自动同步' : '手动同步',
           style: theme.textTheme.bodySmall?.copyWith(
-            fontSize: 10.8,
+            fontSize: mobile ? 11.5 : 10.8,
             color: WColors.of(context).textTertiary,
           ),
         ),
@@ -168,20 +173,29 @@ class _SyncHistoryViewState extends State<SyncHistoryView> {
               record.folder,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
+              style: mobile
+                  ? theme.textTheme.bodyMedium?.copyWith(fontSize: 13.5)
+                  : null,
             ),
           ),
         ),
         IconButton(
           tooltip: '复制目录名',
-          visualDensity: VisualDensity.compact,
-          icon: const Icon(Icons.copy_outlined, size: 16),
+          visualDensity: mobile ? VisualDensity.standard : VisualDensity.compact,
+          constraints: mobile
+              ? const BoxConstraints(minWidth: 36, minHeight: 36)
+              : null,
+          icon: Icon(Icons.copy_outlined, size: mobile ? 18 : 16),
           onPressed: () => widget.copyDirectory(record.folder),
         ),
       ],
     );
     final status = _status(context, outcome);
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
+      padding: EdgeInsets.symmetric(
+        horizontal: mobile ? 14 : 16,
+        vertical: mobile ? 12 : 9,
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -215,7 +229,15 @@ class _SyncHistoryViewState extends State<SyncHistoryView> {
               ],
             ),
             folder,
-            Text('上传 ${record.uploaded} 条 · 下载 ${record.downloaded} 条'),
+            Text(
+              '上传 ${record.uploaded} 条 · 下载 ${record.downloaded} 条',
+              style: mobile
+                  ? theme.textTheme.bodySmall?.copyWith(
+                      fontSize: 12.5,
+                      color: WColors.of(context).textSecondary,
+                    )
+                  : null,
+            ),
           ],
           if (reason != null)
             Padding(
@@ -246,6 +268,7 @@ class _SyncHistoryViewState extends State<SyncHistoryView> {
     return LayoutBuilder(
       builder: (context, constraints) {
         final wide = constraints.maxWidth >= 690;
+        final mobile = constraints.maxWidth < 600;
         final c = WColors.of(context);
         return Padding(
           padding: EdgeInsets.symmetric(
@@ -259,6 +282,7 @@ class _SyncHistoryViewState extends State<SyncHistoryView> {
                 children: [
                   Expanded(
                     child: WFilterChips(
+                      mobile: mobile,
                       labels: const ['全部', '失败', '未完成'],
                       selectedIndex: _Filter.values.indexOf(_filter),
                       onSelected: (index) =>
@@ -339,7 +363,7 @@ class _SyncHistoryViewState extends State<SyncHistoryView> {
                                 child: ListView(
                                   children: [
                                     for (final record in visible) ...[
-                                      _row(context, record, wide),
+                                      _row(context, record, wide, mobile),
                                       Divider(
                                         height: 1,
                                         color: c.border.withValues(alpha: 0.7),

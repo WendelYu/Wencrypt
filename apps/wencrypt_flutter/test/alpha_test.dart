@@ -54,7 +54,7 @@ void main() {
     await tester.tap(find.byTooltip('立即同步'));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
-    final dialog = find.byType(AlertDialog);
+    final dialog = find.byType(Dialog);
     expect(find.text('同步到坚果云？'), findsOneWidget);
     expect(
       find.descendant(
@@ -131,7 +131,7 @@ void main() {
     await tester.tap(find.text('修改主密码'));
     await tester.pumpAndSettle();
     final fields = find.descendant(
-      of: find.byType(AlertDialog),
+      of: find.byType(Dialog),
       matching: find.byType(EditableText),
     );
     expect(tester.widgetList<EditableText>(fields).map((e) => e.obscureText), [
@@ -494,6 +494,295 @@ void main() {
 
       await tester.tap(find.text('取消'));
       await tester.pumpAndSettle();
+    },
+  );
+
+  testWidgets(
+    'locked screen biometric unlock calls native unlock and ignores cancellation',
+    (tester) async {
+      final calls = <String>[];
+      const channel = MethodChannel('org.wencrypt.device/vault');
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+            calls.add(call.method);
+            if (call.method == 'status') {
+              return {
+                'enabled': true,
+                'hardwareAvailable': true,
+                'biometricStatus': 'ready',
+              };
+            }
+            if (call.method == 'unlock') {
+              return {'error': 'biometric_cancelled'};
+            }
+            return null;
+          });
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(channel, null),
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: wencryptTheme(Brightness.light),
+          home: const VaultPage(
+            preview: VaultPreview(
+              exists: true,
+              unlocked: false,
+              biometricEnabled: true,
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('使用指纹解锁'), findsOneWidget);
+      await tester.tap(find.text('使用指纹解锁'));
+      await tester.pumpAndSettle();
+
+      expect(calls, ['unlock']);
+      expect(find.byType(SnackBar), findsNothing);
+      expect(find.textContaining('指纹验证未通过'), findsNothing);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: wencryptTheme(Brightness.light),
+          home: const VaultPage(
+            key: ValueKey('unlocked-biometric'),
+            preview: VaultPreview(unlocked: true, biometricEnabled: true),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('设置'));
+      await tester.pumpAndSettle();
+      expect(find.text('指纹解锁'), findsOneWidget);
+      expect(find.text('已开启'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'mobile layout opens account detail sheet before full-screen editor',
+    (tester) async {
+      tester.view.physicalSize = const Size(390, 844);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: wencryptTheme(Brightness.light),
+          home: const VaultPage(
+            preview: VaultPreview(
+              unlocked: true,
+              mobileLayout: true,
+              entries: [
+                {
+                  'id': 'rev-1',
+                  'entry': 'entry-1',
+                  'deleted': false,
+                  'data': {
+                    'title': 'GitHub',
+                    'username': 'mobile@example.com',
+                    'password': 'Mobile-Secret-789!',
+                    'url': 'https://github.com',
+                    'tags': '开发',
+                    'notes': 'Backup code note',
+                  },
+                },
+              ],
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('GitHub'));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(Dialog), findsNothing);
+      expect(find.text('复制用户名'), findsOneWidget);
+      expect(find.text('复制密码'), findsOneWidget);
+      expect(find.text('Backup code note'), findsOneWidget);
+      expect(find.text('Mobile-Secret-789!'), findsNothing);
+
+      await tester.tap(find.byTooltip('显示密码'));
+      await tester.pumpAndSettle();
+      expect(find.text('Mobile-Secret-789!'), findsOneWidget);
+
+      await tester.tap(find.text('编辑'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('编辑账号'), findsOneWidget);
+      expect(find.text('保存'), findsOneWidget);
+      expect(find.text('随机生成'), findsOneWidget);
+      expect(find.byType(Dialog), findsNothing);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'mobile layout uses 4-tab navigation with dedicated settings page',
+    (tester) async {
+      tester.view.physicalSize = const Size(390, 844);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: wencryptTheme(Brightness.light),
+          home: const VaultPage(
+            preview: VaultPreview(
+              unlocked: true,
+              mobileLayout: true,
+              biometricEnabled: true,
+              syncConfigured: true,
+              syncUsername: 'mobile@example.com',
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.byTooltip('更多'), findsNothing);
+      expect(find.byType(NavigationDestination), findsNWidgets(4));
+      expect(find.text('同步记录'), findsOneWidget);
+
+      await tester.tap(find.text('设置'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('指纹解锁'), findsOneWidget);
+      expect(find.text('已开启'), findsOneWidget);
+      expect(find.text('坚果云与多备份设置'), findsOneWidget);
+      expect(find.text('邀请新设备加入'), findsOneWidget);
+
+      await tester.drag(find.byType(ListView), const Offset(0, -400));
+      await tester.pumpAndSettle();
+      expect(find.text('导出加密备份'), findsOneWidget);
+      expect(find.text('外观主题'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+
+      await tester.tap(find.text('同步记录'));
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'mobile multi-select renders contextual top and bottom bars without overflow',
+    (tester) async {
+      tester.view.physicalSize = const Size(390, 844);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: wencryptTheme(Brightness.light),
+          home: const VaultPage(
+            preview: VaultPreview(
+              unlocked: true,
+              mobileLayout: true,
+              entries: [
+                {
+                  'id': 'rev-1',
+                  'entry': 'entry-1',
+                  'deleted': false,
+                  'data': {
+                    'title': 'GitHub',
+                    'username': 'first@example.com',
+                    'password': 'First-Password-123!',
+                    'url': 'https://github.com',
+                    'tags': '开发',
+                    'notes': '',
+                  },
+                },
+                {
+                  'id': 'rev-2',
+                  'entry': 'entry-2',
+                  'deleted': false,
+                  'data': {
+                    'title': 'Linear',
+                    'username': 'second@example.com',
+                    'password': 'Second-Password-456!',
+                    'url': 'https://linear.app',
+                    'tags': '工作',
+                    'notes': '',
+                  },
+                },
+              ],
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.longPress(find.text('GitHub'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('已选 1 项'), findsOneWidget);
+      expect(find.text('全选'), findsOneWidget);
+      expect(find.text('移入回收站 (1)'), findsOneWidget);
+
+      await tester.tap(find.text('全选'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('已选 2 项'), findsOneWidget);
+      expect(find.text('取消全选'), findsOneWidget);
+      expect(find.text('移入回收站 (2)'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'mobile locked and first-run screens render cleanly at 390px width',
+    (tester) async {
+      tester.view.physicalSize = const Size(390, 844);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: wencryptTheme(Brightness.light),
+          home: const VaultPage(
+            key: ValueKey('mobile-locked'),
+            preview: VaultPreview(
+              exists: true,
+              unlocked: false,
+              biometricEnabled: true,
+              mobileLayout: true,
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('解锁密码库'), findsOneWidget);
+      expect(find.text('使用指纹解锁'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: wencryptTheme(Brightness.light),
+          home: const VaultPage(
+            key: ValueKey('mobile-first-run'),
+            preview: VaultPreview(
+              exists: false,
+              unlocked: false,
+              androidQrScan: true,
+              mobileLayout: true,
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('加入已有库'));
+      await tester.pumpAndSettle();
+      expect(find.text('扫一扫加入'), findsOneWidget);
+      expect(tester.takeException(), isNull);
     },
   );
 }
