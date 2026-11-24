@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:wencrypt/design/wencrypt_theme.dart';
@@ -441,4 +442,58 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('邀请新设备加入'), findsOneWidget);
   });
+
+  testWidgets(
+    'Android QR scan option invokes native scanQr and opens join dialog',
+    (tester) async {
+      final calls = <String>[];
+      final payload = Uint8List(234);
+      payload.setRange(0, 8, utf8.encode('WENCINV2'));
+      payload.setRange(8, 16, utf8.encode('WENCRYPT'));
+      payload[16] = 1;
+      payload[17] = 0;
+      payload[18] = 1;
+      for (var i = 0; i < 16; i++) {
+        payload[19 + i] = i;
+      }
+      final b64Payload = base64Url.encode(payload).replaceAll('=', '');
+      final inviteUri = 'wencrypt://join?v=2&p=$b64Payload';
+
+      const channel = MethodChannel('org.wencrypt.invite');
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+            calls.add(call.method);
+            if (call.method == 'scanQr') return inviteUri;
+            return null;
+          });
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(channel, null),
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: wencryptTheme(Brightness.light),
+          home: const VaultPage(
+            preview: VaultPreview(exists: false, androidQrScan: true),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('加入已有库'));
+      await tester.pumpAndSettle();
+      expect(find.text('扫一扫加入'), findsOneWidget);
+      expect(find.text('快捷加入（邀请码 / 同 WiFi 配对）'), findsOneWidget);
+
+      await tester.tap(find.text('扫一扫加入'));
+      await tester.pumpAndSettle();
+
+      expect(calls, ['scanQr']);
+      expect(find.text('通过离线加密邀请加入'), findsOneWidget);
+
+      await tester.tap(find.text('取消'));
+      await tester.pumpAndSettle();
+    },
+  );
 }

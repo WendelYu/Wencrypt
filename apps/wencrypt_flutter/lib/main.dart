@@ -89,6 +89,7 @@ class VaultPreview {
     this.syncConfigured = false,
     this.syncUsername,
     this.biometricEnabled = false,
+    this.androidQrScan = false,
     this.message = '本地加密 · 离线可用',
   });
 
@@ -100,6 +101,7 @@ class VaultPreview {
   final bool syncConfigured;
   final String? syncUsername;
   final bool biometricEnabled;
+  final bool androidQrScan;
   final String message;
 }
 
@@ -113,6 +115,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   static const invites = MethodChannel('org.wencrypt.invite');
   static const entryImage = MethodChannel('org.wencrypt.entry-image');
   static const device = MethodChannel('org.wencrypt.device/vault');
+
+  bool get _canScanQr =>
+      Platform.isAndroid || (widget.preview?.androidQrScan ?? false);
 
   final master = TextEditingController();
   final confirm = TextEditingController();
@@ -2061,6 +2066,33 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     }
   }
 
+  static const _scanQrSentinel = '__wencrypt_scan_qr__';
+
+  Future<void> _scanInviteQr() async {
+    if (exists || token != null || busy || _inviteFlowOpen) return;
+    if (!_canScanQr) {
+      await _pasteInvite();
+      return;
+    }
+    try {
+      final raw = await invites.invokeMethod<String>('scanQr');
+      final trimmed = raw?.trim() ?? '';
+      if (mounted && trimmed.isNotEmpty) {
+        _useInvite(trimmed);
+      }
+    } on MissingPluginException {
+      if (mounted) await _pasteInvite();
+    } on PlatformException catch (error) {
+      if (mounted) {
+        setState(
+          () => message = error.code == 'busy'
+              ? '扫码页面已打开，请完成或取消当前扫码。'
+              : '无法启动扫码功能，请改用粘贴邀请码。',
+        );
+      }
+    }
+  }
+
   Future<void> _pasteInvite() async {
     if (exists || token != null || busy || _inviteFlowOpen) return;
     final clip = await Clipboard.getData(Clipboard.kTextPlain);
@@ -2081,7 +2113,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
             width: 480,
             icon: Icons.qr_code_2_rounded,
             title: '快捷加入已有密码库',
-            subtitle: '粘贴另一台设备生成的「加密邀请码」或「同 WiFi 配对码」（也可直接用手机扫码打开）。',
+            subtitle: _canScanQr
+                ? '点击「扫一扫」直接识别二维码，或粘贴另一台设备生成的「加密邀请码」/「同 WiFi 配对码」。'
+                : '粘贴另一台设备生成的「加密邀请码」或「同 WiFi 配对码」（可用 Android 客户端内置扫一扫）。',
             footer: WDialogFooter(
               leading: TextButton.icon(
                 onPressed: () async {
@@ -2118,6 +2152,18 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
+                if (_canScanQr) ...[
+                  SizedBox(
+                    width: double.infinity,
+                    height: 40,
+                    child: OutlinedButton.icon(
+                      onPressed: () => Navigator.pop(ctx, _scanQrSentinel),
+                      icon: const Icon(Icons.qr_code_scanner_rounded, size: 17),
+                      label: const Text('扫一扫二维码'),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                ],
                 WLabeledField(
                   label: '邀请码 / 配对码',
                   child: TextField(
@@ -2146,7 +2192,12 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       ),
     );
     ctrl.dispose();
-    if (mounted && raw != null) _useInvite(raw);
+    if (!mounted || raw == null) return;
+    if (raw == _scanQrSentinel) {
+      await _scanInviteQr();
+      return;
+    }
+    _useInvite(raw);
   }
 
   String _deviceDisplayLabel() {
@@ -4428,12 +4479,22 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
               ),
             ),
           ),
+        if (_canScanQr)
+          _authOption(
+            icon: Icons.qr_code_scanner_rounded,
+            title: '扫一扫加入',
+            description: '直接扫描另一台设备上的二维码（支持离线加密邀请与同 WiFi 配对）。',
+            onTap: busy ? null : _scanInviteQr,
+            primary: true,
+          ),
         _authOption(
-          icon: Icons.qr_code_scanner_rounded,
+          icon: _canScanQr
+              ? Icons.content_paste_go_rounded
+              : Icons.qr_code_scanner_rounded,
           title: '快捷加入（邀请码 / 同 WiFi 配对）',
           description: '粘贴加密邀请码或局域网配对码，免输入坚果云账号密码快速加入。',
           onTap: busy ? null : _pasteInvite,
-          primary: true,
+          primary: !_canScanQr,
         ),
         _authOption(
           icon: Icons.cloud_download_outlined,
@@ -6259,7 +6320,7 @@ class _InviteDeviceDialogState extends State<_InviteDeviceDialog> {
           tone: WTone.info,
           icon: Icons.shield_outlined,
           child: Text(
-            '新设备扫码或粘贴后仅需输入 1 次主密码即可自动同步。密文经过 Argon2id 与 AES-256-GCM 保护，通过微信或剪贴板转发同样安全。',
+            '新设备打开 Wencrypt →「加入已有库」→「扫一扫加入」（或粘贴邀请码）并输入 1 次主密码即可自动同步。密文经过 Argon2id 与 AES-256-GCM 保护，通过微信或剪贴板转发同样安全。',
           ),
         ),
       ],
@@ -6447,7 +6508,7 @@ class _InviteDeviceDialogState extends State<_InviteDeviceDialog> {
             tone: WTone.info,
             icon: Icons.wifi_tethering_rounded,
             child: Text(
-              '请确保两台设备在同一 WiFi 下。新设备扫码或粘贴后，本机将弹出 6 位安全核对码，确认后免输主密码直接完成加入。',
+              '请确保两台设备在同一 WiFi 下。新设备打开 Wencrypt →「加入已有库」→「扫一扫加入」后，本机将弹出 6 位安全核对码，确认后免输主密码直接完成加入。',
             ),
           ),
         ],

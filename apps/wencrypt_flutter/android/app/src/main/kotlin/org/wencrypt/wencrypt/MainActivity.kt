@@ -9,8 +9,14 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterFragmentActivity() {
+    companion object {
+        private const val REQUEST_SAVE_BACKUP = 7401
+        private const val REQUEST_QR_SCAN = 7402
+    }
+
     private var backupResult: MethodChannel.Result? = null
     private var backupBytes: ByteArray? = null
+    private var scanResult: MethodChannel.Result? = null
     private var inviteChannel: MethodChannel? = null
     private var pendingInvite: String? = null
 
@@ -34,7 +40,17 @@ class MainActivity : FlutterFragmentActivity() {
     }
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != 7401) return
+        if (requestCode == REQUEST_QR_SCAN) {
+            val result = scanResult
+            scanResult = null
+            if (resultCode == android.app.Activity.RESULT_OK) {
+                result?.success(data?.getStringExtra(QrScannerActivity.EXTRA_QR_RESULT))
+            } else {
+                result?.success(null)
+            }
+            return
+        }
+        if (requestCode != REQUEST_SAVE_BACKUP) return
         val result = backupResult
         val bytes = backupBytes
         backupResult = null
@@ -77,12 +93,29 @@ class MainActivity : FlutterFragmentActivity() {
         super.configureFlutterEngine(flutterEngine)
         inviteChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "org.wencrypt.invite").apply {
             setMethodCallHandler { call, result ->
-                if (call.method == "takePending") {
-                    val invitation = pendingInvite
-                    pendingInvite = null
-                    result.success(invitation)
-                } else {
-                    result.notImplemented()
+                when (call.method) {
+                    "takePending" -> {
+                        val invitation = pendingInvite
+                        pendingInvite = null
+                        result.success(invitation)
+                    }
+                    "scanQr" -> {
+                        if (scanResult != null) {
+                            result.error("busy", "A QR scan is already in progress", null)
+                            return@setMethodCallHandler
+                        }
+                        scanResult = result
+                        try {
+                            startActivityForResult(
+                                Intent(this@MainActivity, QrScannerActivity::class.java),
+                                REQUEST_QR_SCAN,
+                            )
+                        } catch (_: Exception) {
+                            scanResult = null
+                            result.error("scan_unavailable", "QR scanner unavailable", null)
+                        }
+                    }
+                    else -> result.notImplemented()
                 }
             }
         }
@@ -106,7 +139,7 @@ class MainActivity : FlutterFragmentActivity() {
                                 else -> "wencrypt-backup.wenback"
                             }
                             putExtra(Intent.EXTRA_TITLE, name)
-                        }, 7401)
+                        }, REQUEST_SAVE_BACKUP)
                     } catch (_: Exception) { backupBytes = null; backupResult = null; result.error("save_failed", "File picker unavailable", null) }
                 } else if (call.method == "copySensitive") {
                     val text = call.argument<String>("text") ?: ""

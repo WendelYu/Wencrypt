@@ -43,5 +43,12 @@ flutter {
 }
 
 dependencies {
+    val cameraxVersion = "1.5.2"
     implementation("androidx.biometric:biometric:1.1.0")
+    implementation("androidx.camera:camera-core:$cameraxVersion")
+    implementation("androidx.camera:camera-camera2:$cameraxVersion")
+    implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
+    implementation("androidx.camera:camera-view:$cameraxVersion")
+    implementation("com.google.zxing:core:3.5.4")
+    testImplementation("junit:junit:4.13.2")
 }
