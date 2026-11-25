@@ -19,6 +19,9 @@ class MainActivity : FlutterFragmentActivity() {
     private var scanResult: MethodChannel.Result? = null
     private var inviteChannel: MethodChannel? = null
     private var pendingInvite: String? = null
+    private var ocrChannel: MethodChannel? = null
+    private val pendingImageLock = Any()
+    private var pendingSharedImage: ByteArray? = null
 
     private fun receiveInvite(intent: Intent?) {
         val uri = intent?.data ?: return
@@ -27,16 +30,50 @@ class MainActivity : FlutterFragmentActivity() {
         inviteChannel?.invokeMethod("available", null)
     }
 
+    private fun receiveSharedImage(intent: Intent?) {
+        if (intent?.action != Intent.ACTION_SEND) return
+        val type = intent.type ?: ""
+        if (type.isNotEmpty() && !type.startsWith("image/")) return
+        val streamUri = if (android.os.Build.VERSION.SDK_INT >= 33) {
+            intent.getParcelableExtra(Intent.EXTRA_STREAM, android.net.Uri::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent.getParcelableExtra(Intent.EXTRA_STREAM)
+        }
+        val uri = streamUri ?: intent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri ?: return
+        val stream = runCatching { contentResolver.openInputStream(uri) }.getOrNull() ?: return
+        Thread {
+            val bytes = runCatching { ScreenshotOcr.readBoundedStream(stream) }.getOrNull() ?: return@Thread
+            runOnUiThread {
+                synchronized(pendingImageLock) {
+                    pendingSharedImage?.fill(0)
+                    pendingSharedImage = bytes
+                }
+                ocrChannel?.invokeMethod("sharedImageAvailable", null)
+            }
+        }.start()
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         receiveInvite(intent)
+        receiveSharedImage(intent)
     }
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         super.onCreate(savedInstanceState)
         receiveInvite(intent)
+        receiveSharedImage(intent)
         window.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+    }
+
+    override fun onDestroy() {
+        synchronized(pendingImageLock) {
+            pendingSharedImage?.fill(0)
+            pendingSharedImage = null
+        }
+        super.onDestroy()
     }
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
@@ -63,9 +100,8 @@ class MainActivity : FlutterFragmentActivity() {
         } catch (_: Exception) { result?.error("save_failed", "Backup write failed", null) }
     }
 
-    private val probe by lazy { DeviceProbe(this) }
     private val vaultDevice by lazy { DeviceVault(this) }
-    override fun onStop() { vaultDevice.cancel(); probe.cancel(); super.onStop() }
+    override fun onStop() { vaultDevice.cancel(); super.onStop() }
 
     private fun saveEntryImage(bytes: ByteArray) {
         val images = MediaStore.Images.Media
@@ -171,12 +207,90 @@ class MainActivity : FlutterFragmentActivity() {
                 }.start()
             }
 
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "org.wencrypt.p0/device")
+        ocrChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "org.wencrypt.ocr").apply {
+            setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "takePendingImage" -> {
+                        val pending = synchronized(pendingImageLock) {
+                            val data = pendingSharedImage
+                            pendingSharedImage = null
+                            data
+                        }
+                        result.success(pending?.copyOf())
+                        pending?.fill(0)
+                    }
+                    "readClipboardImage" -> {
+                        Thread {
+                            val bytes = ScreenshotOcr.readClipboardImage(applicationContext)
+                            runOnUiThread {
+                                result.success(bytes?.copyOf())
+                                bytes?.fill(0)
+                            }
+                        }.start()
+                    }
+                    "recognizeImage" -> {
+                        val bytes = call.arguments as? ByteArray
+                        if (bytes == null || bytes.isEmpty()) {
+                            result.error("invalid_image", null, null)
+                            return@setMethodCallHandler
+                        }
+                        val copy = bytes.copyOf()
+                        ScreenshotOcr.recognizeImage(
+                            copy,
+                            onSuccess = { output ->
+                                runOnUiThread { result.success(output) }
+                            },
+                            onError = { code ->
+                                runOnUiThread { result.error(code, null, null) }
+                            },
+                        )
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+        }
+
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "org.wencrypt.updater")
             .setMethodCallHandler { call, result ->
-                try {
-                    probe.perform(call.method) { result.success(it) }
-                } catch (_: Exception) {
-                    result.error("probe_failed", "Android device probe unavailable", null)
+                when (call.method) {
+                    "getAppInfo" -> {
+                        val info = runCatching {
+                            @Suppress("DEPRECATION")
+                            packageManager.getPackageInfo(packageName, 0)
+                        }.getOrNull()
+                        val version = info?.versionName ?: "0.3.10"
+                        val buildNumber = if (info == null) {
+                            "1"
+                        } else if (android.os.Build.VERSION.SDK_INT >= 28) {
+                            info.longVersionCode.toString()
+                        } else {
+                            @Suppress("DEPRECATION")
+                            info.versionCode.toString()
+                        }
+                        result.success(
+                            mapOf(
+                                "version" to version,
+                                "buildNumber" to buildNumber,
+                                "installPath" to "",
+                                "canAutoInstall" to false,
+                                "isSandboxed" to false,
+                                "platform" to "android",
+                            )
+                        )
+                    }
+                    "openUrl" -> {
+                        val rawUrl = call.arguments as? String
+                        if (rawUrl == null || !rawUrl.startsWith("https://")) {
+                            result.success(false)
+                            return@setMethodCallHandler
+                        }
+                        val opened = runCatching {
+                            startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(rawUrl)))
+                            true
+                        }.getOrDefault(false)
+                        result.success(opened)
+                    }
+                    else -> result.notImplemented()
                 }
             }
     }

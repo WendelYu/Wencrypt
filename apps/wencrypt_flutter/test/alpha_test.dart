@@ -785,4 +785,84 @@ void main() {
       expect(tester.takeException(), isNull);
     },
   );
+
+  testWidgets(
+    'desktop and mobile UI expose password generator and screenshot import without diagnostics',
+    (tester) async {
+      const ocrChannel = MethodChannel('org.wencrypt.ocr');
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(ocrChannel, (_) async => null);
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(ocrChannel, null),
+      );
+
+      tester.view.physicalSize = const Size(1100, 760);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: wencryptTheme(Brightness.light),
+          home: const VaultPage(preview: VaultPreview(unlocked: true)),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('随机密码'), findsOneWidget);
+      expect(find.text('截图导入'), findsOneWidget);
+      expect(find.text('设备诊断'), findsNothing);
+
+      // Open standalone random password generator from sidebar.
+      await tester.tap(find.text('随机密码'));
+      await tester.pumpAndSettle();
+      expect(find.text('随机密码生成器'), findsOneWidget);
+      await tester.tap(find.text('关闭'));
+      await tester.pumpAndSettle();
+
+      // Open screenshot quick import from sidebar.
+      await tester.tap(find.text('截图导入'));
+      await tester.pumpAndSettle();
+      expect(find.text('截取注册或账号页面后直接导入'), findsOneWidget);
+      await tester.tap(find.text('取消'));
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+
+      // Narrow desktop (<860) exposes header icon buttons without overflow.
+      tester.view.physicalSize = const Size(800, 600);
+      await tester.pumpAndSettle();
+      expect(find.byTooltip('随机密码生成器'), findsOneWidget);
+      expect(find.byTooltip('从截图快捷导入'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+
+      // Mobile layout exposes screenshot import & password generator in settings and app bar.
+      tester.view.physicalSize = const Size(390, 844);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: wencryptTheme(Brightness.light),
+          home: const VaultPage(
+            key: ValueKey('mobile-tools'),
+            preview: VaultPreview(unlocked: true, mobileLayout: true),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.byTooltip('截图导入'), findsOneWidget);
+      await tester.tap(find.text('设置'));
+      await tester.pumpAndSettle();
+
+      await tester.drag(find.byType(ListView), const Offset(0, -400));
+      await tester.pumpAndSettle();
+      expect(find.text('从截图快捷导入'), findsOneWidget);
+      expect(find.text('随机密码生成器'), findsOneWidget);
+      expect(find.text('设备诊断'), findsNothing);
+      expect(tester.takeException(), isNull);
+    },
+  );
 }

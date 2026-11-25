@@ -3,6 +3,7 @@ import FlutterMacOS
 
 private final class WatchDirectoryBookmarks {
   private let key = "WencryptBrowserWatchBookmarks"
+  private let isSandboxed = AppUpdater.isSandboxed()
   private var active: [String: URL] = [:]
 
   private var data: [Data] {
@@ -12,9 +13,12 @@ private final class WatchDirectoryBookmarks {
 
   private func resolve(_ bookmark: Data) throws -> (URL, Bool) {
     var stale = false
+    let options: URL.BookmarkResolutionOptions = isSandboxed
+      ? [.withSecurityScope, .withoutUI]
+      : [.withoutUI]
     let url = try URL(
       resolvingBookmarkData: bookmark,
-      options: [.withSecurityScope, .withoutUI],
+      options: options,
       relativeTo: nil,
       bookmarkDataIsStale: &stale
     )
@@ -26,11 +30,17 @@ private final class WatchDirectoryBookmarks {
     data = data.map { bookmark in
       guard let (url, stale) = try? resolve(bookmark) else { return bookmark }
       let path = url.standardizedFileURL.path
-      guard active[path] == nil, url.startAccessingSecurityScopedResource() else {
+      guard active[path] == nil else {
+        return bookmark
+      }
+      if isSandboxed {
+        guard url.startAccessingSecurityScopedResource() else { return bookmark }
+      } else if !FileManager.default.fileExists(atPath: path) {
         return bookmark
       }
       active[path] = url
-      if stale, let refreshed = try? url.bookmarkData(options: [.withSecurityScope]) {
+      let bookmarkOptions: URL.BookmarkCreationOptions = isSandboxed ? [.withSecurityScope] : []
+      if stale, let refreshed = try? url.bookmarkData(options: bookmarkOptions) {
         return refreshed
       }
       return bookmark
@@ -39,12 +49,15 @@ private final class WatchDirectoryBookmarks {
   }
 
   func add(_ url: URL) throws -> String {
-    let bookmark = try url.bookmarkData(options: [.withSecurityScope])
+    let bookmarkOptions: URL.BookmarkCreationOptions = isSandboxed ? [.withSecurityScope] : []
+    let bookmark = try url.bookmarkData(options: bookmarkOptions)
     let (resolved, _) = try resolve(bookmark)
     let path = resolved.standardizedFileURL.path
     if active[path] == nil {
-      guard resolved.startAccessingSecurityScopedResource() else {
-        throw CocoaError(.fileReadNoPermission)
+      if isSandboxed {
+        guard resolved.startAccessingSecurityScopedResource() else {
+          throw CocoaError(.fileReadNoPermission)
+        }
       }
       active[path] = resolved
     }
@@ -57,7 +70,11 @@ private final class WatchDirectoryBookmarks {
   }
 
   func forget(_ path: String) {
-    active.removeValue(forKey: path)?.stopAccessingSecurityScopedResource()
+    if isSandboxed {
+      active.removeValue(forKey: path)?.stopAccessingSecurityScopedResource()
+    } else {
+      active.removeValue(forKey: path)
+    }
     data = data.filter { bookmark in
       guard let (url, _) = try? resolve(bookmark) else { return true }
       return url.standardizedFileURL.path != path
@@ -65,7 +82,9 @@ private final class WatchDirectoryBookmarks {
   }
 
   func stop() {
-    for url in active.values { url.stopAccessingSecurityScopedResource() }
+    if isSandboxed {
+      for url in active.values { url.stopAccessingSecurityScopedResource() }
+    }
     active.removeAll()
   }
 
@@ -73,12 +92,15 @@ private final class WatchDirectoryBookmarks {
 }
 
 class MainFlutterWindow: NSWindow {
-  private let probe = DeviceProbe()
   private let watchBookmarks = WatchDirectoryBookmarks()
   private let vaultDevice = DeviceVault()
-  private let probeQueue = DispatchQueue(label: "org.wencrypt.p0.device")
+  private let vaultQueue = DispatchQueue(label: "org.wencrypt.device.vault")
+  private let ocrQueue = DispatchQueue(label: "org.wencrypt.ocr", qos: .userInitiated)
+  private let updaterQueue = DispatchQueue(label: "org.wencrypt.updater", qos: .userInitiated)
 
   override func awakeFromNib() {
+    FlutterAccessibilityGuard.install()
+    SandboxDataMigrator.migrateIfNeeded()
     let flutterViewController = FlutterViewController()
     let windowFrame = self.frame
     self.contentViewController = flutterViewController
@@ -87,26 +109,13 @@ class MainFlutterWindow: NSWindow {
     RegisterGeneratedPlugins(registry: flutterViewController)
     (NSApp.delegate as? AppDelegate)?.configureInviteChannel(flutterViewController.engine.binaryMessenger)
 
-    let channel = FlutterMethodChannel(
-      name: "org.wencrypt.p0/device",
-      binaryMessenger: flutterViewController.engine.binaryMessenger
-    )
-    channel.setMethodCallHandler { [weak self] call, result in
-      guard let self else { result(FlutterMethodNotImplemented); return }
-      let method = call.method
-      self.probeQueue.async {
-        let response = self.probe.perform(method)
-        DispatchQueue.main.async { result(response) }
-      }
-    }
-
     let deviceChannel = FlutterMethodChannel(name: "org.wencrypt.device/vault", binaryMessenger: flutterViewController.engine.binaryMessenger)
     deviceChannel.setMethodCallHandler { [weak self] call, result in
       guard let self else { result(FlutterMethodNotImplemented); return }
       if call.method == "cancel" { self.vaultDevice.cancel(); result(nil); return }
       let generation = self.vaultDevice.currentGeneration
       let args = call.arguments as? [String:Any] ?? [:]
-      self.probeQueue.async {
+      self.vaultQueue.async {
         let response = self.vaultDevice.perform(call.method, args, generation:generation)
         DispatchQueue.main.async { result(response) }
       }
@@ -133,6 +142,100 @@ class MainFlutterWindow: NSWindow {
       let clipboard = NSPasteboard.general
       clipboard.clearContents()
       result(clipboard.setData(png.data, forType: .png))
+    }
+
+    let ocrChannel = FlutterMethodChannel(
+      name: "org.wencrypt.ocr",
+      binaryMessenger: flutterViewController.engine.binaryMessenger
+    )
+    ocrChannel.setMethodCallHandler { [weak self] call, result in
+      guard let self else { result(FlutterMethodNotImplemented); return }
+      switch call.method {
+      case "readClipboardImage":
+        if let bytes = ScreenshotOcr.readClipboardImage() {
+          result(FlutterStandardTypedData(bytes: bytes))
+        } else {
+          result(nil)
+        }
+      case "recognizeImage":
+        guard let typed = call.arguments as? FlutterStandardTypedData, !typed.data.isEmpty else {
+          result(FlutterError(code: "invalid_image", message: nil, details: nil))
+          return
+        }
+        let data = typed.data
+        self.ocrQueue.async {
+          do {
+            let output = try ScreenshotOcr.recognizeImage(data)
+            DispatchQueue.main.async { result(output) }
+          } catch ScreenshotOcrError.invalidImage {
+            DispatchQueue.main.async {
+              result(FlutterError(code: "invalid_image", message: nil, details: nil))
+            }
+          } catch {
+            DispatchQueue.main.async {
+              result(FlutterError(code: "ocr_failed", message: nil, details: nil))
+            }
+          }
+        }
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    }
+
+    let updaterChannel = FlutterMethodChannel(
+      name: "org.wencrypt.updater",
+      binaryMessenger: flutterViewController.engine.binaryMessenger
+    )
+    updaterChannel.setMethodCallHandler { [weak self] call, result in
+      guard let self else { result(FlutterMethodNotImplemented); return }
+      switch call.method {
+      case "getAppInfo":
+        result(AppUpdater.appInfo())
+      case "openDirectory":
+        guard let path = call.arguments as? String else {
+          result(false)
+          return
+        }
+        result(AppUpdater.openDirectory(path))
+      case "openUrl":
+        guard let rawUrl = call.arguments as? String else {
+          result(false)
+          return
+        }
+        result(AppUpdater.openUrl(rawUrl))
+      case "installAndRestart":
+        guard let args = call.arguments as? [String: Any],
+              let archivePath = args["archivePath"] as? String,
+              let expectedSha256 = args["sha256"] as? String
+        else {
+          result(FlutterError(code: "invalid_args", message: nil, details: nil))
+          return
+        }
+        self.updaterQueue.async {
+          do {
+            try AppUpdater.installAndRestart(
+              archivePath: archivePath,
+              expectedSha256: expectedSha256
+            )
+            DispatchQueue.main.async {
+              result(true)
+              DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                NSApp.terminate(nil)
+              }
+            }
+          } catch let updaterError as AppUpdaterError {
+            DispatchQueue.main.async {
+              result(FlutterError(code: updaterError.code, message: nil, details: nil))
+            }
+          } catch {
+            DispatchQueue.main.async {
+              result(FlutterError(code: "install_failed", message: nil, details: nil))
+            }
+          }
+        }
+      default:
+        result(FlutterMethodNotImplemented)
+      }
     }
 
     let browsers = [

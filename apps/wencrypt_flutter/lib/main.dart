@@ -1,21 +1,24 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'about_update_view.dart';
+import 'app_updater.dart';
 import 'browser_import.dart';
 import 'core.dart';
 import 'design/wencrypt_theme.dart';
 import 'design/wencrypt_widgets.dart';
 import 'entry_export.dart';
 import 'lan_transfer.dart';
-import 'probe_page.dart' show WencryptProbeApp;
+import 'password_generator.dart';
 import 'qr_code.dart';
+import 'screenshot_import.dart';
+import 'screenshot_import_dialog.dart';
 import 'sync.dart';
 import 'sync_history.dart';
 import 'vault_invite.dart';
@@ -85,6 +88,8 @@ class VaultPreview {
     this.trash = false,
     this.showSyncHistory = false,
     this.showSettings = false,
+    this.showAbout = false,
+    this.updateController,
     this.mobileLayout = false,
     this.entries = const [],
     this.syncTargets = const [],
@@ -99,6 +104,8 @@ class VaultPreview {
   final bool trash;
   final bool showSyncHistory;
   final bool showSettings;
+  final bool showAbout;
+  final AppUpdateController? updateController;
   final bool mobileLayout;
   final List<Map<String, dynamic>> entries;
   final List<Map<String, dynamic>> syncTargets;
@@ -134,6 +141,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   final searchFocus = FocusNode();
   bool showSyncHistory = false;
   bool showSettings = false;
+  bool showAbout = false;
+  late final AppUpdateController _updater;
+  bool _ownsUpdater = false;
   int syncHistoryRevision = 0;
   String? runningSyncRecord;
   bool remoteUpdateAvailable = false;
@@ -170,6 +180,12 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
   String biometricStatus = 'unknown';
   bool foreground = true;
   bool _browserImportActive = false;
+  bool _pickingSystemImage = false;
+  bool _screenshotImportOpen = false;
+  Uint8List? _pendingSharedImage;
+  final ScreenshotOcrService _ocrService = const ScreenshotOcrService();
+  PasswordGeneratorOptions _generatorOptions =
+      const PasswordGeneratorOptions();
   NutstoreSync? activeSync;
 
   bool get _supportsBiometric =>
@@ -190,6 +206,15 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       trash = preview.trash;
       showSyncHistory = preview.showSyncHistory;
       showSettings = preview.showSettings;
+      showAbout = preview.showAbout;
+      if (preview.updateController case final controller?) {
+        _updater = controller;
+        _ownsUpdater = false;
+      } else {
+        _updater = AppUpdateController.preview();
+        _ownsUpdater = true;
+      }
+      _updater.addListener(_onUpdaterChanged);
       entries = preview.entries;
       syncTargets = preview.syncTargets;
       syncUsername = preview.syncUsername;
@@ -198,11 +223,24 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       message = preview.message;
       return;
     }
+    _updater = AppUpdateController();
+    _ownsUpdater = true;
+    _updater.addListener(_onUpdaterChanged);
     device.setMethodCallHandler((call) async {
       if (call.method == 'systemLocked') lock();
     });
+    ScreenshotOcrService.defaultChannel.setMethodCallHandler((call) async {
+      if (call.method == 'sharedImageAvailable') {
+        await _readPendingSharedImage();
+      }
+    });
     invites.setMethodCallHandler((_) async => _readNativeInvite());
-    unawaited(initialize().then((_) => _readNativeInvite()));
+    unawaited(
+      initialize().then((_) async {
+        await _readNativeInvite();
+        await _readPendingSharedImage();
+      }),
+    );
   }
 
   Future<void> initialize() async {
@@ -210,6 +248,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       final dir = await getApplicationSupportDirectory();
       await dir.create(recursive: true);
       path = '${dir.path}/wencrypt-alpha.db';
+      unawaited(_updater.initialize(dir));
       exists = await File(path!).exists();
       if (exists) {
         await deviceStatus();
@@ -223,10 +262,36 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     }
   }
 
+  void _clearPendingSharedImage() {
+    final pending = _pendingSharedImage;
+    if (pending != null) {
+      pending.fillRange(0, pending.length, 0);
+      _pendingSharedImage = null;
+    }
+  }
+
+  void _onUpdaterChanged() {
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _lockBeforeUpdate() async {
+    if (token != null) {
+      lock();
+    }
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _updater.removeListener(_onUpdaterChanged);
+    if (_ownsUpdater) {
+      _updater.dispose();
+    }
     invites.setMethodCallHandler(null);
+    if (widget.preview == null) {
+      ScreenshotOcrService.defaultChannel.setMethodCallHandler(null);
+    }
+    _clearPendingSharedImage();
     master.dispose();
     confirm.dispose();
     _searchUpdate?.cancel();
@@ -268,7 +333,10 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     if (!foreground) autoTimer?.cancel();
     // There is no vault session to lock while filling out first-run forms.
     if (!exists && token == null) return;
-    if (authenticating && state != AppLifecycleState.detached) return;
+    if ((authenticating || _pickingSystemImage) &&
+        state != AppLifecycleState.detached) {
+      return;
+    }
     final isDesktop =
         Platform.isMacOS || Platform.isWindows || Platform.isLinux;
     if (!lockOnFocusLoss &&
@@ -300,6 +368,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     initialSyncPending = false;
     showSyncHistory = false;
     showSettings = false;
+    showAbout = false;
     trash = false;
     runningSyncRecord = null;
     pendingRevisions = 0;
@@ -536,6 +605,11 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     if (creating && mounted && epoch == generation) {
       _showToast('密码库已创建', tone: WTone.success);
     }
+    if (mounted && epoch == generation) {
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => unawaited(_consumePendingSharedImage()),
+      );
+    }
   });
 
   Future<Map<String, dynamic>> request(
@@ -715,6 +789,11 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       touch();
       await refresh();
       await loadAuto();
+      if (mounted && snapshot == generation) {
+        WidgetsBinding.instance.addPostFrameCallback(
+          (_) => unawaited(_consumePendingSharedImage()),
+        );
+      }
     } finally {
       authenticating = false;
     }
@@ -1826,7 +1905,121 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     sheetAlive = false;
   }
 
-  Future<void> edit(Map<String, dynamic>? revision) async {
+  Future<void> _readPendingSharedImage() async {
+    if (!mounted || !Platform.isAndroid || path == null) return;
+    final bytes = await _ocrService.takePendingImage();
+    if (!mounted || bytes == null || bytes.isEmpty) return;
+    _clearPendingSharedImage();
+    _pendingSharedImage = bytes;
+    if (token != null) {
+      unawaited(_consumePendingSharedImage());
+    } else if (exists) {
+      setState(() => message = '已收到分享的截图，解锁后将自动识别导入。');
+    }
+  }
+
+  Future<void> _consumePendingSharedImage() async {
+    final bytes = _pendingSharedImage;
+    if (!mounted || token == null || bytes == null || bytes.isEmpty) return;
+    if (_screenshotImportOpen || busy) return;
+    final copy = Uint8List.fromList(bytes);
+    _clearPendingSharedImage();
+    try {
+      await _openScreenshotImport(initialImageBytes: copy);
+    } finally {
+      copy.fillRange(0, copy.length, 0);
+    }
+  }
+
+  Future<Uint8List?> _pickScreenshotFile() async {
+    _pickingSystemImage = true;
+    try {
+      final file = await openFile(
+        acceptedTypeGroups: const [
+          XTypeGroup(
+            label: '图片',
+            extensions: ['png', 'jpg', 'jpeg', 'webp', 'heic', 'bmp'],
+            uniformTypeIdentifiers: ['public.image'],
+            mimeTypes: ['image/*'],
+          ),
+        ],
+      );
+      if (file == null) return null;
+      final length = await file.length();
+      if (length <= 0 || length > 16 * 1024 * 1024) {
+        throw const ScreenshotOcrException(
+          'invalid_image',
+          '截图文件为空或超出 16 MiB 限制。',
+        );
+      }
+      return await file.readAsBytes();
+    } finally {
+      _pickingSystemImage = false;
+    }
+  }
+
+  Future<void> _openPasswordGenerator() async {
+    if (token == null || busy) return;
+    touch();
+    final epoch = generation;
+    final mobile = _isMobile(context);
+    final result = await showPasswordGeneratorDialog(
+      context,
+      initialOptions: _generatorOptions,
+      mobile: mobile,
+      onCopy: (pwd) => copy(pwd, label: '密码'),
+    );
+    if (!mounted || epoch != generation || result == null) return;
+    _generatorOptions = result.options;
+    if (result.action == PasswordGeneratorAction.copy) {
+      await copy(result.password, label: '密码');
+    } else if (result.action == PasswordGeneratorAction.createAccount) {
+      _selectWorkspace(0);
+      await edit(null, initialValues: {'password': result.password});
+    }
+  }
+
+  Future<void> _openScreenshotImport({Uint8List? initialImageBytes}) async {
+    if (token == null || busy || _screenshotImportOpen) return;
+    _screenshotImportOpen = true;
+    touch();
+    final epoch = generation;
+    final mobile = _isMobile(context);
+    final groups = _groupOptions();
+    try {
+      final data = await showScreenshotImportDialog(
+        context,
+        mobile: mobile,
+        groupOptions: groups,
+        initialGroup: _selectedNamedGroup(groups),
+        generatorOptions: _generatorOptions,
+        onGeneratorOptionsChanged: (next) => _generatorOptions = next,
+        initialImageBytes: initialImageBytes,
+        ocrService: _ocrService,
+        onPickImageFile: _pickScreenshotFile,
+      );
+      if (!mounted || data == null || epoch != generation) return;
+      await action(() async {
+        await request('save', {
+          'data': data,
+          'parents': const <String>[],
+          'deleted': false,
+        });
+        await refresh();
+      });
+      if (mounted && epoch == generation) {
+        _selectWorkspace(0);
+        _showToast('已从截图导入账号', tone: WTone.success);
+      }
+    } finally {
+      _screenshotImportOpen = false;
+    }
+  }
+
+  Future<void> edit(
+    Map<String, dynamic>? revision, {
+    Map<String, String>? initialValues,
+  }) async {
     touch();
     final epoch = generation;
     final mobile = _isMobile(context);
@@ -1839,7 +2032,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     var pinned = initialTags.any(_isPinTag);
     final knownGroups = _groupOptions();
     final initialGroupText = revision == null
-        ? _selectedNamedGroup(knownGroups) ?? ''
+        ? (initialValues?['tags'] ?? _selectedNamedGroup(knownGroups) ?? '')
         : initialTags.where((tag) => !_isPinTag(tag)).join(', ');
     final groupOptions = _splitTags(
       [...knownGroups, ..._presetGroups].join(', '),
@@ -1857,7 +2050,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
         key: TextEditingController(
           text: key == 'tags'
               ? initialGroupText
-              : (revision?['data'][key] as String? ?? ''),
+              : (revision?['data'][key] as String? ??
+                    initialValues?[key] ??
+                    ''),
         ),
     };
     final tagController = controllers['tags']!;
@@ -1880,14 +2075,27 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       final bottomGap = mobile ? 16.0 : 12.0;
 
       void generateRandomPassword() {
-        const chars =
-            'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#%&*+-_';
-        final rng = Random.secure();
-        controllers['password']!.text = List.generate(
-          24,
-          (_) => chars[rng.nextInt(chars.length)],
-        ).join();
+        controllers['password']!.text = generateSecurePassword(
+          _generatorOptions,
+        );
+        passwordError = null;
         setLocal(() {});
+      }
+
+      Future<void> openCustomPasswordGenerator() async {
+        final result = await showPasswordGeneratorDialog(
+          ctx,
+          initialOptions: _generatorOptions,
+          mobile: mobile,
+          pickerMode: true,
+        );
+        if (!ctx.mounted || result == null) return;
+        _generatorOptions = result.options;
+        if (result.action == PasswordGeneratorAction.apply) {
+          controllers['password']!.text = result.password;
+          passwordError = null;
+          setLocal(() {});
+        }
       }
 
       InputDecoration decoration(
@@ -1977,15 +2185,27 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
         child: WLabeledField(
           label: '密码（必填）',
           trailing: mobile
-              ? TextButton.icon(
-                  onPressed: generateRandomPassword,
-                  style: TextButton.styleFrom(
-                    minimumSize: const Size(0, 32),
-                    padding: const EdgeInsets.symmetric(horizontal: 8),
-                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                  ),
-                  icon: const Icon(Icons.auto_fix_high_rounded, size: 16),
-                  label: const Text('随机生成', style: TextStyle(fontSize: 13)),
+              ? Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextButton.icon(
+                      onPressed: generateRandomPassword,
+                      style: TextButton.styleFrom(
+                        minimumSize: const Size(0, 32),
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      icon: const Icon(Icons.auto_fix_high_rounded, size: 16),
+                      label: const Text('随机生成', style: TextStyle(fontSize: 13)),
+                    ),
+                    IconButton(
+                      tooltip: '自定义随机密码',
+                      iconSize: 18,
+                      visualDensity: VisualDensity.compact,
+                      icon: const Icon(Icons.tune_rounded),
+                      onPressed: openCustomPasswordGenerator,
+                    ),
+                  ],
                 )
               : null,
           child: Column(
@@ -2006,14 +2226,22 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                   suffix: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      if (!mobile)
+                      if (!mobile) ...[
                         IconButton(
-                          tooltip: '生成 24 位随机密码',
+                          tooltip: '生成随机密码',
                           iconSize: 17,
                           visualDensity: VisualDensity.compact,
                           icon: const Icon(Icons.auto_fix_high_rounded),
                           onPressed: generateRandomPassword,
                         ),
+                        IconButton(
+                          tooltip: '自定义随机密码',
+                          iconSize: 17,
+                          visualDensity: VisualDensity.compact,
+                          icon: const Icon(Icons.tune_rounded),
+                          onPressed: openCustomPasswordGenerator,
+                        ),
+                      ],
                       IconButton(
                         tooltip: reveal ? '隐藏密码' : '显示密码',
                         iconSize: mobile ? 20 : 17,
@@ -2151,6 +2379,49 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
+          if (revision == null) ...[
+            Container(
+              padding: EdgeInsets.symmetric(
+                horizontal: mobile ? 12 : 10,
+                vertical: mobile ? 8 : 6,
+              ),
+              decoration: BoxDecoration(
+                color: c.surfaceMuted,
+                borderRadius: BorderRadius.circular(WRadius.sm),
+                border: Border.all(color: c.border),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.document_scanner_outlined,
+                    size: mobile ? 18 : 15,
+                    color: c.brand,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      '有注册界面截图？可自动识别账号密码后补全来源',
+                      style: TextStyle(
+                        fontSize: mobile ? 13 : 11.8,
+                        color: c.textSecondary,
+                      ),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: () =>
+                        Navigator.pop(ctx, '__screenshot_import__'),
+                    style: TextButton.styleFrom(
+                      minimumSize: const Size(0, 30),
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                    child: const Text('从注册截图自动识别'),
+                  ),
+                ],
+              ),
+            ),
+            SizedBox(height: bottomGap),
+          ],
           if (group.length > 1) ...[
             WNote(
               tone: WTone.warning,
@@ -2369,7 +2640,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
 
     final result = await Navigator.of(context).push(route);
     await route.completed;
-    if (result != null && epoch == generation) {
+    if (result != null &&
+        result != '__screenshot_import__' &&
+        epoch == generation) {
       final cleanedGroups = _splitTags(controllers['tags']!.text)
           .where((t) => !_isPinTag(t))
           .toList();
@@ -2392,6 +2665,9 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       c.dispose();
     }
     committedTags.dispose();
+    if (result == '__screenshot_import__' && mounted && epoch == generation) {
+      await _openScreenshotImport();
+    }
   }
 
   Future<({String? password, bool fingerprint})?> _reauthenticate({
@@ -5179,6 +5455,26 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                           : const EdgeInsets.fromLTRB(28, 28, 28, 24),
                       child: child,
                     ),
+                    const SizedBox(height: 12),
+                    TextButton(
+                      style: TextButton.styleFrom(
+                        foregroundColor: _updater.hasUpdate
+                            ? c.brand
+                            : c.textTertiary,
+                        textStyle: TextStyle(
+                          fontSize: mobile ? 13 : 12,
+                          fontWeight: _updater.hasUpdate
+                              ? FontWeight.w600
+                              : FontWeight.w500,
+                        ),
+                      ),
+                      onPressed: busy ? null : _openAboutDialog,
+                      child: Text(
+                        _updater.hasUpdate && _updater.latestRelease != null
+                            ? 'v${_updater.currentVersion} · 发现新版本 v${_updater.latestRelease!.version.normalized}'
+                            : 'v${_updater.currentVersion} · 检查更新',
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -5955,6 +6251,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       action: !trash && query.isEmpty && selectedGroup == EntryFilter.all
           ? Wrap(
               spacing: 8,
+              runSpacing: 8,
               alignment: WrapAlignment.center,
               children: [
                 if (!mobile && (Platform.isMacOS || Platform.isWindows))
@@ -5963,6 +6260,11 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                     icon: const Icon(Icons.download_outlined, size: 16),
                     label: const Text('从 Edge / Chrome 导入'),
                   ),
+                OutlinedButton.icon(
+                  onPressed: busy ? null : _openScreenshotImport,
+                  icon: const Icon(Icons.document_scanner_outlined, size: 16),
+                  label: const Text('从截图快捷导入'),
+                ),
                 SizedBox(
                   height: mobile ? 46 : null,
                   child: FilledButton.icon(
@@ -6017,6 +6319,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       final hasConflict = revisionCounts[r['entry']]! > 1;
       final revisionId = r['id'] as String;
       return WAccountDetailPanel(
+        key: ValueKey(revisionId),
         title: title,
         username: username,
         password: password,
@@ -6335,6 +6638,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       trash = index == 1;
       showSyncHistory = index == 2;
       showSettings = index == 3;
+      showAbout = index == 4;
       selectedGroup = EntryFilter.all;
       selectedEntryId = null;
       detailRevealPassword = false;
@@ -6353,6 +6657,18 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
           _selectWorkspace(0);
           edit(null);
         }),
+      if (!busy)
+        WorkspaceCommand(
+          '随机密码生成器',
+          Icons.auto_fix_high_rounded,
+          _openPasswordGenerator,
+        ),
+      if (!busy)
+        WorkspaceCommand(
+          '从截图快捷导入',
+          Icons.document_scanner_outlined,
+          _openScreenshotImport,
+        ),
       if (canSync) WorkspaceCommand('立即同步', Icons.sync, sync),
       WorkspaceCommand('查看同步记录', Icons.history, () => _selectWorkspace(2)),
       if (canSync)
@@ -6380,6 +6696,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
           _changeMasterPassword,
         ),
       if (!busy) WorkspaceCommand('导出加密备份', Icons.download_outlined, backup),
+      WorkspaceCommand('关于与更新', Icons.info_outline_rounded, _openAboutOrPage),
       WorkspaceCommand('锁定密码库', Icons.lock_outline, lock),
     ]);
     if (mounted && generation == epoch) command?.run();
@@ -6392,12 +6709,72 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     });
   }
 
+  void _openAboutOrPage() {
+    if (token != null &&
+        !_isMobile(context) &&
+        MediaQuery.sizeOf(context).width >= 860) {
+      _selectWorkspace(4);
+    } else {
+      _openAboutDialog();
+    }
+  }
+
+  Future<void> _openAboutDialog() async {
+    touch();
+    final mobile = _isMobile(context);
+    if (mobile) {
+      await Navigator.of(context).push<void>(
+        MaterialPageRoute<void>(
+          builder: (routeCtx) => Scaffold(
+            backgroundColor: WColors.of(routeCtx).canvas,
+            appBar: AppBar(
+              title: const Text('关于与更新'),
+              backgroundColor: WColors.of(routeCtx).surface,
+              elevation: 0,
+              scrolledUnderElevation: 0,
+              bottom: PreferredSize(
+                preferredSize: const Size.fromHeight(1),
+                child: Divider(
+                  height: 1,
+                  color: WColors.of(routeCtx).border,
+                ),
+              ),
+            ),
+            body: SafeArea(
+              child: AboutUpdateView(
+                controller: _updater,
+                onBeforeRestart: _lockBeforeUpdate,
+              ),
+            ),
+          ),
+        ),
+      );
+      return;
+    }
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogCtx) => WDialog(
+        width: 620,
+        title: '关于与更新',
+        icon: Icons.info_outline_rounded,
+        showClose: true,
+        child: AboutUpdateView(
+          controller: _updater,
+          onBeforeRestart: _lockBeforeUpdate,
+          compact: true,
+        ),
+      ),
+    );
+  }
+
   Widget _sidebarItem({
     required String label,
     required bool selected,
     required VoidCallback onTap,
     IconData? icon,
     int? count,
+    bool badge = false,
   }) {
     final c = WColors.of(context);
     return Padding(
@@ -6442,6 +6819,17 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                       fontSize: 11,
                       fontWeight: FontWeight.w500,
                       color: selected ? c.brand : c.textTertiary,
+                    ),
+                  ),
+                ],
+                if (badge) ...[
+                  const SizedBox(width: 6),
+                  Container(
+                    width: 7,
+                    height: 7,
+                    decoration: BoxDecoration(
+                      color: c.brand,
+                      shape: BoxShape.circle,
                     ),
                   ),
                 ],
@@ -6526,7 +6914,10 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
             label: '密码库',
             icon: Icons.key_outlined,
             selected:
-                !showSyncHistory && !trash && selectedGroup == EntryFilter.all,
+                !showSyncHistory &&
+                !showAbout &&
+                !trash &&
+                selectedGroup == EntryFilter.all,
             count: vaultCount,
             onTap: () => _selectWorkspace(0),
           ),
@@ -6536,6 +6927,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
               icon: Icons.push_pin_outlined,
               selected:
                   !showSyncHistory &&
+                  !showAbout &&
                   !trash &&
                   selectedGroup == EntryFilter.pinned,
               count: pinnedCount,
@@ -6547,14 +6939,14 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
           _sidebarItem(
             label: '回收站',
             icon: Icons.delete_outline_rounded,
-            selected: !showSyncHistory && trash,
+            selected: !showSyncHistory && !showAbout && trash,
             count: trashCount,
             onTap: () => _selectWorkspace(1),
           ),
           _sidebarItem(
             label: '同步记录',
             icon: Icons.history_rounded,
-            selected: showSyncHistory,
+            selected: showSyncHistory && !showAbout,
             onTap: () => _selectWorkspace(2),
           ),
           if (sortedGroups.isNotEmpty) ...[
@@ -6581,6 +6973,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                       count: groupCounts[entry.key],
                       selected:
                           !showSyncHistory &&
+                          !showAbout &&
                           !trash &&
                           selectedGroup == entry.key,
                       onTap: () {
@@ -6595,6 +6988,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                       count: ungroupedCount,
                       selected:
                           !showSyncHistory &&
+                          !showAbout &&
                           !trash &&
                           selectedGroup == EntryFilter.ungrouped,
                       onTap: () {
@@ -6607,6 +7001,38 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
             ),
           ] else
             const Spacer(),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(17, 10, 16, 4),
+            child: Text(
+              '工具',
+              style: TextStyle(
+                fontSize: 10.8,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 0.4,
+                color: c.textTertiary,
+              ),
+            ),
+          ),
+          _sidebarItem(
+            label: '随机密码',
+            icon: Icons.auto_fix_high_rounded,
+            selected: false,
+            onTap: _openPasswordGenerator,
+          ),
+          _sidebarItem(
+            label: '截图导入',
+            icon: Icons.document_scanner_outlined,
+            selected: false,
+            onTap: _openScreenshotImport,
+          ),
+          _sidebarItem(
+            label: '关于与更新',
+            icon: Icons.info_outline_rounded,
+            selected: showAbout,
+            badge: _updater.hasUpdate,
+            onTap: () => _selectWorkspace(4),
+          ),
+          const SizedBox(height: 6),
           Divider(height: 1, color: c.border),
           Padding(
             padding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
@@ -6655,14 +7081,6 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       message = '';
     });
     _showToast(lockOnFocusLoss ? '切换窗口时自动锁定' : '切换窗口时保持解锁');
-  }
-
-  void _openProbe() {
-    lock();
-    Navigator.push(
-      context,
-      MaterialPageRoute<void>(builder: (_) => const WencryptProbeApp()),
-    );
   }
 
   WCommandMenu _settingsMenu() => WCommandMenu(
@@ -6716,13 +7134,15 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
           ],
         ),
       WMenuSection(
-        label: '系统工具',
+        label: '关于',
         entries: [
           WMenuEntry(
-            label: '设备诊断',
-            icon: Icons.monitor_heart_outlined,
-            enabled: token != null,
-            onTap: token == null ? null : _openProbe,
+            label: '关于与更新',
+            icon: Icons.info_outline_rounded,
+            trailing: _updater.hasUpdate
+                ? '有新版本'
+                : 'v${_updater.currentVersion}',
+            onTap: _openAboutOrPage,
           ),
         ],
       ),
@@ -6731,6 +7151,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
       icon: Icons.settings_outlined,
       tooltip: '设置',
       active: open,
+      badgeColor: _updater.hasUpdate ? WColors.of(context).brand : null,
       onPressed: () => open ? controller.close() : controller.open(),
     ),
   );
@@ -6767,6 +7188,13 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                 enabled: !busy,
                 onTap: importCsv,
               ),
+              if (token != null)
+                WMenuEntry(
+                  label: '从截图快捷导入',
+                  icon: Icons.document_scanner_outlined,
+                  enabled: !busy,
+                  onTap: _openScreenshotImport,
+                ),
               if (token != null)
                 WMenuEntry(
                   label: '导出加密备份',
@@ -6827,7 +7255,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        if (!trash && !showSyncHistory) ...[
+        if (!trash && !showSyncHistory && !showAbout) ...[
           SizedBox(
             height: 32,
             child: FilledButton.icon(
@@ -6843,7 +7271,19 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
               ),
             ),
           ),
-          const SizedBox(width: 8),
+          const SizedBox(width: 6),
+          WIconButton(
+            icon: Icons.document_scanner_outlined,
+            tooltip: '从截图快捷导入',
+            onPressed: busy ? null : _openScreenshotImport,
+          ),
+          const SizedBox(width: 2),
+          WIconButton(
+            icon: Icons.auto_fix_high_rounded,
+            tooltip: '随机密码生成器',
+            onPressed: busy ? null : _openPasswordGenerator,
+          ),
+          const SizedBox(width: 4),
         ],
         if (syncConfigured) ...[
           WIconButton(
@@ -6870,6 +7310,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
 
   String _activePageTitle() {
     if (showSettings) return '设置';
+    if (showAbout) return '关于与更新';
     if (showSyncHistory) return '同步记录';
     if (trash) return '回收站';
     if (selectedGroup == EntryFilter.pinned) return '已置顶';
@@ -6983,6 +7424,12 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
           title: '数据与备份',
           children: [
             WMobileSettingTile(
+              icon: Icons.document_scanner_outlined,
+              title: '从截图快捷导入',
+              enabled: !busy,
+              onTap: _openScreenshotImport,
+            ),
+            WMobileSettingTile(
               icon: Icons.file_open_outlined,
               title: '导入浏览器 CSV',
               enabled: !busy,
@@ -7001,15 +7448,31 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
           title: '外观与工具',
           children: [
             WMobileSettingTile(
+              icon: Icons.auto_fix_high_rounded,
+              title: '随机密码生成器',
+              enabled: !busy,
+              onTap: _openPasswordGenerator,
+            ),
+            WMobileSettingTile(
               icon: Icons.contrast_rounded,
               title: '外观主题',
               trailingText: themeLabel,
               onTap: widget.onCycleTheme,
             ),
+          ],
+        ),
+        const SizedBox(height: 18),
+        WMobileSettingsGroup(
+          title: '关于',
+          children: [
             WMobileSettingTile(
-              icon: Icons.monitor_heart_outlined,
-              title: '设备诊断',
-              onTap: _openProbe,
+              icon: Icons.info_outline_rounded,
+              title: '关于与更新',
+              subtitle: _updater.hasUpdate && _updater.latestRelease != null
+                  ? '发现新版本 v${_updater.latestRelease!.version.normalized}'
+                  : '已是最新检查策略 · 点击检查 GitHub 更新',
+              trailingText: 'v${_updater.currentVersion}',
+              onTap: _openAboutDialog,
             ),
           ],
         ),
@@ -7044,7 +7507,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
             ),
           ),
           const SizedBox(width: 18),
-          if (!showSyncHistory)
+          if (!showSyncHistory && !showAbout)
             Expanded(
               child: Align(
                 alignment: Alignment.centerLeft,
@@ -7093,6 +7556,11 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
     describeIssue: _historyIssue,
   );
 
+  Widget _aboutPage() => AboutUpdateView(
+    controller: _updater,
+    onBeforeRestart: _lockBeforeUpdate,
+  );
+
   @override
   Widget build(BuildContext context) {
     final unlocked = token != null;
@@ -7108,6 +7576,8 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
         ? _buildMobileSettingsPage(context)
         : showSyncHistory
         ? _historyPage()
+        : showAbout
+        ? _aboutPage()
         : _buildUnlockedView(context, desktop: desktop, mobile: mobile);
     final syncBadge = initialSyncPending
         ? c.warning
@@ -7126,6 +7596,18 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
         selectableHeads.every(activeSelection!.contains);
 
     final narrowDesktopActions = <Widget>[
+      if (unlocked) ...[
+        WIconButton(
+          icon: Icons.document_scanner_outlined,
+          tooltip: '从截图快捷导入',
+          onPressed: busy ? null : _openScreenshotImport,
+        ),
+        WIconButton(
+          icon: Icons.auto_fix_high_rounded,
+          tooltip: '随机密码生成器',
+          onPressed: busy ? null : _openPasswordGenerator,
+        ),
+      ],
       if (unlocked && syncConfigured)
         WIconButton(
           icon: Icons.cloud_done_outlined,
@@ -7197,7 +7679,14 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
             fontWeight: FontWeight.w600,
           ),
           actions: [
-            if (!showSettings)
+            if (!showSettings) ...[
+              WIconButton(
+                icon: Icons.document_scanner_outlined,
+                tooltip: '截图导入',
+                size: 40,
+                iconSize: 20,
+                onPressed: busy ? null : _openScreenshotImport,
+              ),
               WIconButton(
                 icon: Icons.sync_rounded,
                 tooltip: syncing ? '正在同步…' : '立即同步',
@@ -7207,6 +7696,7 @@ class _VaultPageState extends State<VaultPage> with WidgetsBindingObserver {
                 badgeColor: syncBadge,
                 onPressed: busy || syncing ? null : sync,
               ),
+            ],
             WIconButton(
               icon: Icons.lock_outline_rounded,
               tooltip: '锁定密码库',

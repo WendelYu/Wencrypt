@@ -22,12 +22,13 @@
 
 /* Begin PBXBuildFile section */
 		AA1A00000000000000000003 /* DeviceVault.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1A00000000000000000004 /* DeviceVault.swift */; };
+		AA1A00000000000000000005 /* ScreenshotOcr.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1A00000000000000000006 /* ScreenshotOcr.swift */; };
+		AA1A00000000000000000007 /* AppUpdater.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1A00000000000000000008 /* AppUpdater.swift */; };
 		331C80D8294CF71000263BE5 /* RunnerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 331C80D7294CF71000263BE5 /* RunnerTests.swift */; };
 		335BBD1B22A9A15E00E9071D /* GeneratedPluginRegistrant.swift in Sources */ = {isa = PBXBuildFile; fileRef = 335BBD1A22A9A15E00E9071D /* GeneratedPluginRegistrant.swift */; };
 		33CC10F12044A3C60003C045 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33CC10F02044A3C60003C045 /* AppDelegate.swift */; };
 		33CC10F32044A3C60003C045 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 33CC10F22044A3C60003C045 /* Assets.xcassets */; };
 		33CC10F62044A3C60003C045 /* MainMenu.xib in Resources */ = {isa = PBXBuildFile; fileRef = 33CC10F42044A3C60003C045 /* MainMenu.xib */; };
-		AA1A00000000000000000001 /* DeviceProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA1A00000000000000000002 /* DeviceProbe.swift */; };
 		33CC11132044BFA00003C045 /* MainFlutterWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 33CC11122044BFA00003C045 /* MainFlutterWindow.swift */; };
 		78A318202AECB46A00862997 /* FlutterGeneratedPluginSwiftPackage in Frameworks */ = {isa = PBXBuildFile; productRef = 78A3181F2AECB46A00862997 /* FlutterGeneratedPluginSwiftPackage */; };
 /* End PBXBuildFile section */
@@ -64,6 +65,8 @@
 
 /* Begin PBXFileReference section */
 		AA1A00000000000000000004 /* DeviceVault.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Runner/DeviceVault.swift"; sourceTree = SOURCE_ROOT; };
+		AA1A00000000000000000006 /* ScreenshotOcr.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Runner/ScreenshotOcr.swift"; sourceTree = SOURCE_ROOT; };
+		AA1A00000000000000000008 /* AppUpdater.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Runner/AppUpdater.swift"; sourceTree = SOURCE_ROOT; };
 		331C80D5294CF71000263BE5 /* RunnerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = RunnerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		331C80D7294CF71000263BE5 /* RunnerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunnerTests.swift; sourceTree = "<group>"; };
 		333000ED22D3DE5D00554162 /* Warnings.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Warnings.xcconfig; sourceTree = "<group>"; };
@@ -73,7 +76,6 @@
 		33CC10F22044A3C60003C045 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Assets.xcassets; path = Runner/Assets.xcassets; sourceTree = "<group>"; };
 		33CC10F52044A3C60003C045 /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.xib; name = Base; path = Base.lproj/MainMenu.xib; sourceTree = "<group>"; };
 		33CC10F72044A3C60003C045 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; name = Info.plist; path = Runner/Info.plist; sourceTree = "<group>"; };
-		AA1A00000000000000000002 /* DeviceProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../../../platform_probes/macos/DeviceProbe.swift"; sourceTree = SOURCE_ROOT; };
 		33CC11122044BFA00003C045 /* MainFlutterWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainFlutterWindow.swift; sourceTree = "<group>"; };
 		33CEB47222A05771004F2AC0 /* Flutter-Debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = "Flutter-Debug.xcconfig"; sourceTree = "<group>"; };
 		33CEB47422A05771004F2AC0 /* Flutter-Release.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = "Flutter-Release.xcconfig"; sourceTree = "<group>"; };
@@ -172,8 +174,9 @@
 			children = (
 				33CC10F02044A3C60003C045 /* AppDelegate.swift */,
 				33CC11122044BFA00003C045 /* MainFlutterWindow.swift */,
-				AA1A00000000000000000002 /* DeviceProbe.swift */,
 				AA1A00000000000000000004 /* DeviceVault.swift */,
+				AA1A00000000000000000006 /* ScreenshotOcr.swift */,
+				AA1A00000000000000000008 /* AppUpdater.swift */,
 				33E51913231747F40026EE4D /* DebugProfile.entitlements */,
 				33E51914231749380026EE4D /* Release.entitlements */,
 				33CC11242044D66E0003C045 /* Resources */,
@@ -361,8 +364,9 @@
 			buildActionMask = 2147483647;
 			files = (
 				33CC11132044BFA00003C045 /* MainFlutterWindow.swift in Sources */,
-				AA1A00000000000000000001 /* DeviceProbe.swift in Sources */,
 				AA1A00000000000000000003 /* DeviceVault.swift in Sources */,
+				AA1A00000000000000000005 /* ScreenshotOcr.swift in Sources */,
+				AA1A00000000000000000007 /* AppUpdater.swift in Sources */,
 				33CC10F12044A3C60003C045 /* AppDelegate.swift in Sources */,
 				335BBD1B22A9A15E00E9071D /* GeneratedPluginRegistrant.swift in Sources */,
 			);

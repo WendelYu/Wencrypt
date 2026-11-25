@@ -67,17 +67,88 @@ int main() {
   const bool rejected = CopyPngToClipboard(owner, {1, 2, 3}) ==
                         ImageClipboardResult::kFailed;
   bool formats_valid = false;
+  std::vector<uint8_t> dib_bytes;
   if (copied && OpenClipboard(owner)) {
     formats_valid = CheckDib() && CheckPng();
+    const auto dib_handle = GetClipboardData(CF_DIB);
+    const auto* locked = static_cast<const uint8_t*>(GlobalLock(dib_handle));
+    if (locked) {
+      dib_bytes.assign(locked, locked + GlobalSize(dib_handle));
+      GlobalUnlock(dib_handle);
+    }
     CloseClipboard();
   }
+
+  std::vector<uint8_t> read_png;
+  bool read_png_ok = false;
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    const auto status = ReadClipboardPng(owner, &read_png);
+    if (status != ReadClipboardImageResult::kBusy) {
+      read_png_ok = status == ReadClipboardImageResult::kFound &&
+                    read_png == kPng;
+      break;
+    }
+    Sleep(50);
+  }
+
+  bool dib_only_ok = false;
+  if (!dib_bytes.empty() && OpenClipboard(owner)) {
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, dib_bytes.size());
+    if (mem) {
+      void* dst = GlobalLock(mem);
+      if (dst) {
+        std::memcpy(dst, dib_bytes.data(), dib_bytes.size());
+        GlobalUnlock(mem);
+        if (EmptyClipboard() && SetClipboardData(CF_DIB, mem)) {
+          mem = nullptr;
+        }
+      }
+      if (mem) GlobalFree(mem);
+    }
+    CloseClipboard();
+
+    std::vector<uint8_t> converted_png;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+      const auto status = ReadClipboardPng(owner, &converted_png);
+      if (status != ReadClipboardImageResult::kBusy) {
+        dib_only_ok = status == ReadClipboardImageResult::kFound &&
+                      converted_png.size() > 8 &&
+                      CopyPngToClipboard(owner, converted_png) ==
+                          ImageClipboardResult::kCopied;
+        break;
+      }
+      Sleep(50);
+    }
+  }
+
+  bool empty_ok = false;
+  if (OpenClipboard(owner)) {
+    EmptyClipboard();
+    CloseClipboard();
+    std::vector<uint8_t> empty_png;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+      const auto status = ReadClipboardPng(owner, &empty_png);
+      if (status != ReadClipboardImageResult::kBusy) {
+        empty_ok = status == ReadClipboardImageResult::kEmpty &&
+                   empty_png.empty();
+        break;
+      }
+      Sleep(50);
+    }
+  }
+
   if (owner) DestroyWindow(owner);
   CoUninitialize();
-  if (!copied || !rejected || !formats_valid) {
-    std::fprintf(stderr, "Clipboard copy=%d invalid_png_rejected=%d formats=%d\n",
-                 copied, rejected, formats_valid);
+  if (!copied || !rejected || !formats_valid || !read_png_ok ||
+      !dib_only_ok || !empty_ok) {
+    std::fprintf(
+        stderr,
+        "Clipboard copy=%d invalid_png_rejected=%d formats=%d read_png=%d "
+        "dib_only=%d empty=%d\n",
+        copied, rejected, formats_valid, read_png_ok, dib_only_ok, empty_ok);
     return 1;
   }
-  std::puts("Windows clipboard passed: DIB pixels and original PNG verified");
+  std::puts(
+      "Windows clipboard passed: DIB/PNG write, PNG/DIB read, and empty check verified");
   return 0;
 }
