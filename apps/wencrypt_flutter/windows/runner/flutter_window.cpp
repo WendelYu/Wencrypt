@@ -107,7 +107,7 @@ bool FlutterWindow::OnCreate() {
                    shared_result = std::move(shared_result),
                    state = std::move(state)]() mutable {
         WindowsOcrResult ocr = RecognizeImageWindows(bytes_copy);
-        std::fill(bytes_copy.begin(), bytes_copy.end(), 0);
+        std::fill(bytes_copy.begin(), bytes_copy.end(), uint8_t{0});
         if (!state) return;
         std::lock_guard<std::mutex> lock(state->mutex);
         if (!state->alive || !state->hwnd) return;
