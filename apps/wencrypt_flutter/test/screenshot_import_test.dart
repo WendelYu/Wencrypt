@@ -382,5 +382,325 @@ Password: ••••••••
       expect(find.text('MobilePass!99'), findsAtLeastNWidgets(1));
       expect(tester.takeException(), isNull);
     });
+
+    testWidgets('uses single-hop readAndRecognizeClipboardImage and clears stale fields on repaste', (
+      tester,
+    ) async {
+      const channel = MethodChannel('wencrypt.test.ocr.singlehop');
+      var pasteCount = 0;
+      var legacyCalls = 0;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+            if (call.method == 'readClipboardImage' ||
+                call.method == 'recognizeImage') {
+              legacyCalls++;
+              return null;
+            }
+            if (call.method == 'readAndRecognizeClipboardImage') {
+              pasteCount++;
+              if (pasteCount == 1) {
+                return {
+                  'hasImage': true,
+                  'image': _testPngBytes,
+                  'text': 'https://github.com/signup\nEmail: first@example.com\nPassword: First!Pass9',
+                  'blocks': [
+                    {
+                      'text': 'https://github.com/signup',
+                      'x': 0.1,
+                      'y': 0.05,
+                      'w': 0.6,
+                      'h': 0.03,
+                    },
+                    {
+                      'text': 'Email: first@example.com',
+                      'x': 0.1,
+                      'y': 0.2,
+                      'w': 0.6,
+                      'h': 0.04,
+                    },
+                    {
+                      'text': 'Password: First!Pass9',
+                      'x': 0.1,
+                      'y': 0.3,
+                      'w': 0.6,
+                      'h': 0.04,
+                    },
+                  ],
+                };
+              }
+              return {
+                'hasImage': true,
+                'image': _testPngBytes,
+                'text': 'Email: second@example.org\nPassword: ••••••••',
+                'blocks': [
+                  {
+                    'text': 'Email: second@example.org',
+                    'x': 0.1,
+                    'y': 0.2,
+                    'w': 0.6,
+                    'h': 0.04,
+                  },
+                  {
+                    'text': 'Password: ••••••••',
+                    'x': 0.1,
+                    'y': 0.3,
+                    'w': 0.6,
+                    'h': 0.04,
+                  },
+                ],
+              };
+            }
+            return null;
+          });
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(channel, null),
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: wencryptTheme(Brightness.light),
+          home: Builder(
+            builder: (context) => Scaffold(
+              body: FilledButton(
+                onPressed: () async {
+                  await showScreenshotImportDialog(
+                    context,
+                    mobile: false,
+                    groupOptions: const [],
+                    generatorOptions: const PasswordGeneratorOptions(),
+                    ocrService: const ScreenshotOcrService(channel: channel),
+                  );
+                },
+                child: const Text('open_single_hop'),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      await tester.tap(find.text('open_single_hop'));
+      await tester.pumpAndSettle();
+
+      expect(legacyCalls, 0);
+      expect(find.text('GitHub'), findsAtLeastNWidgets(1));
+      expect(find.text('first@example.com'), findsAtLeastNWidgets(1));
+      expect(find.text('First!Pass9'), findsAtLeastNWidgets(1));
+
+      await tester.tap(find.text('重新粘贴'));
+      await tester.pumpAndSettle();
+
+      expect(pasteCount, 2);
+      expect(legacyCalls, 0);
+      expect(find.text('first@example.com'), findsNothing);
+      expect(find.text('First!Pass9'), findsNothing);
+      expect(find.text('second@example.org'), findsAtLeastNWidgets(1));
+      expect(find.textContaining('密码已被星号或圆点遮盖'), findsOneWidget);
+    });
+  });
+
+  group('enhanced accuracy & single-hop service tests', () {
+    test('handles parenthetical qualifiers on Simplified and English labels', () {
+      final parsed = parseCredentialFromOcr([
+        const OcrBlock(text: '邮箱地址（必填）', x: 0.1, y: 0.15, w: 0.3, h: 0.03),
+        const OcrBlock(text: 'alice.chen@corp.cn', x: 0.1, y: 0.21, w: 0.4, h: 0.04),
+        const OcrBlock(text: '登录密码(8-20位)', x: 0.1, y: 0.30, w: 0.3, h: 0.03),
+        const OcrBlock(text: 'Secret#8899!', x: 0.1, y: 0.36, w: 0.4, h: 0.04),
+        const OcrBlock(text: 'Password (Required): Backup#22', x: 0.1, y: 0.50, w: 0.5, h: 0.04),
+      ]);
+      expect(parsed.username, 'alice.chen@corp.cn');
+      expect(parsed.password, 'Secret#8899!');
+    });
+
+    test('parses Traditional Chinese registration screenshots accurately', () {
+      final parsed = parseCredentialFromText('''
+歡迎註冊 AcmeTaipei 帳號
+電子郵件：taiwan.dev@example.tw
+密碼：Tw#Pass2026!
+確認密碼：Tw#Pass2026!
+驗證碼：654321
+''');
+      expect(parsed.title, 'AcmeTaipei');
+      expect(parsed.username, 'taiwan.dev@example.tw');
+      expect(parsed.password, 'Tw#Pass2026!');
+      expect(parsed.candidates, isNot(contains('654321')));
+    });
+
+    test('strips OCR-merged trailing action button words from values', () {
+      final parsed = parseCredentialFromOcr([
+        const OcrBlock(text: '网址', x: 0.1, y: 0.10, w: 0.12, h: 0.03),
+        const OcrBlock(text: 'https://panel.mycorp.io 打开', x: 0.28, y: 0.10, w: 0.5, h: 0.03),
+        const OcrBlock(text: '用户名', x: 0.1, y: 0.22, w: 0.15, h: 0.03),
+        const OcrBlock(text: 'alice.chen_01@example.com 复制', x: 0.28, y: 0.22, w: 0.5, h: 0.03),
+        const OcrBlock(text: '密码', x: 0.1, y: 0.34, w: 0.12, h: 0.03),
+        const OcrBlock(text: 'Abc#9876Xy!09K 显示', x: 0.28, y: 0.34, w: 0.5, h: 0.03),
+      ]);
+      expect(parsed.url, 'https://panel.mycorp.io');
+      expect(parsed.username, 'alice.chen_01@example.com');
+      expect(parsed.password, 'Abc#9876Xy!09K');
+    });
+
+    test('normalizes Cyrillic/Greek lookalike homoglyphs and full-width ASCII passwords', () {
+      final homoglyphParsed = parseCredentialFromText(
+        '账号：ops@corp.io\n密码：Abc#9876\u0425y!09K',
+      );
+      expect(homoglyphParsed.password, 'Abc#9876Xy!09K');
+
+      final fullWidthParsed = parseCredentialFromText(
+        '账号：ops@corp.io\n密码：Ａｂｃ＃１２３４！',
+      );
+      expect(fullWidthParsed.password, 'Abc#1234!');
+    });
+
+    test('handles equals/pipe separators and single-space multi-pair lines', () {
+      final singleSpace = parseCredentialFromOcr([
+        const OcrBlock(
+          text: '账号：alice@corp.com 密码：P@ss9988!',
+          x: 0.1,
+          y: 0.2,
+          w: 0.8,
+          h: 0.04,
+        ),
+      ]);
+      expect(singleSpace.username, 'alice@corp.com');
+      expect(singleSpace.password, 'P@ss9988!');
+
+      final envParsed = parseCredentialFromText(
+        'username = root\npassword = Vps#2026!',
+      );
+      expect(envParsed.username, 'root');
+      expect(envParsed.password, 'Vps#2026!');
+    });
+
+    test('handles intermediate hint rows in stacked layout and lone separators', () {
+      final parsed = parseCredentialFromOcr([
+        const OcrBlock(text: '账号', x: 0.1, y: 0.15, w: 0.12, h: 0.03),
+        const OcrBlock(text: ':', x: 0.23, y: 0.15, w: 0.02, h: 0.03),
+        const OcrBlock(text: 'cloud_admin Copy', x: 0.28, y: 0.15, w: 0.4, h: 0.03),
+        const OcrBlock(text: '登录密码', x: 0.1, y: 0.30, w: 0.2, h: 0.03),
+        const OcrBlock(text: '至少8位，需包含大小写字母和数字', x: 0.1, y: 0.35, w: 0.5, h: 0.025),
+        const OcrBlock(text: 'Stack#99Pass!', x: 0.1, y: 0.40, w: 0.4, h: 0.04),
+      ]);
+      expect(parsed.username, 'cloud_admin');
+      expect(parsed.password, 'Stack#99Pass!');
+    });
+
+    test('extracts accurately from dense full-screen browser screenshot with sidebar noise', () {
+      final parsed = parseCredentialFromOcr([
+        const OcrBlock(text: 'https://console.deepseek.com/sign_up', x: 0.10, y: 0.04, w: 0.45, h: 0.025),
+        const OcrBlock(text: '系统公告 1: v0.3.10', x: 0.02, y: 0.14, w: 0.18, h: 0.025),
+        const OcrBlock(text: '2026-11-25', x: 0.02, y: 0.18, w: 0.12, h: 0.025),
+        const OcrBlock(text: 'DOC-1001', x: 0.80, y: 0.20, w: 0.12, h: 0.025),
+        const OcrBlock(text: 'support@deepseek.com', x: 0.78, y: 0.24, w: 0.18, h: 0.025),
+        const OcrBlock(text: '注册 DeepSeek 账号', x: 0.35, y: 0.22, w: 0.30, h: 0.04),
+        const OcrBlock(text: 'alice.chen_01@example.com', x: 0.35, y: 0.34, w: 0.30, h: 0.03),
+        const OcrBlock(text: '忘记密码？', x: 0.58, y: 0.40, w: 0.10, h: 0.025),
+        const OcrBlock(text: 'Abc#9876Xy!09K', x: 0.35, y: 0.46, w: 0.25, h: 0.03),
+        const OcrBlock(text: 'https://beian.miit.gov.cn', x: 0.40, y: 0.92, w: 0.20, h: 0.02),
+      ]);
+      expect(parsed.title, 'DeepSeek');
+      expect(parsed.url, 'https://console.deepseek.com/sign_up');
+      expect(parsed.username, 'alice.chen_01@example.com');
+      expect(parsed.password, 'Abc#9876Xy!09K');
+    });
+
+    test('supports self-hosted IP:port URLs, login headings, and unknown domain titles', () {
+      final selfHosted = parseCredentialFromOcr([
+        const OcrBlock(text: '欢迎登录 内网工单', x: 0.2, y: 0.10, w: 0.5, h: 0.05),
+        const OcrBlock(text: '192.168.1.100:5244/login', x: 0.2, y: 0.20, w: 0.5, h: 0.03),
+        const OcrBlock(text: '管理员账号', x: 0.2, y: 0.32, w: 0.2, h: 0.03),
+        const OcrBlock(text: 'ops_lead', x: 0.45, y: 0.32, w: 0.3, h: 0.03),
+        const OcrBlock(text: '管理密码', x: 0.2, y: 0.42, w: 0.2, h: 0.03),
+        const OcrBlock(text: 'Lan#8822!', x: 0.45, y: 0.42, w: 0.3, h: 0.03),
+      ]);
+      expect(selfHosted.title, '内网工单');
+      expect(selfHosted.url, 'http://192.168.1.100:5244/login');
+      expect(selfHosted.username, 'ops_lead');
+      expect(selfHosted.password, 'Lan#8822!');
+
+      final unknownDomain = parseCredentialFromText('''
+https://portal.acmecorp.io/login
+Sign in to AcmeCloud
+Email: user@acmecorp.io
+Password: Acme#2026!
+''');
+      expect(unknownDomain.title, 'AcmeCloud');
+
+      final fallbackDomainOnly = parseCredentialFromText('''
+https://portal.acmecorp.io/login
+Email: user@acmecorp.io
+Password: Acme#2026!
+''');
+      expect(fallbackDomainOnly.title, 'acmecorp.io');
+    });
+
+    test('ScreenshotOcrService single-hop fast path and fallback behavior', () async {
+      const channel = MethodChannel('wencrypt.test.ocr.fastpath');
+      var legacyCalls = 0;
+      var emptyMode = false;
+      var legacyFallbackMode = false;
+
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+            if (legacyFallbackMode) {
+              if (call.method == 'readAndRecognizeClipboardImage') return null;
+              if (call.method == 'readClipboardImage') {
+                legacyCalls++;
+                return _testPngBytes;
+              }
+              if (call.method == 'recognizeImage') {
+                legacyCalls++;
+                return {'text': 'Email: fallback@test.io', 'blocks': []};
+              }
+              return null;
+            }
+            if (call.method == 'readClipboardImage' ||
+                call.method == 'recognizeImage') {
+              legacyCalls++;
+              return null;
+            }
+            if (call.method == 'readAndRecognizeClipboardImage') {
+              if (emptyMode) return {'hasImage': false};
+              return {
+                'hasImage': true,
+                'image': _testPngBytes,
+                'text': 'Email: single@hop.dev',
+                'blocks': [
+                  {
+                    'text': 'Email: single@hop.dev',
+                    'x': 0.1,
+                    'y': 0.2,
+                    'w': 0.6,
+                    'h': 0.04,
+                  },
+                ],
+              };
+            }
+            return null;
+          });
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(channel, null),
+      );
+
+      const service = ScreenshotOcrService(channel: channel);
+
+      final hit = await service.readAndRecognizeClipboardImage();
+      expect(hit, isNotNull);
+      expect(hit!.recognition.blocks.first.text, 'Email: single@hop.dev');
+      expect(legacyCalls, 0);
+
+      emptyMode = true;
+      final miss = await service.readAndRecognizeClipboardImage();
+      expect(miss, isNull);
+      expect(legacyCalls, 0);
+
+      emptyMode = false;
+      legacyFallbackMode = true;
+      final fallbackHit = await service.readAndRecognizeClipboardImage();
+      expect(fallbackHit, isNotNull);
+      expect(fallbackHit!.recognition.text, 'Email: fallback@test.io');
+      expect(legacyCalls, 2);
+    });
   });
 }

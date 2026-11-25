@@ -95,17 +95,17 @@ void main() {
 
   test('parseSha256Sums parses release checksum lines cleanly', () {
     const sample = '''
-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  wencrypt-v0.4.0-macos-arm64.zip
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *dir/wencrypt-v0.4.0-windows-x64.zip
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA  Wencrypt-v0.4.0-macos-arm64.zip
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *dir/Wencrypt-v0.4.0-windows-x64.zip
 invalid line
 ''';
     final parsed = parseSha256Sums(sample);
     expect(
-      parsed['wencrypt-v0.4.0-macos-arm64.zip'],
+      parsed['Wencrypt-v0.4.0-macos-arm64.zip'],
       'a' * 64,
     );
     expect(
-      parsed['wencrypt-v0.4.0-windows-x64.zip'],
+      parsed['Wencrypt-v0.4.0-windows-x64.zip'],
       'b' * 64,
     );
     expect(parsed.length, 2);
@@ -146,29 +146,29 @@ invalid line
         'size': 256,
       },
       {
-        'name': 'wencrypt-v0.4.0-macos-arm64.dmg',
+        'name': 'Wencrypt-v0.4.0-macos-arm64.dmg',
         'browser_download_url': 'https://github.com/a/mac.dmg',
         'size': 24000000,
       },
       {
-        'name': 'wencrypt-v0.4.0-macos-arm64.zip',
+        'name': 'Wencrypt-v0.4.0-macos-arm64.zip',
         'browser_download_url': 'https://github.com/a/mac.zip',
         'size': 23000000,
       },
       {
-        'name': 'wencrypt-v0.4.0-windows-x64.zip',
+        'name': 'Wencrypt-v0.4.0-windows-x64.zip',
         'browser_download_url': 'https://github.com/a/win.zip',
         'size': 14000000,
       },
       {
-        'name': 'wencrypt-v0.4.0-android-arm64.apk',
+        'name': 'Wencrypt-v0.4.0-android-arm64.apk',
         'browser_download_url': 'https://github.com/a/app.apk',
         'size': 22000000,
       },
     ];
 
     final mac = selectReleaseAsset(assets, UpdatePlatform.macos);
-    expect(mac.assetName, 'wencrypt-v0.4.0-macos-arm64.dmg');
+    expect(mac.assetName, 'Wencrypt-v0.4.0-macos-arm64.dmg');
     expect(mac.canInstallAsset, isTrue);
     expect(mac.sha256AssetUrl, isNotNull);
 
@@ -176,15 +176,15 @@ invalid line
       assets.where((a) => !a['name'].toString().endsWith('.dmg')).toList(),
       UpdatePlatform.macos,
     );
-    expect(macZipFallback.assetName, 'wencrypt-v0.4.0-macos-arm64.zip');
+    expect(macZipFallback.assetName, 'Wencrypt-v0.4.0-macos-arm64.zip');
     expect(macZipFallback.canInstallAsset, isTrue);
 
     final win = selectReleaseAsset(assets, UpdatePlatform.windows);
-    expect(win.assetName, 'wencrypt-v0.4.0-windows-x64.zip');
+    expect(win.assetName, 'Wencrypt-v0.4.0-windows-x64.zip');
     expect(win.canInstallAsset, isTrue);
 
     final android = selectReleaseAsset(assets, UpdatePlatform.android);
-    expect(android.assetName, 'wencrypt-v0.4.0-android-arm64.apk');
+    expect(android.assetName, 'Wencrypt-v0.4.0-android-arm64.apk');
     expect(android.canInstallAsset, isFalse);
   });
 
@@ -216,7 +216,7 @@ invalid line
                     'size': 128,
                   },
                 {
-                  'name': 'wencrypt-v0.4.0-macos-arm64.dmg',
+                  'name': 'Wencrypt-v0.4.0-macos-arm64.dmg',
                   'browser_download_url': '$origin/app.dmg',
                   'size': payloadBytes.length,
                 },
@@ -225,7 +225,7 @@ invalid line
           );
         } else if (req.uri.path == '/SHA256SUMS.txt') {
           req.response.statusCode = 200;
-          req.response.write('$validSha  wencrypt-v0.4.0-macos-arm64.dmg\n');
+          req.response.write('$validSha  Wencrypt-v0.4.0-macos-arm64.dmg\n');
         } else if (req.uri.path == '/app.dmg') {
           req.response.statusCode = 200;
           if (serveCorruptArchive) {
@@ -249,7 +249,7 @@ invalid line
       final bridge = _FakeUpdaterBridge(
         runtimeInfo: const AppRuntimeInfo(
           version: '0.3.9',
-          installPath: '/Applications/wencrypt.app',
+          installPath: '/Applications/Wencrypt.app',
           canAutoInstall: true,
           isSandboxed: false,
         ),
@@ -317,7 +317,7 @@ invalid line
     final bridge = _FakeUpdaterBridge(
       runtimeInfo: const AppRuntimeInfo(
         version: '0.3.9',
-        installPath: '/Applications/wencrypt.app',
+        installPath: '/Applications/Wencrypt.app',
         canAutoInstall: true,
       ),
     );
@@ -327,7 +327,7 @@ invalid line
       status: UpdateStatus.upToDate,
       autoCheckEnabled: true,
       dataDirectoryPath: '/Users/demo/Library/Application Support/org.wencrypt.wencrypt',
-      installPath: '/Applications/wencrypt.app',
+      installPath: '/Applications/Wencrypt.app',
       bridge: bridge,
     );
     addTearDown(upToDate.dispose);
@@ -374,8 +374,8 @@ invalid line
         tagName: 'v0.4.0',
         releaseUrl: '$kGitHubReleasesUrl/tag/v0.4.0',
         notes: '支持应用内一键自动更新',
-        assetName: 'wencrypt-v0.4.0-macos-arm64.dmg',
-        downloadUrl: '$kGitHubReleasesUrl/download/v0.4.0/wencrypt-v0.4.0-macos-arm64.dmg',
+        assetName: 'Wencrypt-v0.4.0-macos-arm64.dmg',
+        downloadUrl: '$kGitHubReleasesUrl/download/v0.4.0/Wencrypt-v0.4.0-macos-arm64.dmg',
         sha256AssetUrl: '$kGitHubReleasesUrl/download/v0.4.0/SHA256SUMS.txt',
         canInstallAsset: true,
       ),

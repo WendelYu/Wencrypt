@@ -128,7 +128,7 @@ enum AppUpdater {
 
   static func appInfo() -> [String: Any] {
     let info = Bundle.main.infoDictionary
-    let version = (info?["CFBundleShortVersionString"] as? String) ?? "0.3.10"
+    let version = (info?["CFBundleShortVersionString"] as? String) ?? "0.3.11"
     let buildNumber = (info?["CFBundleVersion"] as? String) ?? "1"
     return [
       "version": version,
@@ -214,7 +214,7 @@ enum AppUpdater {
       let mountedApps = mountedItems.filter { $0.pathExtension == "app" }
       guard let mountedApp = mountedApps.count == 1
         ? mountedApps.first
-        : mountedApps.first(where: { $0.lastPathComponent == "wencrypt.app" })
+        : mountedApps.first(where: { $0.lastPathComponent.lowercased() == "wencrypt.app" })
       else {
         throw AppUpdaterError.bundleValidationFailed
       }
@@ -237,7 +237,10 @@ enum AppUpdater {
       options: [.skipsHiddenFiles]
     )
     let apps = topLevel.filter { $0.pathExtension == "app" && $0.lastPathComponent != "__MACOSX" }
-    guard let stagedApp = apps.count == 1 ? apps.first : apps.first(where: { $0.lastPathComponent == "wencrypt.app" }) else {
+    guard let stagedApp = apps.count == 1
+      ? apps.first
+      : apps.first(where: { $0.lastPathComponent.lowercased() == "wencrypt.app" })
+    else {
       throw AppUpdaterError.bundleValidationFailed
     }
 
@@ -272,6 +275,25 @@ enum AppUpdater {
     return stagedApp
   }
 
+  static func resolvedFinalTargetURL(currentTargetURL: URL, stagedAppName: String) -> URL {
+    guard currentTargetURL.lastPathComponent.lowercased() == stagedAppName.lowercased() else {
+      return currentTargetURL
+    }
+    if currentTargetURL.lastPathComponent == stagedAppName {
+      return currentTargetURL
+    }
+    let candidate = currentTargetURL.deletingLastPathComponent()
+      .appendingPathComponent(stagedAppName, isDirectory: true)
+    if FileManager.default.fileExists(atPath: candidate.path) {
+      let currentId = (try? currentTargetURL.resourceValues(forKeys: [.fileResourceIdentifierKey]))?.fileResourceIdentifier as? NSObject
+      let candidateId = (try? candidate.resourceValues(forKeys: [.fileResourceIdentifierKey]))?.fileResourceIdentifier as? NSObject
+      if let currentId, let candidateId, !currentId.isEqual(candidateId) {
+        return currentTargetURL
+      }
+    }
+    return candidate
+  }
+
   static func swapScriptContents() -> String {
     return """
     #!/bin/sh
@@ -281,6 +303,7 @@ enum AppUpdater {
     NEW_APP="$3"
     OLD_APP="$4"
     WORK_DIR="$5"
+    FINAL_TARGET="${6:-$TARGET}"
 
     i=0
     while [ "$i" -lt 40 ]; do
@@ -298,14 +321,14 @@ enum AppUpdater {
 
     rm -rf "$OLD_APP"
     mv "$TARGET" "$OLD_APP"
-    if ! mv "$NEW_APP" "$TARGET"; then
+    if ! mv "$NEW_APP" "$FINAL_TARGET"; then
       mv "$OLD_APP" "$TARGET" || true
       rm -rf "$NEW_APP" "$WORK_DIR"
       exit 1
     fi
 
     rm -rf "$OLD_APP" "$WORK_DIR"
-    /usr/bin/open -n "$TARGET"
+    /usr/bin/open -n "$FINAL_TARGET"
     """
   }
 
@@ -337,6 +360,10 @@ enum AppUpdater {
         workDir: workDir,
         requireCoreLibrary: true
       )
+      let finalTargetURL = resolvedFinalTargetURL(
+        currentTargetURL: targetURL,
+        stagedAppName: stagedApp.lastPathComponent
+      )
 
       try? fm.removeItem(at: newAppURL)
       guard runTool("/usr/bin/ditto", [stagedApp.path, newAppURL.path]) == 0 else {
@@ -358,6 +385,7 @@ enum AppUpdater {
         newAppURL.path,
         oldAppURL.path,
         workDir.path,
+        finalTargetURL.path,
       ]
       launcher.standardInput = FileHandle.nullDevice
       launcher.standardOutput = FileHandle.nullDevice

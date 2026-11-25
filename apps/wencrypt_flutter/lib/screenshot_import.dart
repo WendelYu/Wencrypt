@@ -31,6 +31,16 @@ class OcrRecognitionResult {
   final List<OcrBlock> blocks;
 }
 
+class ClipboardOcrResult {
+  const ClipboardOcrResult({
+    required this.imageBytes,
+    required this.recognition,
+  });
+
+  final Uint8List imageBytes;
+  final OcrRecognitionResult recognition;
+}
+
 class ParsedCredential {
   const ParsedCredential({
     this.title = '',
@@ -93,6 +103,67 @@ class ScreenshotOcrService {
     }
   }
 
+  OcrRecognitionResult _parseRecognitionPayload(Map<String, dynamic> raw) {
+    final fullText = (raw['text'] as String? ?? '').trim();
+    final rawBlocks = raw['blocks'] as List? ?? const [];
+    final blocks = <OcrBlock>[];
+    for (final item in rawBlocks) {
+      if (item is! Map) continue;
+      final text = (item['text'] as String? ?? '').trim();
+      if (text.isEmpty) continue;
+      double numVal(String k) {
+        final v = item[k];
+        if (v is num && v.isFinite) return v.toDouble().clamp(0.0, 1.0);
+        return 0.0;
+      }
+
+      blocks.add(
+        OcrBlock(
+          text: text,
+          x: numVal('x'),
+          y: numVal('y'),
+          w: numVal('w'),
+          h: numVal('h'),
+        ),
+      );
+    }
+    if (blocks.isEmpty && fullText.isNotEmpty) {
+      final fallback = _blocksFromPlainText(fullText);
+      return OcrRecognitionResult(text: fullText, blocks: fallback);
+    }
+    return OcrRecognitionResult(text: fullText, blocks: blocks);
+  }
+
+  /// Single-hop native clipboard read + preview generation + OCR when
+  /// supported by the platform host, falling back cleanly otherwise.
+  Future<ClipboardOcrResult?> readAndRecognizeClipboardImage() async {
+    try {
+      final raw = await _channel.invokeMapMethod<String, dynamic>(
+        'readAndRecognizeClipboardImage',
+      );
+      if (raw != null) {
+        if (raw['hasImage'] == false) return null;
+        final image = raw['image'];
+        if (image is Uint8List && image.isNotEmpty) {
+          return ClipboardOcrResult(
+            imageBytes: image,
+            recognition: _parseRecognitionPayload(raw),
+          );
+        }
+        if (raw.containsKey('hasImage')) return null;
+      }
+    } on MissingPluginException {
+      // Fall back to two-step channel calls below (e.g. unit test mocks).
+    } on PlatformException catch (error) {
+      throw ScreenshotOcrException(error.code, friendlyError(error));
+    }
+
+    final bytes = await readClipboardImage();
+    if (bytes == null || bytes.isEmpty) return null;
+    final recognition = await recognizeImage(bytes);
+    return ClipboardOcrResult(imageBytes: bytes, recognition: recognition);
+  }
+
   Future<OcrRecognitionResult> recognizeImage(Uint8List bytes) async {
     if (bytes.isEmpty) {
       throw const ScreenshotOcrException('invalid_image', '图片数据为空，请重新选择截图。');
@@ -105,34 +176,7 @@ class ScreenshotOcrService {
       if (raw == null) {
         return const OcrRecognitionResult(text: '', blocks: []);
       }
-      final fullText = (raw['text'] as String? ?? '').trim();
-      final rawBlocks = raw['blocks'] as List? ?? const [];
-      final blocks = <OcrBlock>[];
-      for (final item in rawBlocks) {
-        if (item is! Map) continue;
-        final text = (item['text'] as String? ?? '').trim();
-        if (text.isEmpty) continue;
-        double numVal(String k) {
-          final v = item[k];
-          if (v is num && v.isFinite) return v.toDouble().clamp(0.0, 1.0);
-          return 0.0;
-        }
-
-        blocks.add(
-          OcrBlock(
-            text: text,
-            x: numVal('x'),
-            y: numVal('y'),
-            w: numVal('w'),
-            h: numVal('h'),
-          ),
-        );
-      }
-      if (blocks.isEmpty && fullText.isNotEmpty) {
-        final fallback = _blocksFromPlainText(fullText);
-        return OcrRecognitionResult(text: fullText, blocks: fallback);
-      }
-      return OcrRecognitionResult(text: fullText, blocks: blocks);
+      return _parseRecognitionPayload(raw);
     } on MissingPluginException {
       throw const ScreenshotOcrException(
         'ocr_unavailable',
@@ -160,7 +204,7 @@ class ScreenshotOcrService {
 const _cjkPattern = r'[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF]';
 final _cjkPairSpaceRe = RegExp('(?<=$_cjkPattern)[ \\t]+(?=$_cjkPattern)');
 final _cjkBeforePunctSpaceRe = RegExp(
-  '(?<=$_cjkPattern)[ \\t]+(?=[：:，,。.！？（）()【】])',
+  '(?<=$_cjkPattern)[ \\t]+(?=[：:，,。.！？（）【】]|\\([\\d$_cjkPattern])',
 );
 final _cjkAfterPunctSpaceRe = RegExp(
   '(?<=[：:（(【])[ \\t]+(?=$_cjkPattern)|(?<=$_cjkPattern'
@@ -255,6 +299,39 @@ final _exactActionNoise = <String>{
   '立即体验',
   '看不清换一张',
   '换一张',
+  '复制',
+  '已复制',
+  '複製',
+  '拷贝',
+  '复制密码',
+  '复制账号',
+  '显示',
+  '隐藏',
+  '顯示',
+  '隱藏',
+  '查看',
+  '显示密码',
+  '隐藏密码',
+  '登录/注册',
+  '注册/登录',
+  '立即登入',
+  '免費註冊',
+  '忘記密碼',
+  '忘記密碼?',
+  '忘記密碼？',
+  '记住我',
+  '記住我',
+  '切换账号',
+  '忘记账号',
+  'copy',
+  'copied',
+  'copy password',
+  'show',
+  'hide',
+  'show password',
+  'hide password',
+  'remember me',
+  'keep me signed in',
   'sign up',
   'signup',
   'sign in',
@@ -343,17 +420,72 @@ bool _isUiNoise(String raw) {
 
 String _stripLabelDecorations(String text) {
   var out = normalizeCjkSpacing(text).trim();
-  out = out.replaceAll(RegExp(r'^[\*\s•·\-]+'), '');
+  out = out.replaceAll(RegExp(r'^[\*\s•·\-▪■✦○●]+'), '');
   out = out.replaceAll(RegExp(r'[\*\s：:]+$'), '');
   return out.trim();
 }
 
+final _labelBracketQualifierRe = RegExp(
+  r'[\(（\[【][^\)）\]】]{1,24}[\)）\]】]',
+);
+final _labelTrailingWordQualifierRe = RegExp(
+  r'(?:必填|选填|可选|\brequired\b|\boptional\b)$',
+  caseSensitive: false,
+);
+
+String _stripLabelQualifiers(String cleaned) {
+  var out = cleaned.replaceAll(_labelBracketQualifierRe, ' ');
+  out = out.replaceAll(RegExp(r'\s+'), ' ').trim();
+  out = out.replaceAll(RegExp(r'^[\*\s•·\-]+|[\*\s：:]+$'), '').trim();
+  out = out.replaceAll(_labelTrailingWordQualifierRe, '').trim();
+  return out.replaceAll(RegExp(r'[\*\s：:]+$'), '').trim();
+}
+
+final _inlineLeadingPictographRe = RegExp(
+  r'^[\s\u{1F4CB}\u{1F511}\u{1F512}\u2709\uFE0F\u{1F441}]+',
+  unicode: true,
+);
+final _inlineTrailingActionWithSpaceRe = RegExp(
+  r'(?:[ \t]+)(?:复制密码|复制账号|复制链接|已复制|复制|複製|拷贝|显示密码|隐藏密码|显示|隐藏|顯示|隱藏|查看|随机生成|重新生成|生成|换一个|打开|访问|前往|清空|清除|copy\s+password|copy|copied|show|hide|reveal|view|clear|open|generate|\u{1F4CB}|\u{1F441}\uFE0F?|\u2715|\u00D7|\u2713|\u2714)[ \t]*$',
+  caseSensitive: false,
+  unicode: true,
+);
+final _inlineTrailingCjkActionAttachedRe = RegExp(
+  r'(?<=[A-Za-z0-9!@#\$%\^&\*\(\)_+\-=\[\]{};:\x27",.<>/?\\|`~])(?:复制密码|复制账号|复制链接|已复制|复制|複製|显示密码|隐藏密码|显示|隐藏|顯示|隱藏|查看|打开|前往)$',
+);
+
+String _stripInlineActionSuffix(String value) {
+  var out = value.trim().replaceFirst(_inlineLeadingPictographRe, '').trim();
+  for (var i = 0; i < 2; i++) {
+    final next = out
+        .replaceFirst(_inlineTrailingActionWithSpaceRe, '')
+        .replaceFirst(_inlineTrailingCjkActionAttachedRe, '')
+        .trim();
+    if (next == out) break;
+    out = next;
+  }
+  return out;
+}
+
+final _standaloneSeparatorRe = RegExp(r'^[:：=\*\-•·|｜\s]+$');
+
 const _captchaLabels = [
   '图形验证码',
+  '图片验证码',
   '短信验证码',
   '邮箱验证码',
   '手机验证码',
   '动态验证码',
+  '人机验证码',
+  '动态口令',
+  '二次验证码',
+  '圖形驗證碼',
+  '簡訊驗證碼',
+  '郵箱驗證碼',
+  '驗證碼',
+  '校驗碼',
+  '安全碼',
+  '邀請碼',
   '验证码',
   '校验码',
   '动态码',
@@ -362,7 +494,15 @@ const _captchaLabels = [
   '推荐码',
   'verification code',
   'verify code',
+  'confirmation code',
   'security code',
+  'one-time code',
+  'one time code',
+  'auth code',
+  '2fa code',
+  'mfa code',
+  '2fa',
+  'totp',
   'captcha',
   'otp',
   'sms code',
@@ -376,13 +516,25 @@ const _confirmPasswordLabels = [
   '确认密码',
   '重复密码',
   '再次输入密码',
+  '再次确认密码',
+  '重复输入密码',
   '确认登录密码',
   '确认新密码',
+  '确认新登录密码',
   '密码确认',
+  '確認密碼',
+  '重複密碼',
+  '再次輸入密碼',
+  '確認新密碼',
+  '密碼確認',
   'confirm password',
   'confirm new password',
+  'confirm your password',
+  'password confirmation',
   're-enter password',
   'reenter password',
+  're-type password',
+  'retype password',
   'repeat password',
   'verify password',
   'password again',
@@ -394,75 +546,190 @@ const _passwordLabels = [
   '默认密码',
   '设置密码',
   '新密码',
+  '新登录密码',
+  '管理密码',
+  '管理员密码',
+  '注册密码',
+  '访问密码',
+  '临时密码',
+  '随机密码',
+  '登录口令',
+  '账户口令',
+  '密码设置',
   '账户密码',
   '账号密码',
   '通行密码',
+  '登入密碼',
+  '初始密碼',
+  '預設密碼',
+  '設定密碼',
+  '新密碼',
+  '帳戶密碼',
+  '帳號密碼',
+  '管理密碼',
+  '密碼',
   '密码',
   '口令',
   'new password',
+  'set password',
+  'create password',
+  'login password',
+  'account password',
+  'admin password',
+  'user password',
   'initial password',
   'default password',
+  'temp password',
+  'temporary password',
   'password',
   'passwd',
   'pwd',
   'passcode',
   'passphrase',
+  'secret',
 ];
 
 const _usernameLabels = [
   '登录账号',
   '登录帐号',
+  '登录账户',
+  '登录邮箱',
+  '注册邮箱',
+  '绑定邮箱',
+  '联系邮箱',
+  '工作邮箱',
+  '企业邮箱',
+  '用户邮箱',
+  '注册手机号',
+  '登录手机号',
+  '绑定手机',
+  '绑定手机号',
+  '管理账号',
+  '管理员账号',
   '登录名',
   '用户名',
   '账户名',
+  '会员名',
+  '通行证',
   '电子邮箱',
   '邮箱地址',
   '手机号码',
+  '用户名/邮箱/手机号',
+  '用户名/邮箱',
+  '用户名/手机号',
+  '账号/手机号',
+  '账号/用户名',
+  '手机号/邮箱',
+  '邮箱/手机号',
+  '账号/邮箱',
+  '用户id',
+  '登入帳號',
+  '登入帳戶',
+  '登入名',
+  '使用者名稱',
+  '用戶名',
+  '用戶名稱',
+  '帳戶名',
+  '電子郵件',
+  '電子信箱',
+  '信箱',
+  '郵箱地址',
+  '郵箱',
+  '手機號碼',
+  '手機號',
+  '帳號',
+  '帳戶',
   '账号',
   '帐号',
   '账户',
   '邮箱',
   '手机号',
-  '用户id',
-  '用户名/邮箱',
-  '手机号/邮箱',
-  '账号/邮箱',
+  'uid',
   'user name',
   'username',
   'user id',
   'userid',
+  'user account',
+  'account name',
+  'account id',
   'account',
+  'member id',
   'login id',
   'login name',
+  'login email',
+  'login account',
   'login',
+  'sign-in email',
+  'sign in email',
+  'email address',
+  'e-mail address',
+  'work email',
   'e-mail',
   'email',
   'phone number',
+  'mobile number',
+  'cell phone',
+  'phone/email',
+  'email or username',
+  'username or email',
+  'email / username',
   'phone',
   'mobile',
 ];
 
 const _urlLabels = [
+  '登录网址',
   '登录地址',
   '网站地址',
+  '后台地址',
+  '管理地址',
+  '控制台地址',
+  '面板地址',
+  '系统地址',
+  '访问地址',
+  '服务地址',
+  '接口地址',
+  '注册地址',
+  '首页地址',
   '服务器地址',
+  '登入網址',
+  '登入地址',
+  '網站地址',
+  '伺服器地址',
+  '網址',
+  '網站',
+  '官網',
+  '伺服器',
+  '網域',
   '网址',
   '网站',
   '地址',
   '官网',
   '服务器',
   '域名',
+  '链接',
+  '入口',
   'website',
   'web site',
+  'web address',
   'login url',
   'site url',
   'server url',
+  'console url',
+  'admin url',
+  'panel url',
+  'portal url',
+  'dashboard url',
+  'access url',
+  'homepage',
   'url',
   'site',
   'host',
   'server',
   'domain',
   'endpoint',
+  'address',
+  'link',
 ];
 
 const _titleLabels = [
@@ -471,18 +738,55 @@ const _titleLabels = [
   '系统名称',
   '应用名称',
   '服务名称',
+  '产品名称',
+  '项目名称',
+  '所属平台',
+  '所属系统',
+  '網站名稱',
+  '平台名稱',
+  '系統名稱',
+  '應用名稱',
+  '服務名稱',
+  '來源',
+  '名稱',
+  '應用',
+  '服務',
   '来源',
   '平台',
+  '系统',
+  '项目',
+  '产品',
   '名称',
   '应用',
   '服务',
   'service name',
   'app name',
+  'site name',
   'platform',
+  'project',
+  'product',
+  'workspace',
+  'organization',
+  'company',
+  'provider',
   'source',
   'title',
   'name',
 ];
+
+final List<({String label, _FieldKind kind})> _sortedInlineLabels = (() {
+  final all = <({String label, _FieldKind kind})>[
+    for (final l in _captchaLabels) (label: l, kind: _FieldKind.captcha),
+    for (final l in _confirmPasswordLabels)
+      (label: l, kind: _FieldKind.confirmPassword),
+    for (final l in _passwordLabels) (label: l, kind: _FieldKind.password),
+    for (final l in _usernameLabels) (label: l, kind: _FieldKind.username),
+    for (final l in _urlLabels) (label: l, kind: _FieldKind.url),
+    for (final l in _titleLabels) (label: l, kind: _FieldKind.title),
+  ];
+  all.sort((a, b) => b.label.length.compareTo(a.label.length));
+  return all;
+})();
 
 bool _matchesLabelList(String cleanedLower, List<String> candidates) {
   for (final label in candidates) {
@@ -491,11 +795,7 @@ bool _matchesLabelList(String cleanedLower, List<String> candidates) {
   return false;
 }
 
-_FieldKind _classifyLabel(String raw) {
-  final cleaned = _stripLabelDecorations(raw);
-  if (cleaned.isEmpty || cleaned.length > 26) return _FieldKind.none;
-  if (_isUiNoise(cleaned)) return _FieldKind.none;
-  final lower = cleaned.toLowerCase();
+_FieldKind _classifyExactNormalizedLabel(String lower) {
   if (_matchesLabelList(lower, _captchaLabels)) return _FieldKind.captcha;
   if (_matchesLabelList(lower, _confirmPasswordLabels)) {
     return _FieldKind.confirmPassword;
@@ -507,14 +807,52 @@ _FieldKind _classifyLabel(String raw) {
   return _FieldKind.none;
 }
 
+_FieldKind _classifyLabel(String raw) {
+  final cleaned = _stripLabelDecorations(raw);
+  if (cleaned.isEmpty || cleaned.length > 36) return _FieldKind.none;
+
+  if (!_isUiNoise(cleaned)) {
+    final direct = _classifyExactNormalizedLabel(cleaned.toLowerCase());
+    if (direct != _FieldKind.none) return direct;
+  }
+
+  final qualifierStripped = _stripLabelQualifiers(cleaned);
+  if (qualifierStripped.isNotEmpty &&
+      qualifierStripped != cleaned &&
+      !_isUiNoise(qualifierStripped)) {
+    final kind = _classifyExactNormalizedLabel(qualifierStripped.toLowerCase());
+    if (kind != _FieldKind.none) return kind;
+  }
+
+  if (!_isUiNoise(cleaned)) {
+    for (final match in _labelBracketQualifierRe.allMatches(cleaned)) {
+      final innerRaw = match.group(0)!;
+      final inner = _stripLabelDecorations(
+        innerRaw.substring(1, innerRaw.length - 1),
+      );
+      if (inner.isEmpty) continue;
+      final innerKind = _classifyExactNormalizedLabel(inner.toLowerCase());
+      if (innerKind != _FieldKind.none) return innerKind;
+    }
+  }
+
+  return _FieldKind.none;
+}
+
 ({String label, String value})? _splitInlineLabelValue(String raw) {
   final normalized = normalizeCjkSpacing(raw).trim();
   if (normalized.isEmpty) return null;
 
-  // Prefer explicit colon separators (ignoring URL scheme `://`).
+  // Prefer explicit separators (ignoring URL scheme `://`).
   for (var i = 0; i < normalized.length; i++) {
     final ch = normalized[i];
-    if (ch == '：' || ch == ':') {
+    if (ch == '：' ||
+        ch == ':' ||
+        ch == '=' ||
+        ch == '｜' ||
+        ch == '|' ||
+        ch == '；' ||
+        ch == ';') {
       if (ch == ':' &&
           i + 2 < normalized.length &&
           normalized.substring(i + 1, i + 3) == '//') {
@@ -528,29 +866,33 @@ _FieldKind _classifyLabel(String raw) {
     }
   }
 
-  // Fallback for space-separated inline pairs like "账号 alice@example.com"
-  // or "Password MySecret99!".
-  final allLabels = [
-    ..._captchaLabels,
-    ..._confirmPasswordLabels,
-    ..._passwordLabels,
-    ..._usernameLabels,
-    ..._urlLabels,
-    ..._titleLabels,
-  ];
+  // Fallback for space-separated or annotated inline pairs like
+  // "账号 alice@example.com" or "登录密码(8-20位) MySecret99!".
   final lower = normalized.toLowerCase();
-  for (final candidate in allLabels) {
+  for (final entry in _sortedInlineLabels) {
+    final candidate = entry.label;
     if (!lower.startsWith(candidate)) continue;
-    final rest = normalized.substring(candidate.length);
+    var labelEnd = candidate.length;
+    var rest = normalized.substring(labelEnd);
     if (rest.isEmpty) continue;
+
+    final parenMatch = RegExp(
+      r'^[\(（\[【][^\)）\]】]{1,24}[\)）\]】]',
+    ).firstMatch(rest);
+    if (parenMatch != null) {
+      labelEnd += parenMatch.end;
+      rest = normalized.substring(labelEnd);
+      if (rest.isEmpty) continue;
+    }
+
     final startsWithGap = rest.startsWith(' ') || rest.startsWith('\t');
     final isCjkLabelToAsciiValue =
         candidate.runes.any((r) => r >= 0x4E00) &&
-        RegExp(r'^[A-Za-z0-9@._+!\-#]').hasMatch(rest);
+        RegExp(r'^[A-Za-z0-9@._+!\-#/~*]').hasMatch(rest);
     if (startsWithGap || isCjkLabelToAsciiValue) {
       final value = rest.trim();
       if (value.isNotEmpty) {
-        return (label: normalized.substring(0, candidate.length), value: value);
+        return (label: normalized.substring(0, labelEnd), value: value);
       }
     }
   }
@@ -561,22 +903,31 @@ final _emailRe = RegExp(
   r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b',
 );
 final _urlWithSchemeRe = RegExp(
-  r'https?://[^\s<>\]\)"\x27]+',
+  r'https?://[^\s<>\]\)"\x27\u4E00-\u9FFF]+',
+  caseSensitive: false,
+);
+final _ipWithPortRe = RegExp(
+  r'(?<![\d.\-])((?:localhost|(?:\d{1,3}\.){3}\d{1,3}):\d{2,5}(?:/[^\s<>\]\)"\x27\u4E00-\u9FFF]*)?)',
   caseSensitive: false,
 );
 final _domainRe = RegExp(
-  r'(?<![@\w.\-])([a-zA-Z0-9\-]+(?:\.[a-zA-Z0-9\-]+)*\.(?:com|cn|com\.cn|net|org|io|app|dev|co|ai|me|cc|tv|jp|uk|edu|gov|cloud|tech|xyz)(?:/[^\s<>\]\)"\x27]*)?)\b',
+  r'(?<![@\w.\-])([a-zA-Z0-9\-]+(?:\.[a-zA-Z0-9\-]+)*\.(?:com|cn|com\.cn|org\.cn|net\.cn|gov\.cn|net|org|io|app|dev|co|ai|me|cc|tv|jp|uk|edu|gov|cloud|tech|xyz|so|top|vip|site|online|store|gg|sh|work|pro|hk|tw|sg|de|fr|ca|au|kr|in|im|to|la|icu|run|fun|ink|link|club|space|live|info|biz|page)(?:/[^\s<>\]\)"\x27\u4E00-\u9FFF]*)?)(?!@|\w)',
   caseSensitive: false,
 );
 final _cnPhoneRe = RegExp(r'(?<!\d)(?:\+?86[-\s]?)?(1[3-9]\d{9})(?!\d)');
 final _intlPhoneRe = RegExp(r'(?<!\w)(\+\d{1,3}[\s\-]?\d{6,12})(?!\d)');
 
 String? _extractUrlCandidate(String raw) {
-  final trimmed = raw.trim();
+  final trimmed = _stripInlineActionSuffix(raw).trim();
   if (trimmed.isEmpty) return null;
   final withScheme = _urlWithSchemeRe.firstMatch(trimmed);
   if (withScheme != null) {
     return _cleanTrailingUrlPunct(withScheme.group(0)!);
+  }
+  final ipPort = _ipWithPortRe.firstMatch(trimmed);
+  if (ipPort != null) {
+    final matched = _cleanTrailingUrlPunct(ipPort.group(1)!);
+    return 'http://$matched';
   }
   final domain = _domainRe.firstMatch(trimmed);
   if (domain != null) {
@@ -589,7 +940,14 @@ String? _extractUrlCandidate(String raw) {
 String _cleanTrailingUrlPunct(String url) =>
     url.replaceAll(RegExp(r'[,.;:!?，。；：！？\)]+$'), '');
 
-String? _extractEmailCandidate(String raw) => _emailRe.firstMatch(raw)?.group(0);
+String? _extractEmailCandidate(String raw) {
+  final normalized = raw
+      .replaceAll('\uFF20', '@')
+      .replaceAll('\uFF0E', '.')
+      .replaceAll('\uFF0D', '-')
+      .replaceAll('\uFF3F', '_');
+  return _emailRe.firstMatch(normalized)?.group(0);
+}
 
 String? _extractPhoneCandidate(String raw) {
   final cn = _cnPhoneRe.firstMatch(raw);
@@ -611,15 +969,61 @@ bool _isGenericServiceEmail(String email) {
       lower.startsWith('help@') ||
       lower.startsWith('feedback@') ||
       lower.startsWith('kefu@') ||
+      lower.startsWith('contact@') ||
+      lower.startsWith('info@') ||
+      lower.startsWith('hello@') ||
+      lower.startsWith('sales@') ||
+      lower.startsWith('security@') ||
+      lower.startsWith('privacy@') ||
+      lower.startsWith('legal@') ||
+      lower.startsWith('official@') ||
       lower.startsWith('admin@');
 }
 
+final _dateTokenRe = RegExp(
+  r'^(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})$',
+);
+final _timeTokenRe = RegExp(r'^\d{1,2}:\d{2}(?::\d{2})?$');
+final _versionTokenRe = RegExp(
+  r'^v?\d+\.\d+(?:\.\d+)*(?:[-+][A-Za-z0-9.]+)?$',
+  caseSensitive: false,
+);
+final _ipOnlyRe = RegExp(r'^(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?$');
+final _docRefIdRe = RegExp(
+  r'^(?:DOC|NO|ERR|REF|REQ|MSG|BUG|SKU|ORD|INV|UTF|TLS|SSL|AES|SHA)[-_]\d+(?:\.\d+)*$',
+  caseSensitive: false,
+);
+final _filenameTokenRe = RegExp(
+  r'^[A-Za-z0-9._\-]+\.(?:png|jpe?g|webp|gif|svg|pdf|zip|dmg|exe|msi|apk|html?|css|js|ts|json|ya?ml|xml|txt|md|log)$',
+  caseSensitive: false,
+);
+final _numericPunctOnlyRe = RegExp(r'^[\d,._+\-%$¥€£:;/\\]+$');
+
 bool _looksLikePasswordToken(String value) {
-  final s = value.trim();
+  final s = _normalizePasswordToken(value);
   if (s.length < 6 || s.length > 64) return false;
   if (s.contains(RegExp(r'\s'))) return false;
   if (s.runes.any((r) => r < 0x21 || r > 0x7E)) return false;
-  if (_urlWithSchemeRe.hasMatch(s) || _emailRe.hasMatch(s)) return false;
+  if (_urlWithSchemeRe.hasMatch(s) ||
+      _ipWithPortRe.hasMatch(s) ||
+      _emailRe.hasMatch(s)) {
+    return false;
+  }
+  final domainMatch = _domainRe.firstMatch(s);
+  if (domainMatch != null && domainMatch.group(0) == s) return false;
+  final cnPhoneMatch = _cnPhoneRe.firstMatch(s);
+  if (cnPhoneMatch != null && cnPhoneMatch.group(0) == s) return false;
+  final intlPhoneMatch = _intlPhoneRe.firstMatch(s);
+  if (intlPhoneMatch != null && intlPhoneMatch.group(0) == s) return false;
+  if (_dateTokenRe.hasMatch(s) ||
+      _timeTokenRe.hasMatch(s) ||
+      _versionTokenRe.hasMatch(s) ||
+      _ipOnlyRe.hasMatch(s) ||
+      _docRefIdRe.hasMatch(s) ||
+      _filenameTokenRe.hasMatch(s) ||
+      _numericPunctOnlyRe.hasMatch(s)) {
+    return false;
+  }
   if (_isUiNoise(s) || isMaskedPasswordText(s)) return false;
 
   var classes = 0;
@@ -649,30 +1053,89 @@ const _knownBrandDomains = <String, String>{
   'chatgpt.com': 'ChatGPT',
   'claude.ai': 'Claude',
   'anthropic.com': 'Anthropic',
+  'deepseek.com': 'DeepSeek',
+  'cursor.com': 'Cursor',
+  'perplexity.ai': 'Perplexity',
+  'openrouter.ai': 'OpenRouter',
+  'huggingface.co': 'Hugging Face',
+  'siliconflow.cn': '硅基流动',
+  'moonshot.cn': 'Kimi',
+  'kimi.com': 'Kimi',
+  'bigmodel.cn': '智谱清言',
+  'zhipuai.cn': '智谱清言',
+  'doubao.com': '豆包',
+  'volcengine.com': '火山引擎',
+  'x.ai': 'xAI',
   'notion.so': 'Notion',
   'figma.com': 'Figma',
+  'linear.app': 'Linear',
   'discord.com': 'Discord',
   'slack.com': 'Slack',
+  'zoom.us': 'Zoom',
+  'x.com': 'X',
+  'twitter.com': 'X',
+  'reddit.com': 'Reddit',
+  'linkedin.com': 'LinkedIn',
+  'youtube.com': 'YouTube',
+  'netflix.com': 'Netflix',
+  'spotify.com': 'Spotify',
+  'twitch.tv': 'Twitch',
+  'dropbox.com': 'Dropbox',
+  'proton.me': 'Proton',
+  'protonmail.com': 'Proton Mail',
   'cloudflare.com': 'Cloudflare',
   'vercel.com': 'Vercel',
   'netlify.com': 'Netlify',
+  'supabase.com': 'Supabase',
+  'docker.com': 'Docker',
+  'npmjs.com': 'npm',
+  'pypi.org': 'PyPI',
+  'jetbrains.com': 'JetBrains',
+  'atlassian.com': 'Atlassian',
+  'digitalocean.com': 'DigitalOcean',
+  'vultr.com': 'Vultr',
+  'hetzner.com': 'Hetzner',
+  'namecheap.com': 'Namecheap',
+  'porkbun.com': 'Porkbun',
+  'paypal.com': 'PayPal',
+  'stripe.com': 'Stripe',
   'aws.amazon.com': 'AWS',
   'amazon.com': 'Amazon',
   'steampowered.com': 'Steam',
   'store.steampowered.com': 'Steam',
+  'epicgames.com': 'Epic Games',
+  'nintendo.com': 'Nintendo',
   'aliyun.com': '阿里云',
   'alibabacloud.com': '阿里云',
   'tencent.com': '腾讯',
   'cloud.tencent.com': '腾讯云',
   'huawei.com': '华为',
   'huaweicloud.com': '华为云',
+  'xiaomi.com': '小米',
+  'mi.com': '小米',
   'baidu.com': '百度',
+  'quark.cn': '夸克',
+  'alipan.com': '阿里云盘',
+  'aliyundrive.com': '阿里云盘',
+  'wps.cn': 'WPS',
+  'kdocs.cn': '金山文档',
   'bilibili.com': 'Bilibili',
+  'douyin.com': '抖音',
+  'kuaishou.com': '快手',
   'zhihu.com': '知乎',
+  'juejin.cn': '掘金',
+  'csdn.net': 'CSDN',
+  'cnblogs.com': '博客园',
+  'v2ex.com': 'V2EX',
+  'yuque.com': '语雀',
   'jd.com': '京东',
   'taobao.com': '淘宝',
   'tmall.com': '天猫',
   'alipay.com': '支付宝',
+  'meituan.com': '美团',
+  'pinduoduo.com': '拼多多',
+  'ctrip.com': '携程',
+  '12306.cn': '12306',
   'douban.com': '豆瓣',
   '163.com': '网易',
   '126.com': '网易邮箱',
@@ -683,9 +1146,13 @@ const _knownBrandDomains = <String, String>{
   'feishu.cn': '飞书',
   'dingtalk.com': '钉钉',
   'gitee.com': 'Gitee',
+  'gitea.com': 'Gitea',
+  'tailscale.com': 'Tailscale',
+  'synology.com': '群晖',
+  'fnos.net': '飞牛 fnOS',
 };
 
-String _inferTitleFromUrl(String url) {
+String _inferKnownBrandFromUrl(String url) {
   if (url.isEmpty) return '';
   final uri = Uri.tryParse(url.contains('://') ? url : 'https://$url');
   final host = (uri?.host ?? '').toLowerCase();
@@ -702,20 +1169,65 @@ String _inferTitleFromUrl(String url) {
   return '';
 }
 
+const _compoundPublicSuffixes = <String>{
+  'com.cn',
+  'org.cn',
+  'net.cn',
+  'gov.cn',
+  'co.uk',
+  'org.uk',
+  'co.jp',
+  'ne.jp',
+  'com.hk',
+  'com.tw',
+  'com.sg',
+  'com.au',
+};
+
+String _inferFallbackDomainTitle(String url) {
+  if (url.isEmpty) return '';
+  final uri = Uri.tryParse(url.contains('://') ? url : 'https://$url');
+  final host = (uri?.host ?? '').toLowerCase();
+  if (host.isEmpty || host == 'localhost' || _ipOnlyRe.hasMatch(host)) {
+    return '';
+  }
+  final bareHost = host.startsWith('www.') ? host.substring(4) : host;
+  final parts = bareHost.split('.').where((p) => p.isNotEmpty).toList();
+  if (parts.length < 2) return '';
+  if (parts.length >= 3) {
+    final tail2 = '${parts[parts.length - 2]}.${parts.last}';
+    if (_compoundPublicSuffixes.contains(tail2)) {
+      return parts.sublist(parts.length - 3).join('.');
+    }
+    return tail2;
+  }
+  return bareHost;
+}
+
 final _cnHeadingPatterns = [
   RegExp(
-    r'^(?:欢迎)?(?:注册|创建)\s*([A-Za-z0-9\u4E00-\u9FFF._\- ]{2,24}?)\s*(?:账号|帐号|账户)?$',
+    r'^(?:欢迎|歡迎)?(?:注册|註冊|创建|創建|登录|登錄|登陆|登入|使用|加入)\s*([A-Za-z0-9\u4E00-\u9FFF._\- ]{2,24}?)\s*(?:账号|帳號|帐号|账户|帳戶|系统|系統|平台|控制台)?$',
   ),
-  RegExp(r'^([A-Za-z0-9\u4E00-\u9FFF._\-]{2,20})\s*(?:用户|账号|账户)?注册$'),
+  RegExp(
+    r'^([A-Za-z0-9\u4E00-\u9FFF._\-]{2,20})\s*(?:用户|用戶|账号|帳號|账户|帳戶)?(?:注册|註冊|登录|登錄|登陆|登入)$',
+  ),
 ];
 
 final _enHeadingPatterns = [
   RegExp(
-    r'^(?:sign\s*up|register)\s+(?:for|to|with)\s+([A-Za-z0-9._\- ]{2,28})$',
+    r'^(?:sign\s*up|sign\s*in|log\s*in|register)\s+(?:for|to|with|into)\s+([A-Za-z0-9._\- ]{2,28})$',
+    caseSensitive: false,
+  ),
+  RegExp(
+    r'^welcome\s+to\s+([A-Za-z0-9._\- ]{2,28})$',
     caseSensitive: false,
   ),
   RegExp(
     r'^create\s+(?:your|an?)\s+([A-Za-z0-9._\- ]{2,28}?)\s+account$',
+    caseSensitive: false,
+  ),
+  RegExp(
+    r'^([A-Za-z0-9][A-Za-z0-9._\- ]{1,24})\s+(?:login|sign\s*in|console|portal)$',
     caseSensitive: false,
   ),
 ];
@@ -735,11 +1247,26 @@ const _genericHeadingTokens = <String>{
   '账号',
   '帐号',
   '账户',
+  '您的账号',
+  '您的账户',
+  '密码',
   '用户',
   '新用户',
   '个人',
   '企业',
   '马上',
+  '系统',
+  '后台',
+  '平台',
+  '管理',
+  '控制台',
+  'sign in',
+  'log in',
+  'login',
+  'account',
+  'your account',
+  'your',
+  'the',
 };
 
 String _inferTitleFromHeadings(List<OcrBlock> sortedBlocks) {
@@ -757,7 +1284,7 @@ String _inferTitleFromHeadings(List<OcrBlock> sortedBlocks) {
         final brand = m.group(1)!.trim();
         if (brand.isNotEmpty &&
             !_isUiNoise(brand) &&
-            !_genericHeadingTokens.contains(brand)) {
+            !_genericHeadingTokens.contains(brand.toLowerCase())) {
           return brand;
         }
       }
@@ -766,7 +1293,11 @@ String _inferTitleFromHeadings(List<OcrBlock> sortedBlocks) {
       final m = re.firstMatch(norm);
       if (m != null) {
         final brand = m.group(1)!.trim();
-        if (brand.isNotEmpty && !_isUiNoise(brand)) return brand;
+        if (brand.isNotEmpty &&
+            !_isUiNoise(brand) &&
+            !_genericHeadingTokens.contains(brand.toLowerCase())) {
+          return brand;
+        }
       }
     }
   }
@@ -780,19 +1311,61 @@ class _RowItem {
   final String normalized;
 }
 
+final _inlinePairBoundaryRe = RegExp(
+  r'[ \t]+(?=[A-Za-z\u4E00-\u9FFF][A-Za-z0-9\u4E00-\u9FFF\s/\-（）\(\)]{0,18}[：:=])',
+);
+
+List<String> _splitPartsIfMultiPair(String norm) {
+  final wideParts = norm.split(RegExp(r'\s{2,}|\s+[|｜]\s+'));
+  if (wideParts.length >= 2) {
+    var pairCount = 0;
+    for (final part in wideParts) {
+      final inline = _splitInlineLabelValue(part);
+      if (inline != null && _classifyLabel(inline.label) != _FieldKind.none) {
+        pairCount++;
+      }
+    }
+    if (pairCount >= 2) return wideParts;
+  }
+
+  final boundaryMatches = _inlinePairBoundaryRe.allMatches(norm).toList();
+  if (boundaryMatches.isEmpty) return const [];
+  final cuts = <int>[0];
+  for (final m in boundaryMatches) {
+    final suffix = norm.substring(m.end);
+    final inline = _splitInlineLabelValue(suffix);
+    if (inline != null &&
+        _classifyLabel(inline.label) != _FieldKind.none &&
+        inline.value.isNotEmpty) {
+      cuts.add(m.end);
+    }
+  }
+  if (cuts.length < 2) return const [];
+  final parts = <String>[];
+  for (var i = 0; i < cuts.length; i++) {
+    final start = cuts[i];
+    final end = i + 1 < cuts.length ? cuts[i + 1] : norm.length;
+    final segment = norm.substring(start, end).trim();
+    if (segment.isNotEmpty) parts.add(segment);
+  }
+  if (parts.length < 2) return const [];
+  var validCount = 0;
+  for (final part in parts) {
+    final inline = _splitInlineLabelValue(part);
+    if (inline != null &&
+        _classifyLabel(inline.label) != _FieldKind.none &&
+        inline.value.isNotEmpty) {
+      validCount++;
+    }
+  }
+  return validCount >= 2 ? parts : const [];
+}
+
 List<OcrBlock> _splitMultiPairBlock(OcrBlock block) {
   final norm = normalizeCjkSpacing(block.text);
   if (norm.isEmpty) return const [];
-  final parts = norm.split(RegExp(r'\s{2,}'));
+  final parts = _splitPartsIfMultiPair(norm);
   if (parts.length < 2) return [block];
-  var pairCount = 0;
-  for (final part in parts) {
-    final inline = _splitInlineLabelValue(part);
-    if (inline != null && _classifyLabel(inline.label) != _FieldKind.none) {
-      pairCount++;
-    }
-  }
-  if (pairCount < 2) return [block];
   final result = <OcrBlock>[];
   final totalLen = math.max(norm.length, 1);
   var offset = 0;
@@ -864,6 +1437,28 @@ List<List<_RowItem>> _groupIntoRows(List<OcrBlock> blocks) {
   return rows;
 }
 
+bool _isBoilerplateUrl(String url) {
+  final uri = Uri.tryParse(url.contains('://') ? url : 'https://$url');
+  final host = (uri?.host ?? '').toLowerCase();
+  if (host.isEmpty) return false;
+  return host == 'beian.miit.gov.cn' ||
+      host.endsWith('.beian.miit.gov.cn') ||
+      host == 'miit.gov.cn' ||
+      host == 'w3.org' ||
+      host == 'www.w3.org' ||
+      host == 'schema.org';
+}
+
+bool _isPolicyUrl(String url) {
+  final uri = Uri.tryParse(url.contains('://') ? url : 'https://$url');
+  final path = (uri?.path ?? '').toLowerCase();
+  return path.contains('/privacy') ||
+      path.contains('/terms') ||
+      path.contains('/legal') ||
+      path.contains('/help') ||
+      path.contains('/agreement');
+}
+
 /// Parses account credentials (title/source, username, password, URL) from
 /// OCR blocks detected on a registration or account-setup screenshot.
 ParsedCredential parseCredentialFromOcr(List<OcrBlock> blocks) {
@@ -886,6 +1481,8 @@ ParsedCredential parseCredentialFromOcr(List<OcrBlock> blocks) {
   var confirmPassword = '';
   var url = '';
   var passwordMasked = false;
+  OcrBlock? usernameBlock;
+  OcrBlock? passwordBlock;
 
   final excludedTexts = <String>{};
   final consumedIds = <int>{};
@@ -896,6 +1493,7 @@ ParsedCredential parseCredentialFromOcr(List<OcrBlock> blocks) {
     if (trimmed.isEmpty ||
         isMaskedPasswordText(trimmed) ||
         _isUiNoise(trimmed) ||
+        _standaloneSeparatorRe.hasMatch(trimmed) ||
         _classifyLabel(trimmed) != _FieldKind.none) {
       return;
     }
@@ -908,6 +1506,7 @@ ParsedCredential parseCredentialFromOcr(List<OcrBlock> blocks) {
     _FieldKind kind,
     String rawValue, {
     bool fromInline = false,
+    OcrBlock? sourceBlock,
   }) {
     final trimmed = rawValue.trim();
     if (trimmed.isEmpty) return;
@@ -923,35 +1522,55 @@ ParsedCredential parseCredentialFromOcr(List<OcrBlock> blocks) {
       return;
     }
 
-    if (_isUiNoise(trimmed)) return;
+    if (_isUiNoise(trimmed) || _standaloneSeparatorRe.hasMatch(trimmed)) return;
     if (!fromInline && _classifyLabel(trimmed) != _FieldKind.none) return;
 
     switch (kind) {
       case _FieldKind.title:
-        if (title.isEmpty) title = normalizeCjkSpacing(trimmed);
-        addCandidate(normalizeCjkSpacing(trimmed));
+        final cleanTitle = normalizeCjkSpacing(trimmed);
+        if (title.isEmpty) title = cleanTitle;
+        addCandidate(cleanTitle);
       case _FieldKind.url:
-        final parsedUrl = _extractUrlCandidate(trimmed) ?? trimmed;
+        final cleanedRawUrl = _stripInlineActionSuffix(trimmed);
+        final parsedUrl = _extractUrlCandidate(cleanedRawUrl) ?? cleanedRawUrl;
+        if (parsedUrl.isEmpty) return;
         if (url.isEmpty) url = parsedUrl;
         addCandidate(parsedUrl);
       case _FieldKind.username:
-        final cleanUser = trimmed.split(RegExp(r'\s+')).length == 1
-            ? trimmed
-            : (_extractEmailCandidate(trimmed) ??
-                  _extractPhoneCandidate(trimmed) ??
-                  trimmed);
-        if (username.isEmpty) username = cleanUser;
+        final stripped = _stripInlineActionSuffix(trimmed);
+        if (stripped.isEmpty || _isUiNoise(stripped)) return;
+        final cleanUser = stripped.split(RegExp(r'\s+')).length == 1
+            ? stripped
+            : (_extractEmailCandidate(stripped) ??
+                  _extractPhoneCandidate(stripped) ??
+                  stripped);
+        if (username.isEmpty) {
+          username = cleanUser;
+          usernameBlock = sourceBlock;
+        }
         addCandidate(cleanUser);
       case _FieldKind.password:
         final cleanPwd = _normalizePasswordToken(trimmed);
-        if (password.isEmpty && !isMaskedPasswordText(cleanPwd)) {
+        if (cleanPwd.isEmpty) return;
+        if (isMaskedPasswordText(cleanPwd)) {
+          passwordMasked = true;
+          return;
+        }
+        if (password.isEmpty) {
           password = cleanPwd;
+          passwordBlock = sourceBlock;
           addCandidate(cleanPwd);
         }
       case _FieldKind.confirmPassword:
         final cleanPwd = _normalizePasswordToken(trimmed);
-        if (confirmPassword.isEmpty && !isMaskedPasswordText(cleanPwd)) {
+        if (cleanPwd.isEmpty) return;
+        if (isMaskedPasswordText(cleanPwd)) {
+          passwordMasked = true;
+          return;
+        }
+        if (confirmPassword.isEmpty) {
           confirmPassword = cleanPwd;
+          passwordBlock ??= sourceBlock;
           addCandidate(cleanPwd);
         }
       case _FieldKind.captcha:
@@ -973,7 +1592,12 @@ ParsedCredential parseCredentialFromOcr(List<OcrBlock> blocks) {
         if (kind != _FieldKind.none) {
           consumedIds.add(itemKey(r, c));
           if (inline.value.isNotEmpty) {
-            assignValue(kind, inline.value, fromInline: true);
+            assignValue(
+              kind,
+              inline.value,
+              fromInline: true,
+              sourceBlock: item.block,
+            );
             continue;
           }
         }
@@ -983,51 +1607,87 @@ ParsedCredential parseCredentialFromOcr(List<OcrBlock> blocks) {
       if (kind == _FieldKind.none) continue;
       consumedIds.add(itemKey(r, c));
 
-      // Strategy B: right neighbor in the same visual row.
+      // Strategy B: right neighbor in the same visual row (skipping lone separators).
       var matchedRight = false;
-      if (c + 1 < row.length) {
-        final rightItem = row[c + 1];
-        if (_classifyLabel(rightItem.normalized) == _FieldKind.none &&
-            _splitInlineLabelValue(rightItem.normalized) == null) {
-          consumedIds.add(itemKey(r, c + 1));
-          if (kind == _FieldKind.captcha) {
-            excludedTexts.add(rightItem.normalized);
-            matchedRight = true;
-          } else if (isMaskedPasswordText(rightItem.normalized) &&
-              (kind == _FieldKind.password ||
-                  kind == _FieldKind.confirmPassword)) {
-            passwordMasked = true;
-            matchedRight = true;
-          } else if (!_isUiNoise(rightItem.normalized)) {
-            assignValue(kind, rightItem.normalized);
-            matchedRight = true;
-          }
+      for (var nc = c + 1; nc < row.length; nc++) {
+        final rightItem = row[nc];
+        if (rightItem.block.x - item.block.right > 0.42) break;
+        if (_classifyLabel(rightItem.normalized) != _FieldKind.none ||
+            _splitInlineLabelValue(rightItem.normalized) != null) {
+          break;
         }
+        if (_standaloneSeparatorRe.hasMatch(rightItem.normalized)) {
+          consumedIds.add(itemKey(r, nc));
+          continue;
+        }
+        if (kind == _FieldKind.captcha) {
+          consumedIds.add(itemKey(r, nc));
+          excludedTexts.add(rightItem.normalized);
+          matchedRight = true;
+          break;
+        }
+        if (isMaskedPasswordText(rightItem.normalized) &&
+            (kind == _FieldKind.password ||
+                kind == _FieldKind.confirmPassword)) {
+          consumedIds.add(itemKey(r, nc));
+          passwordMasked = true;
+          matchedRight = true;
+          break;
+        }
+        if (_isUiNoise(rightItem.normalized)) {
+          break;
+        }
+        consumedIds.add(itemKey(r, nc));
+        assignValue(kind, rightItem.normalized, sourceBlock: rightItem.block);
+        matchedRight = true;
+        break;
       }
       if (matchedRight) continue;
 
-      // Strategy C: below neighbor in the next row (stacked form inputs).
-      if (r + 1 < rows.length) {
-        final nextRow = rows[r + 1];
+      // Strategy C: below neighbor in the next 1-2 rows (stacked form inputs,
+      // allowing a helper hint or action link row in between if not another field).
+      for (var rowOffset = 1; rowOffset <= 2; rowOffset++) {
+        final targetRowIdx = r + rowOffset;
+        if (targetRowIdx >= rows.length) break;
+
+        if (rowOffset == 2) {
+          final interveningRow = rows[r + 1];
+          final hasAlignedNextLabel = interveningRow.any((cand) {
+            final isLabel =
+                _classifyLabel(cand.normalized) != _FieldKind.none ||
+                _splitInlineLabelValue(cand.normalized) != null;
+            if (!isLabel) return false;
+            return cand.block.right >= item.block.x - 0.08 &&
+                cand.block.x <= item.block.right + 0.35;
+          });
+          if (hasAlignedNextLabel) break;
+        }
+
+        final nextRow = rows[targetRowIdx];
         _RowItem? bestBelow;
         var bestScore = double.infinity;
         var bestCol = -1;
+        final maxGap = math.max(
+          item.block.h * (rowOffset == 1 ? 4.5 : 6.5),
+          rowOffset == 1 ? 0.16 : 0.22,
+        );
         for (var nc = 0; nc < nextRow.length; nc++) {
-          if (consumedIds.contains(itemKey(r + 1, nc))) continue;
+          if (consumedIds.contains(itemKey(targetRowIdx, nc))) continue;
           final cand = nextRow[nc];
           final vGap = cand.block.y - item.block.bottom;
-          final maxGap = math.max(item.block.h * 4.5, 0.16);
           if (vGap > maxGap || vGap < -0.02) continue;
 
           if (_classifyLabel(cand.normalized) != _FieldKind.none ||
-              _splitInlineLabelValue(cand.normalized) != null) {
+              _splitInlineLabelValue(cand.normalized) != null ||
+              _standaloneSeparatorRe.hasMatch(cand.normalized)) {
             continue;
           }
 
           final hDist = (cand.block.x - item.block.x).abs();
           final overlapsHorizontally =
               cand.block.right >= item.block.x - 0.08 &&
-              cand.block.x <= item.block.right + 0.35;
+              cand.block.x <=
+                  math.max(item.block.right + 0.35, item.block.x + 0.45);
           if (!overlapsHorizontally && nextRow.length > 1) continue;
           if (hDist < bestScore) {
             bestScore = hDist;
@@ -1038,16 +1698,23 @@ ParsedCredential parseCredentialFromOcr(List<OcrBlock> blocks) {
 
         if (bestBelow != null && bestCol >= 0) {
           if (kind == _FieldKind.captcha) {
-            consumedIds.add(itemKey(r + 1, bestCol));
+            consumedIds.add(itemKey(targetRowIdx, bestCol));
             excludedTexts.add(bestBelow.normalized);
+            break;
           } else if (isMaskedPasswordText(bestBelow.normalized) &&
               (kind == _FieldKind.password ||
                   kind == _FieldKind.confirmPassword)) {
-            consumedIds.add(itemKey(r + 1, bestCol));
+            consumedIds.add(itemKey(targetRowIdx, bestCol));
             passwordMasked = true;
+            break;
           } else if (!_isUiNoise(bestBelow.normalized)) {
-            consumedIds.add(itemKey(r + 1, bestCol));
-            assignValue(kind, bestBelow.normalized);
+            consumedIds.add(itemKey(targetRowIdx, bestCol));
+            assignValue(
+              kind,
+              bestBelow.normalized,
+              sourceBlock: bestBelow.block,
+            );
+            break;
           }
         }
       }
@@ -1060,24 +1727,41 @@ ParsedCredential parseCredentialFromOcr(List<OcrBlock> blocks) {
 
   // Pass 2: fallback heuristics when labels were absent or missed by OCR.
   if (url.isEmpty) {
-    for (final row in rows) {
-      for (final item in row) {
+    String? bestUrl;
+    var bestUrlScore = double.negativeInfinity;
+    for (var r = 0; r < rows.length; r++) {
+      for (final item in rows[r]) {
         if (excludedTexts.contains(item.normalized)) continue;
         final candidate = _extractUrlCandidate(item.normalized);
-        if (candidate != null) {
-          url = candidate;
-          addCandidate(candidate);
-          break;
+        if (candidate == null || _isBoilerplateUrl(candidate)) continue;
+        var score = 0.0 - r * 0.01;
+        if (item.block.y <= 0.16) {
+          score += 35.0;
+        } else if (item.block.y < 0.82) {
+          score += 10.0;
+        }
+        final lowerRaw = item.normalized.toLowerCase();
+        if (lowerRaw.contains('https://') || lowerRaw.contains('http://')) {
+          score += 15.0;
+        }
+        if (!_isPolicyUrl(candidate)) {
+          score += 12.0;
+        }
+        if (score > bestUrlScore) {
+          bestUrlScore = score;
+          bestUrl = candidate;
         }
       }
-      if (url.isNotEmpty) break;
+    }
+    if (bestUrl != null) {
+      url = bestUrl;
+      addCandidate(bestUrl);
     }
   }
 
   int? usernameRowIdx;
   if (username.isEmpty) {
-    String? fallbackGenericEmail;
-    int? genericEmailRowIdx;
+    final emailCandidates = <({String email, int rowIdx, OcrBlock block, double score})>[];
     for (var r = 0; r < rows.length; r++) {
       for (final item in rows[r]) {
         if (excludedTexts.contains(item.normalized) ||
@@ -1085,29 +1769,39 @@ ParsedCredential parseCredentialFromOcr(List<OcrBlock> blocks) {
           continue;
         }
         final email = _extractEmailCandidate(item.normalized);
-        if (email != null) {
-          if (_isGenericServiceEmail(email)) {
-            fallbackGenericEmail ??= email;
-            genericEmailRowIdx ??= r;
-          } else {
-            username = email;
-            usernameRowIdx = r;
-            addCandidate(email);
-            break;
-          }
+        if (email == null) continue;
+        var score = _isGenericServiceEmail(email) ? -50.0 : 20.0;
+        if (passwordBlock != null) {
+          final dy = passwordBlock!.centerY - item.block.centerY;
+          if (dy >= -0.02 && dy <= 0.28) score += 25.0 - dy * 30.0;
+          if ((item.block.x - passwordBlock!.x).abs() <= 0.28) score += 15.0;
+        } else {
+          if (item.block.x >= 0.10 && item.block.right <= 0.90) score += 8.0;
+          score -= r * 0.05;
         }
+        emailCandidates.add((
+          email: email,
+          rowIdx: r,
+          block: item.block,
+          score: score,
+        ));
       }
-      if (username.isNotEmpty) break;
     }
-    if (username.isEmpty && fallbackGenericEmail != null) {
-      username = fallbackGenericEmail;
-      usernameRowIdx = genericEmailRowIdx;
-      addCandidate(fallbackGenericEmail);
+    if (emailCandidates.isNotEmpty) {
+      emailCandidates.sort((a, b) => b.score.compareTo(a.score));
+      final chosen = emailCandidates.first;
+      username = chosen.email;
+      usernameRowIdx = chosen.rowIdx;
+      usernameBlock = chosen.block;
+      addCandidate(chosen.email);
     }
   } else {
     for (var r = 0; r < rows.length; r++) {
       if (rows[r].any((item) => item.normalized.contains(username))) {
         usernameRowIdx = r;
+        usernameBlock ??= rows[r]
+            .firstWhere((item) => item.normalized.contains(username))
+            .block;
         break;
       }
     }
@@ -1124,6 +1818,7 @@ ParsedCredential parseCredentialFromOcr(List<OcrBlock> blocks) {
         if (phone != null) {
           username = phone;
           usernameRowIdx = r;
+          usernameBlock = item.block;
           addCandidate(phone);
           break;
         }
@@ -1143,47 +1838,76 @@ ParsedCredential parseCredentialFromOcr(List<OcrBlock> blocks) {
   }
 
   if (password.isEmpty && !passwordMasked) {
-    final searchOrder = <int>{
-      if (usernameRowIdx != null && usernameRowIdx + 1 < rows.length)
-        usernameRowIdx + 1,
-      if (usernameRowIdx != null && usernameRowIdx + 2 < rows.length)
-        usernameRowIdx + 2,
-      for (var r = 0; r < rows.length; r++) r,
-    };
-    for (final r in searchOrder) {
+    String? bestPassword;
+    var bestPasswordScore = double.negativeInfinity;
+    for (var r = 0; r < rows.length; r++) {
       for (var c = 0; c < rows[r].length; c++) {
         final item = rows[r][c];
-        final token = item.normalized.trim();
-        if (token == username ||
-            token == url ||
-            token == title ||
-            excludedTexts.contains(token)) {
+        final rawTrimmed = item.normalized.trim();
+        final normalizedToken = _normalizePasswordToken(rawTrimmed);
+        if (normalizedToken.isEmpty ||
+            normalizedToken == username ||
+            rawTrimmed == username ||
+            normalizedToken == url ||
+            rawTrimmed == url ||
+            normalizedToken == title ||
+            excludedTexts.contains(rawTrimmed) ||
+            excludedTexts.contains(normalizedToken)) {
           continue;
         }
-        if (_looksLikePasswordToken(token)) {
-          password = token;
-          addCandidate(token);
-          break;
+        if (!_looksLikePasswordToken(rawTrimmed)) continue;
+
+        var score = 0.0 - r * 0.01;
+        if (usernameBlock != null) {
+          final dy = item.block.centerY - usernameBlock!.centerY;
+          final dx = (item.block.x - usernameBlock!.x).abs();
+          if (dy >= -0.01 && dy <= 0.25 && dx <= 0.28) {
+            score += 45.0 - dy * 40.0 - dx * 20.0;
+          } else if (dy.abs() <= 0.03 && item.block.x > usernameBlock!.x) {
+            score += 28.0;
+          }
+        } else if (usernameRowIdx != null &&
+            (r == usernameRowIdx + 1 || r == usernameRowIdx + 2)) {
+          score += 22.0;
+        }
+        if (item.block.x >= 0.12 && item.block.right <= 0.88) {
+          score += 8.0;
+        }
+        if (RegExp(r'[^a-zA-Z0-9]').hasMatch(normalizedToken)) {
+          score += 5.0;
+        }
+        if (score > bestPasswordScore) {
+          bestPasswordScore = score;
+          bestPassword = normalizedToken;
         }
       }
-      if (password.isNotEmpty) break;
+    }
+    if (bestPassword != null) {
+      password = bestPassword;
+      addCandidate(bestPassword);
     }
   }
 
-  // Pass 3: infer title only from a clear domain/brand or registration heading.
+  // Pass 3: infer title from known domain brand, clear headings, or fallback host.
   if (title.isEmpty && url.isNotEmpty) {
-    title = _inferTitleFromUrl(url);
+    title = _inferKnownBrandFromUrl(url);
   }
   if (title.isEmpty) {
     title = _inferTitleFromHeadings(flatBlocks);
+  }
+  if (title.isEmpty && url.isNotEmpty) {
+    title = _inferFallbackDomainTitle(url);
   }
 
   // Collect remaining clean text fragments as quick-assign candidate chips.
   for (final row in rows) {
     for (final item in row) {
       final inline = _splitInlineLabelValue(item.normalized);
-      final piece = inline != null ? inline.value : item.normalized;
-      if (excludedTexts.contains(piece)) continue;
+      final rawPiece = inline != null ? inline.value : item.normalized;
+      final piece = _stripInlineActionSuffix(rawPiece);
+      if (excludedTexts.contains(rawPiece) || excludedTexts.contains(piece)) {
+        continue;
+      }
       addCandidate(piece);
       if (candidateValues.length >= 16) break;
     }
@@ -1201,43 +1925,69 @@ ParsedCredential parseCredentialFromOcr(List<OcrBlock> blocks) {
   );
 }
 
-const _fullWidthPasswordMap = <int, String>{
-  0xFF01: '!', // ！
-  0xFF20: '@', // ＠
-  0xFF03: '#', // ＃
-  0xFF04: r'$', // ＄
-  0xFF05: '%', // ％
-  0xFF06: '&', // ＆
-  0xFF0A: '*', // ＊
-  0xFF08: '(', // （
-  0xFF09: ')', // ）
-  0xFF0D: '-', // －
-  0xFF3F: '_', // ＿
-  0xFF0B: '+', // ＋
-  0xFF1D: '=', // ＝
-  0xFF1F: '?', // ？
-  0xFF0E: '.', // ．
-  0xFF0C: ',', // ，
-  0xFF1A: ':', // ：
-  0xFF1B: ';', // ；
+const _fullWidthOffset = 0xFEE0;
+const _homoglyphPasswordMap = <int, String>{
+  0x0410: 'A', // Cyrillic А
+  0x0412: 'B', // Cyrillic В
+  0x0421: 'C', // Cyrillic С
+  0x0415: 'E', // Cyrillic Е
+  0x041D: 'H', // Cyrillic Н
+  0x041A: 'K', // Cyrillic К
+  0x041C: 'M', // Cyrillic М
+  0x041E: 'O', // Cyrillic О
+  0x0420: 'P', // Cyrillic Р
+  0x0422: 'T', // Cyrillic Т
+  0x0425: 'X', // Cyrillic Х
+  0x0406: 'I', // Cyrillic І
+  0x0408: 'J', // Cyrillic Ј
+  0x0405: 'S', // Cyrillic Ѕ
+  0x0430: 'a', // Cyrillic а
+  0x0441: 'c', // Cyrillic с
+  0x0435: 'e', // Cyrillic е
+  0x043E: 'o', // Cyrillic о
+  0x0440: 'p', // Cyrillic р
+  0x0445: 'x', // Cyrillic х
+  0x0443: 'y', // Cyrillic у
+  0x0456: 'i', // Cyrillic і
+  0x0455: 's', // Cyrillic ѕ
+  0x0391: 'A', // Greek Α
+  0x0392: 'B', // Greek Β
+  0x0395: 'E', // Greek Ε
+  0x0396: 'Z', // Greek Ζ
+  0x0397: 'H', // Greek Η
+  0x0399: 'I', // Greek Ι
+  0x039A: 'K', // Greek Κ
+  0x039C: 'M', // Greek Μ
+  0x039D: 'N', // Greek Ν
+  0x039F: 'O', // Greek Ο
+  0x03A1: 'P', // Greek Ρ
+  0x03A4: 'T', // Greek Τ
+  0x03A7: 'X', // Greek Χ
+  0x03BF: 'o', // Greek ο
 };
 
 /// OCR engines configured for Chinese+English occasionally emit full-width
-/// punctuation adjacent to CJK labels (e.g. `密码：Abc#7890Xy！`). Normalize
-/// full-width ASCII symbols back to ASCII when the password is ASCII-based.
+/// punctuation/letters (e.g. `密码：Abc#7890Xy！`) or Cyrillic/Greek lookalikes
+/// (e.g. `Х` U+0425 instead of `X`). Strip inline button suffixes first, then
+/// normalize ASCII-based passwords back to clean ASCII.
 String _normalizePasswordToken(String value) {
-  final trimmed = value.trim();
-  if (trimmed.isEmpty) return '';
-  final hasAsciiAlphaNum = RegExp(r'[A-Za-z0-9]').hasMatch(trimmed);
-  final hasHanzi = RegExp(_cjkPattern).hasMatch(trimmed);
-  if (!hasAsciiAlphaNum || hasHanzi) return trimmed;
+  final cleaned = _stripInlineActionSuffix(value).trim();
+  if (cleaned.isEmpty) return '';
+  final hasAlphaNum = RegExp(r'[A-Za-z0-9\uFF10-\uFF19\uFF21-\uFF3A\uFF41-\uFF5A]')
+      .hasMatch(cleaned);
+  final hasHanzi = RegExp(_cjkPattern).hasMatch(cleaned);
+  if (!hasAlphaNum || hasHanzi) return cleaned;
   final out = StringBuffer();
-  for (final rune in trimmed.runes) {
-    final mapped = _fullWidthPasswordMap[rune];
-    if (mapped != null) {
-      out.write(mapped);
+  for (final rune in cleaned.runes) {
+    if (rune >= 0xFF01 && rune <= 0xFF5E) {
+      out.writeCharCode(rune - _fullWidthOffset);
     } else {
-      out.writeCharCode(rune);
+      final mapped = _homoglyphPasswordMap[rune];
+      if (mapped != null) {
+        out.write(mapped);
+      } else {
+        out.writeCharCode(rune);
+      }
     }
   }
   return out.toString();

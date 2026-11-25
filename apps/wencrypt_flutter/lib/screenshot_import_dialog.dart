@@ -110,6 +110,7 @@ class _ScreenshotImportViewState extends State<_ScreenshotImportView> {
   late PasswordGeneratorOptions _generatorOptions;
   Uint8List? _imageBytes;
   ParsedCredential? _parsed;
+  bool _checkingClipboard = false;
   bool _recognizing = false;
   bool _revealPassword = true;
   bool _showReview = false;
@@ -179,18 +180,37 @@ class _ScreenshotImportViewState extends State<_ScreenshotImportView> {
       await _processImageBytes(Uint8List.fromList(initial));
       return;
     }
+    setState(() => _checkingClipboard = true);
     try {
-      final clipBytes = await widget.ocrService.readClipboardImage();
+      final result = await widget.ocrService.readAndRecognizeClipboardImage();
       if (!mounted) return;
-      if (clipBytes != null && clipBytes.isNotEmpty) {
-        await _processImageBytes(clipBytes);
+      _checkingClipboard = false;
+      if (result != null) {
+        final parsed = parseCredentialFromOcr(result.recognition.blocks);
+        _wipeImageBytes();
+        setState(() {
+          _imageBytes = result.imageBytes;
+          _applyParsedCredential(parsed, replacePrevious: false);
+        });
+      } else {
+        setState(() {});
       }
     } catch (_) {
-      // Leave landing view ready for manual paste or file selection.
+      if (mounted) {
+        setState(() => _checkingClipboard = false);
+      }
     }
   }
 
-  void _applyParsedCredential(ParsedCredential parsed) {
+  void _applyParsedCredential(
+    ParsedCredential parsed, {
+    bool replacePrevious = true,
+  }) {
+    if (replacePrevious) {
+      _controllers['username']!.text = '';
+      _controllers['password']!.text = '';
+      _controllers['url']!.text = '';
+    }
     final currentTitle = _controllers['title']!.text.trim();
     if (parsed.title.isNotEmpty) {
       _controllers['title']!.text = parsed.title;
@@ -224,6 +244,7 @@ class _ScreenshotImportViewState extends State<_ScreenshotImportView> {
       bytes.fillRange(0, bytes.length, 0);
       return;
     }
+    final hadPrevious = _parsed != null;
     _wipeImageBytes();
     setState(() {
       _imageBytes = bytes;
@@ -237,7 +258,7 @@ class _ScreenshotImportViewState extends State<_ScreenshotImportView> {
       final parsed = parseCredentialFromOcr(result.blocks);
       setState(() {
         _recognizing = false;
-        _applyParsedCredential(parsed);
+        _applyParsedCredential(parsed, replacePrevious: hadPrevious);
       });
     } catch (error) {
       if (!mounted) return;
@@ -250,18 +271,31 @@ class _ScreenshotImportViewState extends State<_ScreenshotImportView> {
   }
 
   Future<void> _pasteFromClipboard() async {
-    if (_recognizing) return;
-    setState(() => _error = null);
+    if (_recognizing || _checkingClipboard) return;
+    final hadPrevious = _parsed != null;
+    setState(() {
+      _error = null;
+      _recognizing = true;
+    });
     try {
-      final image = await widget.ocrService.readClipboardImage();
+      final result = await widget.ocrService.readAndRecognizeClipboardImage();
       if (!mounted) return;
-      if (image != null && image.isNotEmpty) {
-        await _processImageBytes(image);
+      if (result != null) {
+        final parsed = parseCredentialFromOcr(result.recognition.blocks);
+        _wipeImageBytes();
+        setState(() {
+          _recognizing = false;
+          _imageBytes = result.imageBytes;
+          _applyParsedCredential(parsed, replacePrevious: hadPrevious);
+        });
         return;
       }
     } catch (error) {
       if (!mounted) return;
-      setState(() => _error = ScreenshotOcrService.friendlyError(error));
+      setState(() {
+        _recognizing = false;
+        _error = ScreenshotOcrService.friendlyError(error);
+      });
       return;
     }
 
@@ -273,19 +307,22 @@ class _ScreenshotImportViewState extends State<_ScreenshotImportView> {
       if (!parsed.isEmpty || parsed.rawLines.isNotEmpty) {
         _wipeImageBytes();
         setState(() {
-          _applyParsedCredential(parsed);
+          _recognizing = false;
+          _applyParsedCredential(parsed, replacePrevious: hadPrevious);
         });
         return;
       }
     }
 
     setState(() {
+      _recognizing = false;
       _error = '剪贴板中暂无截图或账号文本，请先截图或直接选择图片文件。';
     });
   }
 
   Future<void> _importClipboardText() async {
-    if (_recognizing) return;
+    if (_recognizing || _checkingClipboard) return;
+    final hadPrevious = _parsed != null;
     final clipText =
         (await Clipboard.getData(Clipboard.kTextPlain))?.text?.trim() ?? '';
     if (!mounted) return;
@@ -296,12 +333,17 @@ class _ScreenshotImportViewState extends State<_ScreenshotImportView> {
     _wipeImageBytes();
     setState(() {
       _error = null;
-      _applyParsedCredential(parseCredentialFromText(clipText));
+      _applyParsedCredential(
+        parseCredentialFromText(clipText),
+        replacePrevious: hadPrevious,
+      );
     });
   }
 
   Future<void> _pickImageFile() async {
-    if (_recognizing || widget.onPickImageFile == null) return;
+    if (_recognizing || _checkingClipboard || widget.onPickImageFile == null) {
+      return;
+    }
     setState(() => _error = null);
     try {
       final bytes = await widget.onPickImageFile!();
@@ -561,10 +603,20 @@ class _ScreenshotImportViewState extends State<_ScreenshotImportView> {
                   width: double.infinity,
                   height: mobile ? 46 : 38,
                   child: FilledButton.icon(
-                    onPressed: _recognizing ? null : _pasteFromClipboard,
-                    icon: const Icon(Icons.content_paste_rounded, size: 17),
+                    onPressed: (_recognizing || _checkingClipboard)
+                        ? null
+                        : _pasteFromClipboard,
+                    icon: (_recognizing || _checkingClipboard)
+                        ? const SizedBox(
+                            width: 15,
+                            height: 15,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.content_paste_rounded, size: 17),
                     label: Text(
-                      mobile ? '粘贴剪贴板截图' : '粘贴剪贴板截图 ($pasteShortcut)',
+                      _checkingClipboard
+                          ? '正在检测剪贴板截图…'
+                          : (mobile ? '粘贴剪贴板截图' : '粘贴剪贴板截图 ($pasteShortcut)'),
                     ),
                   ),
                 ),
@@ -620,7 +672,12 @@ class _ScreenshotImportViewState extends State<_ScreenshotImportView> {
                       width: mobile ? 84 : 96,
                       height: mobile ? 84 : 76,
                       color: c.surfaceSunken,
-                      child: Image.memory(imageBytes, fit: BoxFit.cover),
+                      child: Image.memory(
+                        imageBytes,
+                        fit: BoxFit.cover,
+                        cacheWidth: 256,
+                        filterQuality: FilterQuality.medium,
+                      ),
                     ),
                   ),
                 ),
@@ -960,7 +1017,7 @@ class _ScreenshotImportViewState extends State<_ScreenshotImportView> {
     final bodyWithPasteShortcut = CallbackShortcuts(
       bindings: {
         SingleActivator(LogicalKeyboardKey.keyV, meta: mac, control: !mac): () {
-          if (!_hasAnyFieldFocus && !_recognizing) {
+          if (!_hasAnyFieldFocus && !_recognizing && !_checkingClipboard) {
             unawaited(_pasteFromClipboard());
           }
         },

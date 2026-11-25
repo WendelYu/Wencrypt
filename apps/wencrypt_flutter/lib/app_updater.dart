@@ -6,7 +6,7 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
-const String kDefaultAppVersion = '0.3.10';
+const String kDefaultAppVersion = '0.3.11';
 const String kGitHubOwner = 'WendelYu';
 const String kGitHubRepo = 'Wencrypt';
 const String kGitHubReleasesUrl =
@@ -582,7 +582,7 @@ class AppUpdateController extends ChangeNotifier {
     UpdateStatus status = UpdateStatus.upToDate,
     bool autoCheckEnabled = true,
     String dataDirectoryPath = '/preview/org.wencrypt.wencrypt',
-    String installPath = '/Applications/wencrypt.app',
+    String installPath = '/Applications/Wencrypt.app',
     bool canAutoInstall = true,
     bool isSandboxed = false,
     UpdateReleaseInfo? latestRelease,

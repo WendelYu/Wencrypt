@@ -152,10 +152,43 @@ class MainFlutterWindow: NSWindow {
       guard let self else { result(FlutterMethodNotImplemented); return }
       switch call.method {
       case "readClipboardImage":
-        if let bytes = ScreenshotOcr.readClipboardImage() {
-          result(FlutterStandardTypedData(bytes: bytes))
-        } else {
+        guard let raw = ScreenshotOcr.readRawClipboardImageData() else {
           result(nil)
+          return
+        }
+        self.ocrQueue.async {
+          let bytes = ScreenshotOcr.encodeClipboardImageForTransfer(raw)
+          DispatchQueue.main.async {
+            if let bytes, !bytes.isEmpty {
+              result(FlutterStandardTypedData(bytes: bytes))
+            } else {
+              result(nil)
+            }
+          }
+        }
+      case "readAndRecognizeClipboardImage":
+        guard let raw = ScreenshotOcr.readRawClipboardImageData() else {
+          result(["hasImage": false])
+          return
+        }
+        self.ocrQueue.async {
+          do {
+            let output = try ScreenshotOcr.recognizeAndPreview(raw)
+            DispatchQueue.main.async {
+              var payload = output.ocr
+              payload["hasImage"] = true
+              payload["image"] = FlutterStandardTypedData(bytes: output.preview)
+              result(payload)
+            }
+          } catch ScreenshotOcrError.invalidImage {
+            DispatchQueue.main.async {
+              result(FlutterError(code: "invalid_image", message: nil, details: nil))
+            }
+          } catch {
+            DispatchQueue.main.async {
+              result(FlutterError(code: "ocr_failed", message: nil, details: nil))
+            }
+          }
         }
       case "recognizeImage":
         guard let typed = call.arguments as? FlutterStandardTypedData, !typed.data.isEmpty else {
@@ -326,5 +359,11 @@ class MainFlutterWindow: NSWindow {
     }
 
     super.awakeFromNib()
+
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+      self?.ocrQueue.async {
+        ScreenshotOcr.warmUpIfNeeded()
+      }
+    }
   }
 }

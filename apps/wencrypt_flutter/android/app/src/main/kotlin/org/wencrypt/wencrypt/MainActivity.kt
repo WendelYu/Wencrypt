@@ -127,6 +127,7 @@ class MainActivity : FlutterFragmentActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        ScreenshotOcr.warmUp()
         inviteChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "org.wencrypt.invite").apply {
             setMethodCallHandler { call, result ->
                 when (call.method) {
@@ -228,6 +229,20 @@ class MainActivity : FlutterFragmentActivity() {
                             }
                         }.start()
                     }
+                    "readAndRecognizeClipboardImage" -> {
+                        ScreenshotOcr.readAndRecognizeClipboardImage(
+                            applicationContext,
+                            onEmpty = {
+                                runOnUiThread { result.success(mapOf("hasImage" to false)) }
+                            },
+                            onSuccess = { output ->
+                                runOnUiThread { result.success(output) }
+                            },
+                            onError = { code ->
+                                runOnUiThread { result.error(code, null, null) }
+                            },
+                        )
+                    }
                     "recognizeImage" -> {
                         val bytes = call.arguments as? ByteArray
                         if (bytes == null || bytes.isEmpty()) {
@@ -258,7 +273,7 @@ class MainActivity : FlutterFragmentActivity() {
                             @Suppress("DEPRECATION")
                             packageManager.getPackageInfo(packageName, 0)
                         }.getOrNull()
-                        val version = info?.versionName ?: "0.3.10"
+                        val version = info?.versionName ?: "0.3.11"
                         val buildNumber = if (info == null) {
                             "1"
                         } else if (android.os.Build.VERSION.SDK_INT >= 28) {

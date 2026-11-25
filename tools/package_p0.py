@@ -61,17 +61,17 @@ def android(*, release=False):
     with zipfile.ZipFile(apk) as bundle:
         bundle.getinfo("lib/arm64-v8a/libwencrypt_core.so")
     variant = "unsigned" if release else "debug"
-    shutil.copy2(apk, OUTPUT / f"wencrypt-android-arm64-{variant}.apk")
+    shutil.copy2(apk, OUTPUT / f"Wencrypt-android-arm64-{variant}.apk")
 
 
 def windows():
     library = rust_build("x86_64-pc-windows-msvc") / "wencrypt_core.dll"
     flutter("build", "windows", "--release")
     bundle = APP / "build/windows/x64/runner/Release"
-    if not (bundle / "wencrypt.exe").is_file():
-        raise SystemExit("Windows build did not produce wencrypt.exe")
+    if not (bundle / "Wencrypt.exe").is_file():
+        raise SystemExit("Windows build did not produce Wencrypt.exe")
     shutil.copy2(library, bundle)
-    shutil.make_archive(str(OUTPUT / "wencrypt-windows-x64"), "zip", root_dir=bundle)
+    shutil.make_archive(str(OUTPUT / "Wencrypt-windows-x64"), "zip", root_dir=bundle)
 
 
 def macos():
@@ -79,10 +79,10 @@ def macos():
         raise SystemExit("macOS packaging requires an Apple Silicon runner")
     library = rust_build("aarch64-apple-darwin") / "libwencrypt_core.dylib"
     flutter("build", "macos", "--release")
-    apps = list((APP / "build/macos/Build/Products/Release").glob("*.app"))
-    if len(apps) != 1:
-        raise SystemExit("Expected one macOS app")
-    package_macos_bundle(apps[0], library)
+    bundle = APP / "build/macos/Build/Products/Release/Wencrypt.app"
+    if not bundle.is_dir():
+        raise SystemExit("macOS build did not produce Wencrypt.app")
+    package_macos_bundle(bundle, library)
 
 
 def package_macos_bundle(app, library):
@@ -96,12 +96,12 @@ def package_macos_bundle(app, library):
             str(APP / "macos/Runner/Release.entitlements"), str(bundle))
         run("codesign", "--verify", "--deep", "--strict", str(bundle))
         run("ditto", "-c", "-k", "--keepParent", str(bundle),
-            str(OUTPUT / "wencrypt-macos-arm64.zip"))
+            str(OUTPUT / "Wencrypt-macos-arm64.zip"))
         macos_disk_image(bundle)
 
 
 def macos_disk_image(bundle):
-    image = OUTPUT / "wencrypt-macos-arm64.dmg"
+    image = OUTPUT / "Wencrypt-macos-arm64.dmg"
     with tempfile.TemporaryDirectory(prefix="wencrypt-dmg-") as tmp:
         staging = Path(tmp) / "Wencrypt"
         staging.mkdir()

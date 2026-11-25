@@ -286,12 +286,23 @@ bool ExpandZipWithPowerShell(const std::wstring& zip_path,
   return wait_result == WAIT_OBJECT_0 && exit_code == 0;
 }
 
+std::wstring FindPayloadExecutableName(const std::filesystem::path& dir) {
+  std::error_code ec;
+  for (const wchar_t* candidate : {L"Wencrypt.exe", L"wencrypt.exe"}) {
+    ec.clear();
+    if (std::filesystem::is_regular_file(dir / candidate, ec) && !ec) {
+      return candidate;
+    }
+  }
+  return {};
+}
+
 std::filesystem::path LocatePayloadRoot(
     const std::filesystem::path& stage_dir) {
-  std::error_code ec;
-  if (std::filesystem::is_regular_file(stage_dir / L"wencrypt.exe", ec) && !ec) {
+  if (!FindPayloadExecutableName(stage_dir).empty()) {
     return stage_dir;
   }
+  std::error_code ec;
   std::vector<std::filesystem::path> subdirs;
   for (const auto& entry :
        std::filesystem::directory_iterator(stage_dir, ec)) {
@@ -301,19 +312,17 @@ std::filesystem::path LocatePayloadRoot(
       subdirs.push_back(entry.path());
     }
   }
-  if (subdirs.size() == 1 &&
-      std::filesystem::is_regular_file(subdirs[0] / L"wencrypt.exe", ec) &&
-      !ec) {
+  if (subdirs.size() == 1 && !FindPayloadExecutableName(subdirs[0]).empty()) {
     return subdirs[0];
   }
   return {};
 }
 
 bool ValidatePayloadRoot(const std::filesystem::path& root) {
-  if (root.empty()) return false;
+  if (root.empty() || FindPayloadExecutableName(root).empty()) return false;
   std::error_code ec;
-  for (const wchar_t* required :
-       {L"wencrypt.exe", L"wencrypt_core.dll", L"flutter_windows.dll"}) {
+  for (const wchar_t* required : {L"wencrypt_core.dll", L"flutter_windows.dll"}) {
+    ec.clear();
     if (!std::filesystem::is_regular_file(root / required, ec) || ec) {
       return false;
     }
@@ -328,7 +337,7 @@ WindowsAppInfo GetWindowsAppInfo() {
 #ifdef FLUTTER_VERSION
   info.version = FLUTTER_VERSION;
 #else
-  info.version = "0.3.10";
+  info.version = "0.3.11";
 #endif
 #ifdef FLUTTER_VERSION_BUILD
   info.build_number = std::to_string(FLUTTER_VERSION_BUILD);
@@ -422,6 +431,12 @@ WindowsInstallResult InstallWindowsUpdateAndRestart(
     std::filesystem::remove_all(work_dir, ec);
     return {false, "bundle_validation_failed"};
   }
+  const std::wstring payload_exe_name = FindPayloadExecutableName(payload_root);
+  if (payload_exe_name.empty()) {
+    std::filesystem::remove_all(work_dir, ec);
+    return {false, "bundle_validation_failed"};
+  }
+  const std::filesystem::path target_exe_path = install_dir / payload_exe_name;
 
   std::filesystem::path script_path = work_dir / L"apply-update.ps1";
   const std::string script_body =
@@ -429,7 +444,8 @@ WindowsInstallResult InstallWindowsUpdateAndRestart(
       "  [int]$TargetPid,\n"
       "  [string]$SourceDir,\n"
       "  [string]$InstallDir,\n"
-      "  [string]$ExePath,\n"
+      "  [string]$OldExePath,\n"
+      "  [string]$TargetExePath,\n"
       "  [string]$WorkDir\n"
       ")\n"
       "$deadline = (Get-Date).AddSeconds(20)\n"
@@ -441,9 +457,12 @@ WindowsInstallResult InstallWindowsUpdateAndRestart(
       "  Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction SilentlyContinue\n"
       "  exit 1\n"
       "}\n"
+      "if (($OldExePath -cne $TargetExePath) -and (Test-Path -LiteralPath $OldExePath)) {\n"
+      "  Remove-Item -LiteralPath $OldExePath -Force -ErrorAction SilentlyContinue\n"
+      "}\n"
       "Copy-Item -Path (Join-Path $SourceDir '*') -Destination $InstallDir -Recurse -Force\n"
       "Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction SilentlyContinue\n"
-      "Start-Process -FilePath $ExePath\n";
+      "Start-Process -FilePath $TargetExePath\n";
 
   if (!WriteUtf8File(script_path, script_body)) {
     std::filesystem::remove_all(work_dir, ec);
@@ -457,6 +476,7 @@ WindowsInstallResult InstallWindowsUpdateAndRestart(
       QuoteArg(payload_root.wstring()) + L" " +
       QuoteArg(install_dir.wstring()) + L" " +
       QuoteArg(exe_path) + L" " +
+      QuoteArg(target_exe_path.wstring()) + L" " +
       QuoteArg(work_dir.wstring());
 
   STARTUPINFOW si{};

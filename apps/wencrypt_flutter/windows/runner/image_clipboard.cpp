@@ -1,12 +1,36 @@
 #include "image_clipboard.h"
 
+#include <objbase.h>
 #include <wincodec.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <cstring>
 
 namespace {
 using Microsoft::WRL::ComPtr;
+
+constexpr size_t kMaxTransferBytes = 16 * 1024 * 1024;
+constexpr size_t kMaxRawClipboardBytes = 64 * 1024 * 1024;
+
+class ScopedComInit {
+ public:
+  ScopedComInit() : hr_(CoInitializeEx(nullptr, COINIT_MULTITHREADED)) {}
+  ScopedComInit(const ScopedComInit&) = delete;
+  ScopedComInit& operator=(const ScopedComInit&) = delete;
+  ~ScopedComInit() {
+    if (SUCCEEDED(hr_)) CoUninitialize();
+  }
+  bool ok() const { return SUCCEEDED(hr_) || hr_ == RPC_E_CHANGED_MODE; }
+
+ private:
+  HRESULT hr_ = E_FAIL;
+};
+
+struct ZeroVectorOnExit {
+  std::vector<uint8_t>& buf;
+  ~ZeroVectorOnExit() { std::fill(buf.begin(), buf.end(), uint8_t{0}); }
+};
 
 class ClipboardBuffer {
  public:
@@ -157,9 +181,98 @@ size_t ExactPngLength(const uint8_t* data, size_t size) {
   return size;
 }
 
+std::vector<uint8_t> EncodeWicBitmapSource(IWICImagingFactory* factory,
+                                           IWICBitmapSource* source, UINT width,
+                                           UINT height,
+                                           REFGUID container_format,
+                                           REFGUID target_pixel_format,
+                                           size_t max_output_bytes) {
+  if (!factory || !source || width == 0 || height == 0) return {};
+
+  ComPtr<IWICFormatConverter> converter;
+  if (FAILED(factory->CreateFormatConverter(converter.GetAddressOf())) ||
+      FAILED(converter->Initialize(source, target_pixel_format,
+                                   WICBitmapDitherTypeNone, nullptr, 0.0,
+                                   WICBitmapPaletteTypeCustom))) {
+    return {};
+  }
+
+  ComPtr<IStream> output_stream;
+  ComPtr<IWICBitmapEncoder> encoder;
+  ComPtr<IWICBitmapFrameEncode> out_frame;
+  WICPixelFormatGUID pixel_format = target_pixel_format;
+  if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, output_stream.GetAddressOf())) ||
+      FAILED(factory->CreateEncoder(container_format, nullptr,
+                                    encoder.GetAddressOf())) ||
+      FAILED(encoder->Initialize(output_stream.Get(), WICBitmapEncoderNoCache)) ||
+      FAILED(encoder->CreateNewFrame(out_frame.GetAddressOf(), nullptr)) ||
+      FAILED(out_frame->Initialize(nullptr)) ||
+      FAILED(out_frame->SetSize(width, height)) ||
+      FAILED(out_frame->SetPixelFormat(&pixel_format)) ||
+      FAILED(out_frame->WriteSource(converter.Get(), nullptr)) ||
+      FAILED(out_frame->Commit()) ||
+      FAILED(encoder->Commit())) {
+    return {};
+  }
+
+  STATSTG stat{};
+  HGLOBAL hglobal = nullptr;
+  if (FAILED(output_stream->Stat(&stat, STATFLAG_NONAME)) ||
+      stat.cbSize.QuadPart == 0 ||
+      stat.cbSize.QuadPart > static_cast<ULONGLONG>(max_output_bytes) ||
+      FAILED(GetHGlobalFromStream(output_stream.Get(), &hglobal))) {
+    return {};
+  }
+
+  GlobalLockGuard out_lock(hglobal);
+  if (!out_lock.data() ||
+      static_cast<uint64_t>(out_lock.size()) < stat.cbSize.QuadPart) {
+    return {};
+  }
+  const size_t encoded_size = static_cast<size_t>(stat.cbSize.QuadPart);
+  const auto* encoded_bytes = static_cast<const uint8_t*>(out_lock.data());
+  return std::vector<uint8_t>(encoded_bytes, encoded_bytes + encoded_size);
+}
+
 std::vector<uint8_t> EncodeDibAsPng(const uint8_t* dib, size_t dib_size) {
-  constexpr size_t kMaxBytes = 16 * 1024 * 1024;
-  if (!dib || dib_size < sizeof(BITMAPINFOHEADER) || dib_size > kMaxBytes * 4) {
+  std::vector<uint8_t> bmp = WrapDibAsBmp(dib, dib_size);
+  if (bmp.empty()) return {};
+  ZeroVectorOnExit zero_bmp{bmp};
+
+  ComPtr<IWICImagingFactory> factory;
+  ComPtr<IWICStream> input_stream;
+  ComPtr<IWICBitmapDecoder> decoder;
+  ComPtr<IWICBitmapFrameDecode> frame;
+  if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                              CLSCTX_INPROC_SERVER,
+                              IID_PPV_ARGS(factory.GetAddressOf()))) ||
+      FAILED(factory->CreateStream(input_stream.GetAddressOf())) ||
+      FAILED(input_stream->InitializeFromMemory(
+          bmp.data(), static_cast<DWORD>(bmp.size()))) ||
+      FAILED(factory->CreateDecoderFromStream(input_stream.Get(), nullptr,
+                                              WICDecodeMetadataCacheOnDemand,
+                                              decoder.GetAddressOf())) ||
+      FAILED(decoder->GetFrame(0, frame.GetAddressOf()))) {
+    return {};
+  }
+
+  UINT width = 0;
+  UINT height = 0;
+  if (FAILED(frame->GetSize(&width, &height)) || !width || !height ||
+      width > 16384 || height > 16384 ||
+      static_cast<uint64_t>(width) * height > 64ULL * 1024 * 1024) {
+    return {};
+  }
+
+  return EncodeWicBitmapSource(factory.Get(), frame.Get(), width, height,
+                               GUID_ContainerFormatPng,
+                               GUID_WICPixelFormat32bppBGRA, kMaxTransferBytes);
+}
+}  // namespace
+
+std::vector<uint8_t> WrapDibAsBmp(const uint8_t* dib, size_t dib_size) {
+  if (!dib || dib_size < sizeof(BITMAPINFOHEADER) ||
+      dib_size > kMaxRawClipboardBytes) {
     return {};
   }
 
@@ -199,75 +312,8 @@ std::vector<uint8_t> EncodeDibAsPng(const uint8_t* dib, size_t dib_size) {
   file_header.bfOffBits = static_cast<DWORD>(pixel_offset);
   std::memcpy(bmp.data(), &file_header, sizeof(file_header));
   std::memcpy(bmp.data() + sizeof(file_header), dib, dib_size);
-
-  ComPtr<IWICImagingFactory> factory;
-  ComPtr<IWICStream> input_stream;
-  ComPtr<IWICBitmapDecoder> decoder;
-  ComPtr<IWICBitmapFrameDecode> frame;
-  if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
-                              CLSCTX_INPROC_SERVER,
-                              IID_PPV_ARGS(factory.GetAddressOf()))) ||
-      FAILED(factory->CreateStream(input_stream.GetAddressOf())) ||
-      FAILED(input_stream->InitializeFromMemory(bmp.data(),
-                                                static_cast<DWORD>(bmp.size()))) ||
-      FAILED(factory->CreateDecoderFromStream(input_stream.Get(), nullptr,
-                                              WICDecodeMetadataCacheOnDemand,
-                                              decoder.GetAddressOf())) ||
-      FAILED(decoder->GetFrame(0, frame.GetAddressOf()))) {
-    return {};
-  }
-
-  UINT width = 0;
-  UINT height = 0;
-  if (FAILED(frame->GetSize(&width, &height)) || !width || !height ||
-      width > 8192 || height > 8192 ||
-      static_cast<uint64_t>(width) * height > 32ULL * 1024 * 1024) {
-    return {};
-  }
-
-  ComPtr<IWICFormatConverter> converter;
-  if (FAILED(factory->CreateFormatConverter(converter.GetAddressOf())) ||
-      FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppBGRA,
-                                   WICBitmapDitherTypeNone, nullptr, 0,
-                                   WICBitmapPaletteTypeCustom))) {
-    return {};
-  }
-
-  ComPtr<IStream> output_stream;
-  ComPtr<IWICBitmapEncoder> encoder;
-  ComPtr<IWICBitmapFrameEncode> out_frame;
-  if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, output_stream.GetAddressOf())) ||
-      FAILED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr,
-                                    encoder.GetAddressOf())) ||
-      FAILED(encoder->Initialize(output_stream.Get(), WICBitmapEncoderNoCache)) ||
-      FAILED(encoder->CreateNewFrame(out_frame.GetAddressOf(), nullptr)) ||
-      FAILED(out_frame->Initialize(nullptr)) ||
-      FAILED(out_frame->SetSize(width, height)) ||
-      [&]() {
-        WICPixelFormatGUID pixel_format = GUID_WICPixelFormat32bppBGRA;
-        return FAILED(out_frame->SetPixelFormat(&pixel_format));
-      }() ||
-      FAILED(out_frame->WriteSource(converter.Get(), nullptr)) ||
-      FAILED(out_frame->Commit()) ||
-      FAILED(encoder->Commit())) {
-    return {};
-  }
-
-  STATSTG stat{};
-  HGLOBAL hglobal = nullptr;
-  if (FAILED(output_stream->Stat(&stat, STATFLAG_NONAME)) ||
-      stat.cbSize.QuadPart == 0 || stat.cbSize.QuadPart > kMaxBytes ||
-      FAILED(GetHGlobalFromStream(output_stream.Get(), &hglobal))) {
-    return {};
-  }
-
-  GlobalLockGuard out_lock(hglobal);
-  if (!out_lock.data() || out_lock.size() < stat.cbSize.QuadPart) return {};
-  const size_t png_size = static_cast<size_t>(stat.cbSize.QuadPart);
-  const auto* png_bytes = static_cast<const uint8_t*>(out_lock.data());
-  return std::vector<uint8_t>(png_bytes, png_bytes + png_size);
+  return bmp;
 }
-}  // namespace
 
 ImageClipboardResult CopyPngToClipboard(HWND owner,
                                         const std::vector<uint8_t>& png) {
@@ -282,54 +328,140 @@ ImageClipboardResult CopyPngToClipboard(HWND owner,
   return copied ? ImageClipboardResult::kCopied : ImageClipboardResult::kFailed;
 }
 
+ReadClipboardImageResult GrabClipboardImageRaw(HWND owner,
+                                               RawClipboardImage* out_raw) {
+  if (!out_raw) return ReadClipboardImageResult::kFailed;
+  out_raw->bytes.clear();
+  out_raw->is_dib = false;
+
+  const UINT png_format = RegisterClipboardFormatW(L"PNG");
+  ClipboardGuard clipboard(owner);
+  if (!clipboard.is_open()) return ReadClipboardImageResult::kBusy;
+
+  if (png_format != 0 && IsClipboardFormatAvailable(png_format)) {
+    HANDLE handle = GetClipboardData(png_format);
+    GlobalLockGuard lock(handle);
+    const size_t size = lock.size();
+    const auto* bytes = static_cast<const uint8_t*>(lock.data());
+    if (bytes && size > 0 && size <= kMaxTransferBytes &&
+        HasPngSignature(bytes, size)) {
+      const size_t exact_len = ExactPngLength(bytes, size);
+      out_raw->bytes.assign(bytes, bytes + exact_len);
+      out_raw->is_dib = false;
+      return ReadClipboardImageResult::kFound;
+    }
+  }
+
+  UINT dib_format = 0;
+  if (IsClipboardFormatAvailable(CF_DIBV5)) {
+    dib_format = CF_DIBV5;
+  } else if (IsClipboardFormatAvailable(CF_DIB)) {
+    dib_format = CF_DIB;
+  }
+  if (dib_format == 0) {
+    return ReadClipboardImageResult::kEmpty;
+  }
+
+  HANDLE handle = GetClipboardData(dib_format);
+  GlobalLockGuard lock(handle);
+  const size_t size = lock.size();
+  const auto* bytes = static_cast<const uint8_t*>(lock.data());
+  if (!bytes || size < sizeof(BITMAPINFOHEADER) ||
+      size > kMaxRawClipboardBytes) {
+    return ReadClipboardImageResult::kFailed;
+  }
+  out_raw->bytes.assign(bytes, bytes + size);
+  out_raw->is_dib = true;
+  return ReadClipboardImageResult::kFound;
+}
+
+std::vector<uint8_t> EncodeRawClipboardImageAsPng(const RawClipboardImage& raw) {
+  if (raw.bytes.empty()) return {};
+  if (!raw.is_dib) {
+    return raw.bytes.size() <= kMaxTransferBytes ? raw.bytes
+                                                 : std::vector<uint8_t>{};
+  }
+  ScopedComInit com;
+  if (!com.ok()) return {};
+  return EncodeDibAsPng(raw.bytes.data(), raw.bytes.size());
+}
+
+std::vector<uint8_t> EncodeImagePreviewBytes(
+    const std::vector<uint8_t>& image_bytes, UINT max_dimension) {
+  if (image_bytes.empty() || image_bytes.size() > kMaxRawClipboardBytes) {
+    return {};
+  }
+  ScopedComInit com;
+  if (!com.ok()) return {};
+
+  ComPtr<IWICImagingFactory> factory;
+  ComPtr<IWICStream> input_stream;
+  ComPtr<IWICBitmapDecoder> decoder;
+  ComPtr<IWICBitmapFrameDecode> frame;
+  if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                              CLSCTX_INPROC_SERVER,
+                              IID_PPV_ARGS(factory.GetAddressOf()))) ||
+      FAILED(factory->CreateStream(input_stream.GetAddressOf())) ||
+      FAILED(input_stream->InitializeFromMemory(
+          const_cast<BYTE*>(image_bytes.data()),
+          static_cast<DWORD>(image_bytes.size()))) ||
+      FAILED(factory->CreateDecoderFromStream(input_stream.Get(), nullptr,
+                                              WICDecodeMetadataCacheOnDemand,
+                                              decoder.GetAddressOf())) ||
+      FAILED(decoder->GetFrame(0, frame.GetAddressOf()))) {
+    return {};
+  }
+
+  UINT width = 0;
+  UINT height = 0;
+  if (FAILED(frame->GetSize(&width, &height)) || !width || !height ||
+      width > 16384 || height > 16384 ||
+      static_cast<uint64_t>(width) * height > 64ULL * 1024 * 1024) {
+    return {};
+  }
+
+  ComPtr<IWICBitmapSource> source = frame;
+  UINT dst_w = width;
+  UINT dst_h = height;
+  if (max_dimension > 0 && (width > max_dimension || height > max_dimension)) {
+    const double scale = static_cast<double>(max_dimension) /
+                         static_cast<double>((std::max)(width, height));
+    dst_w = (std::max)(
+        UINT{1}, static_cast<UINT>(static_cast<double>(width) * scale + 0.5));
+    dst_h = (std::max)(
+        UINT{1}, static_cast<UINT>(static_cast<double>(height) * scale + 0.5));
+    ComPtr<IWICBitmapScaler> scaler;
+    if (SUCCEEDED(factory->CreateBitmapScaler(scaler.GetAddressOf())) &&
+        SUCCEEDED(scaler->Initialize(frame.Get(), dst_w, dst_h,
+                                     WICBitmapInterpolationModeFant))) {
+      source = scaler;
+    } else {
+      dst_w = width;
+      dst_h = height;
+    }
+  }
+
+  std::vector<uint8_t> preview = EncodeWicBitmapSource(
+      factory.Get(), source.Get(), dst_w, dst_h, GUID_ContainerFormatJpeg,
+      GUID_WICPixelFormat24bppBGR, kMaxTransferBytes);
+  if (!preview.empty()) return preview;
+
+  return EncodeWicBitmapSource(factory.Get(), source.Get(), dst_w, dst_h,
+                               GUID_ContainerFormatPng,
+                               GUID_WICPixelFormat32bppBGRA, kMaxTransferBytes);
+}
+
 ReadClipboardImageResult ReadClipboardPng(HWND owner,
                                           std::vector<uint8_t>* out_png) {
   if (!out_png) return ReadClipboardImageResult::kFailed;
   out_png->clear();
 
-  constexpr size_t kMaxBytes = 16 * 1024 * 1024;
-  const UINT png_format = RegisterClipboardFormatW(L"PNG");
+  RawClipboardImage raw;
+  const ReadClipboardImageResult status = GrabClipboardImageRaw(owner, &raw);
+  if (status != ReadClipboardImageResult::kFound) return status;
+  ZeroVectorOnExit zero_raw{raw.bytes};
 
-  std::vector<uint8_t> dib_copy;
-  {
-    ClipboardGuard clipboard(owner);
-    if (!clipboard.is_open()) return ReadClipboardImageResult::kBusy;
-
-    if (png_format != 0 && IsClipboardFormatAvailable(png_format)) {
-      HANDLE handle = GetClipboardData(png_format);
-      GlobalLockGuard lock(handle);
-      const size_t size = lock.size();
-      const auto* bytes = static_cast<const uint8_t*>(lock.data());
-      if (bytes && size > 0 && size <= kMaxBytes &&
-          HasPngSignature(bytes, size)) {
-        const size_t exact_len = ExactPngLength(bytes, size);
-        out_png->assign(bytes, bytes + exact_len);
-        return ReadClipboardImageResult::kFound;
-      }
-    }
-
-    UINT dib_format = 0;
-    if (IsClipboardFormatAvailable(CF_DIBV5)) {
-      dib_format = CF_DIBV5;
-    } else if (IsClipboardFormatAvailable(CF_DIB)) {
-      dib_format = CF_DIB;
-    }
-    if (dib_format == 0) {
-      return ReadClipboardImageResult::kEmpty;
-    }
-
-    HANDLE handle = GetClipboardData(dib_format);
-    GlobalLockGuard lock(handle);
-    const size_t size = lock.size();
-    const auto* bytes = static_cast<const uint8_t*>(lock.data());
-    if (!bytes || size < sizeof(BITMAPINFOHEADER) || size > kMaxBytes * 4) {
-      return ReadClipboardImageResult::kFailed;
-    }
-    dib_copy.assign(bytes, bytes + size);
-  }
-
-  std::vector<uint8_t> encoded =
-      EncodeDibAsPng(dib_copy.data(), dib_copy.size());
+  std::vector<uint8_t> encoded = EncodeRawClipboardImageAsPng(raw);
   if (encoded.empty()) return ReadClipboardImageResult::kFailed;
   *out_png = std::move(encoded);
   return ReadClipboardImageResult::kFound;

@@ -4,6 +4,7 @@
 #include <roapi.h>
 #include <shcore.h>
 #include <shlwapi.h>
+#include <wincodec.h>
 #include <winstring.h>
 #include <windows.foundation.h>
 #include <windows.foundation.collections.h>
@@ -29,9 +30,15 @@ namespace ABI_Img = ABI::Windows::Graphics::Imaging;
 namespace ABI_Ocr = ABI::Windows::Media::Ocr;
 namespace ABI_Strm = ABI::Windows::Storage::Streams;
 
-constexpr size_t kMaxImageBytes = 16 * 1024 * 1024;
-constexpr UINT32 kMaxImageDim = 8192;
-constexpr uint64_t kMaxImagePixels = 32ULL * 1024 * 1024;
+constexpr size_t kMaxImageBytes = 64 * 1024 * 1024;
+constexpr UINT32 kMaxImageDim = 16384;
+constexpr uint64_t kMaxImagePixels = 64ULL * 1024 * 1024;
+constexpr UINT32 kTargetOcrMaxDim = 2400;
+
+struct ZeroBytesOnExit {
+  std::vector<uint8_t>& buf;
+  ~ZeroBytesOnExit() { std::fill(buf.begin(), buf.end(), uint8_t{0}); }
+};
 
 class ScopedRoInit {
  public:
@@ -261,6 +268,96 @@ HRESULT WaitForAsyncOperation(ABI_Found::IAsyncOperation<LogicalT>* op,
   return op->GetResults(out_result);
 }
 
+bool DownscaleImageToBmpIfNeeded(const std::vector<uint8_t>& bytes,
+                                  UINT32 target_max,
+                                  std::vector<uint8_t>* out_bmp) {
+  if (!out_bmp || bytes.empty() || target_max == 0) return false;
+  out_bmp->clear();
+
+  ComPtr<IWICImagingFactory> factory;
+  ComPtr<IWICStream> input_stream;
+  ComPtr<IWICBitmapDecoder> decoder;
+  ComPtr<IWICBitmapFrameDecode> frame;
+  if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                              CLSCTX_INPROC_SERVER,
+                              IID_PPV_ARGS(factory.GetAddressOf()))) ||
+      FAILED(factory->CreateStream(input_stream.GetAddressOf())) ||
+      FAILED(input_stream->InitializeFromMemory(
+          const_cast<BYTE*>(bytes.data()), static_cast<DWORD>(bytes.size()))) ||
+      FAILED(factory->CreateDecoderFromStream(input_stream.Get(), nullptr,
+                                              WICDecodeMetadataCacheOnDemand,
+                                              decoder.GetAddressOf())) ||
+      FAILED(decoder->GetFrame(0, frame.GetAddressOf()))) {
+    return false;
+  }
+
+  UINT width = 0;
+  UINT height = 0;
+  if (FAILED(frame->GetSize(&width, &height)) || !width || !height ||
+      (width <= target_max && height <= target_max)) {
+    return false;
+  }
+
+  const double scale = static_cast<double>(target_max) /
+                       static_cast<double>((std::max)(width, height));
+  const UINT dst_w = (std::max)(
+      UINT{1}, static_cast<UINT>(static_cast<double>(width) * scale + 0.5));
+  const UINT dst_h = (std::max)(
+      UINT{1}, static_cast<UINT>(static_cast<double>(height) * scale + 0.5));
+
+  ComPtr<IWICBitmapScaler> scaler;
+  ComPtr<IWICFormatConverter> converter;
+  if (FAILED(factory->CreateBitmapScaler(scaler.GetAddressOf())) ||
+      FAILED(scaler->Initialize(frame.Get(), dst_w, dst_h,
+                                WICBitmapInterpolationModeFant)) ||
+      FAILED(factory->CreateFormatConverter(converter.GetAddressOf())) ||
+      FAILED(converter->Initialize(scaler.Get(), GUID_WICPixelFormat32bppBGRA,
+                                   WICBitmapDitherTypeNone, nullptr, 0.0,
+                                   WICBitmapPaletteTypeCustom))) {
+    return false;
+  }
+
+  ComPtr<IStream> output_stream;
+  ComPtr<IWICBitmapEncoder> encoder;
+  ComPtr<IWICBitmapFrameEncode> out_frame;
+  WICPixelFormatGUID pixel_format = GUID_WICPixelFormat32bppBGRA;
+  if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, output_stream.GetAddressOf())) ||
+      FAILED(factory->CreateEncoder(GUID_ContainerFormatBmp, nullptr,
+                                    encoder.GetAddressOf())) ||
+      FAILED(encoder->Initialize(output_stream.Get(), WICBitmapEncoderNoCache)) ||
+      FAILED(encoder->CreateNewFrame(out_frame.GetAddressOf(), nullptr)) ||
+      FAILED(out_frame->Initialize(nullptr)) ||
+      FAILED(out_frame->SetSize(dst_w, dst_h)) ||
+      FAILED(out_frame->SetPixelFormat(&pixel_format)) ||
+      FAILED(out_frame->WriteSource(converter.Get(), nullptr)) ||
+      FAILED(out_frame->Commit()) ||
+      FAILED(encoder->Commit())) {
+    return false;
+  }
+
+  STATSTG stat{};
+  HGLOBAL hglobal = nullptr;
+  if (FAILED(output_stream->Stat(&stat, STATFLAG_NONAME)) ||
+      stat.cbSize.QuadPart == 0 ||
+      stat.cbSize.QuadPart > static_cast<ULONGLONG>(kMaxImageBytes) ||
+      FAILED(GetHGlobalFromStream(output_stream.Get(), &hglobal))) {
+    return false;
+  }
+
+  const void* locked = GlobalLock(hglobal);
+  if (!locked) return false;
+  const size_t avail = GlobalSize(hglobal);
+  const bool size_ok =
+      static_cast<uint64_t>(avail) >= stat.cbSize.QuadPart;
+  if (size_ok) {
+    const size_t bmp_size = static_cast<size_t>(stat.cbSize.QuadPart);
+    const auto* bmp_bytes = static_cast<const uint8_t*>(locked);
+    out_bmp->assign(bmp_bytes, bmp_bytes + bmp_size);
+  }
+  GlobalUnlock(hglobal);
+  return size_ok && !out_bmp->empty();
+}
+
 HRESULT CreateOcrEngine(ABI_Ocr::IOcrEngineStatics* statics,
                         ABI_Ocr::IOcrEngine** out_engine) {
   if (!statics || !out_engine) return E_POINTER;
@@ -383,8 +480,67 @@ WindowsOcrResult RecognizeImageWindows(const std::vector<uint8_t>& bytes) {
     return result;
   }
 
+  ComPtr<ABI_Img::IBitmapDecoder> active_decoder = decoder;
+
+  StaticHStringRef ocr_class(RuntimeClass_Windows_Media_Ocr_OcrEngine);
+  if (FAILED(ocr_class.result())) {
+    result.error_code = "ocr_unavailable";
+    return result;
+  }
+
+  ComPtr<ABI_Ocr::IOcrEngineStatics> ocr_statics;
+  hr = RoGetActivationFactory(ocr_class.get(),
+                              IID_PPV_ARGS(ocr_statics.GetAddressOf()));
+  if (FAILED(hr) || !ocr_statics) {
+    result.error_code = "ocr_unavailable";
+    return result;
+  }
+
+  UINT32 engine_max_dim = 0;
+  if (FAILED(ocr_statics->get_MaxImageDimension(&engine_max_dim)) ||
+      engine_max_dim == 0) {
+    engine_max_dim = 4096;
+  }
+  const UINT32 target_max = (std::min)(kTargetOcrMaxDim, engine_max_dim);
+
+  std::vector<uint8_t> scaled_bmp;
+  ZeroBytesOnExit zero_scaled{scaled_bmp};
+  if (pixel_width > target_max || pixel_height > target_max) {
+    if (DownscaleImageToBmpIfNeeded(bytes, target_max, &scaled_bmp)) {
+      ComPtr<IStream> scaled_mem_stream;
+      scaled_mem_stream.Attach(SHCreateMemStream(
+          scaled_bmp.data(), static_cast<UINT>(scaled_bmp.size())));
+      ComPtr<ABI_Strm::IRandomAccessStream> scaled_random_stream;
+      ComPtr<ABI_Found::IAsyncOperation<ABI_Img::BitmapDecoder*>>
+          scaled_decoder_op;
+      ComPtr<ABI_Img::IBitmapDecoder> scaled_decoder;
+      ComPtr<ABI_Img::IBitmapFrame> scaled_frame;
+      UINT32 scaled_w = 0;
+      UINT32 scaled_h = 0;
+      if (scaled_mem_stream &&
+          SUCCEEDED(CreateRandomAccessStreamOverStream(
+              scaled_mem_stream.Get(), BSOS_DEFAULT,
+              IID_PPV_ARGS(scaled_random_stream.GetAddressOf()))) &&
+          SUCCEEDED(decoder_statics->CreateAsync(
+              scaled_random_stream.Get(), scaled_decoder_op.GetAddressOf())) &&
+          scaled_decoder_op &&
+          SUCCEEDED(WaitForAsyncOperation<ABI_Img::BitmapDecoder*,
+                                          ABI_Img::IBitmapDecoder>(
+              scaled_decoder_op.Get(), scaled_decoder.GetAddressOf())) &&
+          scaled_decoder &&
+          SUCCEEDED(scaled_decoder.As(&scaled_frame)) && scaled_frame &&
+          SUCCEEDED(scaled_frame->get_PixelWidth(&scaled_w)) &&
+          SUCCEEDED(scaled_frame->get_PixelHeight(&scaled_h)) &&
+          scaled_w > 0 && scaled_h > 0) {
+        active_decoder = scaled_decoder;
+        pixel_width = scaled_w;
+        pixel_height = scaled_h;
+      }
+    }
+  }
+
   ComPtr<ABI_Img::IBitmapFrameWithSoftwareBitmap> frame_with_bitmap;
-  hr = decoder.As(&frame_with_bitmap);
+  hr = active_decoder.As(&frame_with_bitmap);
   if (FAILED(hr) || !frame_with_bitmap) {
     result.error_code = "invalid_image";
     return result;
@@ -410,22 +566,6 @@ WindowsOcrResult RecognizeImageWindows(const std::vector<uint8_t>& bytes) {
 
   ComPtr<ABI_Found::IClosable> closable_bitmap;
   software_bitmap.As(&closable_bitmap);
-
-  StaticHStringRef ocr_class(RuntimeClass_Windows_Media_Ocr_OcrEngine);
-  if (FAILED(ocr_class.result())) {
-    if (closable_bitmap) closable_bitmap->Close();
-    result.error_code = "ocr_unavailable";
-    return result;
-  }
-
-  ComPtr<ABI_Ocr::IOcrEngineStatics> ocr_statics;
-  hr = RoGetActivationFactory(ocr_class.get(),
-                              IID_PPV_ARGS(ocr_statics.GetAddressOf()));
-  if (FAILED(hr) || !ocr_statics) {
-    if (closable_bitmap) closable_bitmap->Close();
-    result.error_code = "ocr_unavailable";
-    return result;
-  }
 
   ComPtr<ABI_Ocr::IOcrEngine> ocr_engine;
   hr = CreateOcrEngine(ocr_statics.Get(), ocr_engine.GetAddressOf());

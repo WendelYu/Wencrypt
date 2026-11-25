@@ -90,12 +90,12 @@ BEGIN
         BLOCK "040904e4"
         BEGIN
             VALUE "CompanyName", "org.wencrypt" "\0"
-            VALUE "FileDescription", "wencrypt" "\0"
+            VALUE "FileDescription", "Wencrypt" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
-            VALUE "InternalName", "wencrypt" "\0"
+            VALUE "InternalName", "Wencrypt" "\0"
             VALUE "LegalCopyright", "Copyright (C) 2026 org.wencrypt. All rights reserved." "\0"
-            VALUE "OriginalFilename", "wencrypt.exe" "\0"
-            VALUE "ProductName", "wencrypt" "\0"
+            VALUE "OriginalFilename", "Wencrypt.exe" "\0"
+            VALUE "ProductName", "Wencrypt" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END

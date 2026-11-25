@@ -28,6 +28,38 @@ struct OcrDispatchState {
   std::vector<std::function<void()>> callbacks;
 };
 
+namespace {
+void DispatchOcrCallback(const std::shared_ptr<OcrDispatchState>& state,
+                         std::function<void()> callback) {
+  if (!state) return;
+  std::lock_guard<std::mutex> lock(state->mutex);
+  if (!state->alive || !state->hwnd) return;
+  HWND target_hwnd = state->hwnd;
+  state->callbacks.push_back(std::move(callback));
+  PostMessageW(target_hwnd, kWmOcrComplete, 0, 0);
+}
+
+flutter::EncodableMap BuildWindowsOcrPayload(const WindowsOcrResult& ocr) {
+  flutter::EncodableList blocks;
+  blocks.reserve(ocr.blocks.size());
+  for (const auto& block : ocr.blocks) {
+    flutter::EncodableMap item;
+    item[flutter::EncodableValue("text")] =
+        flutter::EncodableValue(block.text);
+    item[flutter::EncodableValue("x")] = flutter::EncodableValue(block.x);
+    item[flutter::EncodableValue("y")] = flutter::EncodableValue(block.y);
+    item[flutter::EncodableValue("w")] = flutter::EncodableValue(block.w);
+    item[flutter::EncodableValue("h")] = flutter::EncodableValue(block.h);
+    blocks.push_back(flutter::EncodableValue(std::move(item)));
+  }
+  flutter::EncodableMap payload;
+  payload[flutter::EncodableValue("text")] = flutter::EncodableValue(ocr.text);
+  payload[flutter::EncodableValue("blocks")] =
+      flutter::EncodableValue(std::move(blocks));
+  return payload;
+}
+}  // namespace
+
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
 
@@ -78,15 +110,94 @@ bool FlutterWindow::OnCreate() {
       &flutter::StandardMethodCodec::GetInstance());
   ocr_channel.SetMethodCallHandler([this](const auto& call, auto result) {
     if (call.method_name() == "readClipboardImage") {
-      std::vector<uint8_t> png;
-      const auto status = ReadClipboardPng(GetHandle(), &png);
+      RawClipboardImage raw;
+      const auto status = GrabClipboardImageRaw(GetHandle(), &raw);
       if (status == ReadClipboardImageResult::kBusy) {
         result->Error("clipboard_busy");
-      } else if (status == ReadClipboardImageResult::kFound) {
-        result->Success(flutter::EncodableValue(std::move(png)));
-      } else {
+      } else if (status != ReadClipboardImageResult::kFound) {
         result->Success(flutter::EncodableValue());
+      } else if (!raw.is_dib) {
+        result->Success(flutter::EncodableValue(std::move(raw.bytes)));
+      } else {
+        auto shared_result =
+            std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>>(
+                result.release());
+        auto state = ocr_state_;
+        std::thread([raw = std::move(raw),
+                     shared_result = std::move(shared_result),
+                     state = std::move(state)]() mutable {
+          std::vector<uint8_t> png = EncodeRawClipboardImageAsPng(raw);
+          std::fill(raw.bytes.begin(), raw.bytes.end(), uint8_t{0});
+          DispatchOcrCallback(state, [png = std::move(png),
+                                      shared_result =
+                                          std::move(shared_result)]() mutable {
+            if (png.empty()) {
+              shared_result->Success(flutter::EncodableValue());
+            } else {
+              shared_result->Success(flutter::EncodableValue(std::move(png)));
+            }
+          });
+        }).detach();
       }
+      return;
+    }
+
+    if (call.method_name() == "readAndRecognizeClipboardImage") {
+      RawClipboardImage raw;
+      const auto status = GrabClipboardImageRaw(GetHandle(), &raw);
+      if (status == ReadClipboardImageResult::kBusy) {
+        result->Error("clipboard_busy");
+        return;
+      }
+      if (status != ReadClipboardImageResult::kFound) {
+        flutter::EncodableMap empty_payload;
+        empty_payload[flutter::EncodableValue("hasImage")] =
+            flutter::EncodableValue(false);
+        result->Success(flutter::EncodableValue(std::move(empty_payload)));
+        return;
+      }
+      auto shared_result =
+          std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>>(
+              result.release());
+      auto state = ocr_state_;
+      std::thread([raw = std::move(raw),
+                   shared_result = std::move(shared_result),
+                   state = std::move(state)]() mutable {
+        std::vector<uint8_t> ocr_input =
+            raw.is_dib ? WrapDibAsBmp(raw.bytes.data(), raw.bytes.size())
+                       : raw.bytes;
+        WindowsOcrResult ocr = RecognizeImageWindows(ocr_input);
+        std::vector<uint8_t> preview;
+        if (ocr.ok) {
+          preview = EncodeImagePreviewBytes(ocr_input, 1600);
+          if (preview.empty()) {
+            preview = EncodeRawClipboardImageAsPng(raw);
+          }
+        }
+        std::fill(ocr_input.begin(), ocr_input.end(), uint8_t{0});
+        std::fill(raw.bytes.begin(), raw.bytes.end(), uint8_t{0});
+        DispatchOcrCallback(
+            state,
+            [ocr = std::move(ocr), preview = std::move(preview),
+             shared_result = std::move(shared_result)]() mutable {
+              if (!ocr.ok) {
+                shared_result->Error(
+                    ocr.error_code.empty() ? "ocr_failed" : ocr.error_code);
+                return;
+              }
+              if (preview.empty()) {
+                shared_result->Error("invalid_image");
+                return;
+              }
+              flutter::EncodableMap payload = BuildWindowsOcrPayload(ocr);
+              payload[flutter::EncodableValue("hasImage")] =
+                  flutter::EncodableValue(true);
+              payload[flutter::EncodableValue("image")] =
+                  flutter::EncodableValue(std::move(preview));
+              shared_result->Success(
+                  flutter::EncodableValue(std::move(payload)));
+            });
+      }).detach();
       return;
     }
 
@@ -94,7 +205,7 @@ bool FlutterWindow::OnCreate() {
       const auto* bytes = call.arguments()
           ? std::get_if<std::vector<uint8_t>>(call.arguments())
           : nullptr;
-      if (!bytes || bytes->empty()) {
+      if (!bytes || bytes->empty() || bytes->size() > 16 * 1024 * 1024) {
         result->Error("invalid_image");
         return;
       }
@@ -108,43 +219,17 @@ bool FlutterWindow::OnCreate() {
                    state = std::move(state)]() mutable {
         WindowsOcrResult ocr = RecognizeImageWindows(bytes_copy);
         std::fill(bytes_copy.begin(), bytes_copy.end(), uint8_t{0});
-        if (!state) return;
-        std::lock_guard<std::mutex> lock(state->mutex);
-        if (!state->alive || !state->hwnd) return;
-        HWND target_hwnd = state->hwnd;
-        state->callbacks.push_back(
-            [ocr = std::move(ocr),
-             shared_result = std::move(shared_result)]() mutable {
-              if (!ocr.ok) {
-                shared_result->Error(
-                    ocr.error_code.empty() ? "ocr_failed" : ocr.error_code);
-                return;
-              }
-              flutter::EncodableList blocks;
-              blocks.reserve(ocr.blocks.size());
-              for (const auto& block : ocr.blocks) {
-                flutter::EncodableMap item;
-                item[flutter::EncodableValue("text")] =
-                    flutter::EncodableValue(block.text);
-                item[flutter::EncodableValue("x")] =
-                    flutter::EncodableValue(block.x);
-                item[flutter::EncodableValue("y")] =
-                    flutter::EncodableValue(block.y);
-                item[flutter::EncodableValue("w")] =
-                    flutter::EncodableValue(block.w);
-                item[flutter::EncodableValue("h")] =
-                    flutter::EncodableValue(block.h);
-                blocks.push_back(flutter::EncodableValue(std::move(item)));
-              }
-              flutter::EncodableMap payload;
-              payload[flutter::EncodableValue("text")] =
-                  flutter::EncodableValue(ocr.text);
-              payload[flutter::EncodableValue("blocks")] =
-                  flutter::EncodableValue(std::move(blocks));
-              shared_result->Success(
-                  flutter::EncodableValue(std::move(payload)));
-            });
-        PostMessageW(target_hwnd, kWmOcrComplete, 0, 0);
+        DispatchOcrCallback(state, [ocr = std::move(ocr),
+                                    shared_result =
+                                        std::move(shared_result)]() mutable {
+          if (!ocr.ok) {
+            shared_result->Error(
+                ocr.error_code.empty() ? "ocr_failed" : ocr.error_code);
+            return;
+          }
+          shared_result->Success(
+              flutter::EncodableValue(BuildWindowsOcrPayload(ocr)));
+        });
       }).detach();
       return;
     }

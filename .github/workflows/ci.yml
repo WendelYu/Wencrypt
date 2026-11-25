@@ -33,17 +33,17 @@ jobs:
           - os: windows-latest
             target: windows
             rust-target: x86_64-pc-windows-msvc
-            artifact: build/p0/wencrypt-windows-x64.zip
+            artifact: build/p0/Wencrypt-windows-x64.zip
           - os: macos-15
             target: macos
             rust-target: aarch64-apple-darwin
             artifact: |
-              build/p0/wencrypt-macos-arm64.zip
-              build/p0/wencrypt-macos-arm64.dmg
+              build/p0/Wencrypt-macos-arm64.zip
+              build/p0/Wencrypt-macos-arm64.dmg
           - os: ubuntu-latest
             target: android
             rust-target: aarch64-linux-android
-            artifact: build/p0/wencrypt-android-arm64-*.apk
+            artifact: build/p0/Wencrypt-android-arm64-*.apk
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -165,8 +165,8 @@ jobs:
           ANDROID_SIGNING_CERT_SHA256: ${{ vars.ANDROID_SIGNING_CERT_SHA256 }}
         run: |
           bash tools/sign_android_release.sh "$ANDROID_HOME/build-tools/36.0.0" \
-            release-assets/wencrypt-android-arm64-unsigned.apk \
-            release-assets/wencrypt-android-arm64.apk
+            release-assets/Wencrypt-android-arm64-unsigned.apk \
+            release-assets/Wencrypt-android-arm64.apk
       - name: Publish release
         if: steps.version.outputs.tag != ''
         env:
@@ -175,8 +175,8 @@ jobs:
         working-directory: release-assets
         run: |
           assets=()
-          for package in wencrypt-macos-arm64.dmg wencrypt-windows-x64.zip wencrypt-android-arm64.apk; do
-            name="wencrypt-$TAG-${package#wencrypt-}"
+          for package in Wencrypt-macos-arm64.dmg Wencrypt-windows-x64.zip Wencrypt-android-arm64.apk; do
+            name="Wencrypt-$TAG-${package#Wencrypt-}"
             mv -- "$package" "$name"
             assets+=("$name")
           done
