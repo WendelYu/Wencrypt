@@ -523,18 +523,20 @@ WindowsOcrResult RecognizeImageWindows(const std::vector<uint8_t>& bytes) {
               IID_PPV_ARGS(scaled_random_stream.GetAddressOf()))) &&
           SUCCEEDED(decoder_statics->CreateAsync(
               scaled_random_stream.Get(), scaled_decoder_op.GetAddressOf())) &&
-          scaled_decoder_op &&
-          SUCCEEDED(WaitForAsyncOperation<ABI_Img::BitmapDecoder*,
-                                          ABI_Img::IBitmapDecoder>(
-              scaled_decoder_op.Get(), scaled_decoder.GetAddressOf())) &&
-          scaled_decoder &&
-          SUCCEEDED(scaled_decoder.As(&scaled_frame)) && scaled_frame &&
-          SUCCEEDED(scaled_frame->get_PixelWidth(&scaled_w)) &&
-          SUCCEEDED(scaled_frame->get_PixelHeight(&scaled_h)) &&
-          scaled_w > 0 && scaled_h > 0) {
-        active_decoder = scaled_decoder;
-        pixel_width = scaled_w;
-        pixel_height = scaled_h;
+          scaled_decoder_op) {
+        const HRESULT scaled_wait_hr =
+            WaitForAsyncOperation<ABI_Img::BitmapDecoder*,
+                                  ABI_Img::IBitmapDecoder>(
+                scaled_decoder_op.Get(), scaled_decoder.GetAddressOf());
+        if (SUCCEEDED(scaled_wait_hr) && scaled_decoder &&
+            SUCCEEDED(scaled_decoder.As(&scaled_frame)) && scaled_frame &&
+            SUCCEEDED(scaled_frame->get_PixelWidth(&scaled_w)) &&
+            SUCCEEDED(scaled_frame->get_PixelHeight(&scaled_h)) &&
+            scaled_w > 0 && scaled_h > 0) {
+          active_decoder = scaled_decoder;
+          pixel_width = scaled_w;
+          pixel_height = scaled_h;
+        }
       }
     }
   }
